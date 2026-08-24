@@ -535,14 +535,14 @@ async fn a_checkpoint_carries_the_counters_as_of_the_snapshot() {
         .admit(&[Candidate::new("https://example.com/", T0).unwrap()])
         .await
         .unwrap();
-    let before = state.checkpoint().await.unwrap();
+    let before = state.checkpoint(T0).await.unwrap();
     assert_eq!(before.stats.urls_seen, 1);
 
     state
         .admit(&[Candidate::new("https://example.com/two", T0).unwrap()])
         .await
         .unwrap();
-    let after = state.checkpoint().await.unwrap();
+    let after = state.checkpoint(T0).await.unwrap();
     assert_eq!(after.stats.urls_seen, 2);
     // The earlier snapshot is a value, and admitting more did not reach back
     // into it.

@@ -190,6 +190,7 @@ where
     run!(stats_account_for_what_was_admitted);
     run!(checkpoint_sequence_is_monotonic);
     run!(a_checkpoint_names_the_canonicalisation_its_keys_are_under);
+    run!(a_checkpoint_is_stamped_with_the_time_it_was_given);
 
     report
 }
@@ -854,11 +855,11 @@ async fn stats_account_for_what_was_admitted(state: &dyn State) -> Outcome {
 
 async fn checkpoint_sequence_is_monotonic(state: &dyn State) -> Outcome {
     let first = state
-        .checkpoint()
+        .checkpoint(T0)
         .await
         .map_err(|e| format!("checkpoint failed: {e}"))?;
     let second = state
-        .checkpoint()
+        .checkpoint(T0)
         .await
         .map_err(|e| format!("checkpoint failed: {e}"))?;
     ensure!(
@@ -872,13 +873,30 @@ async fn checkpoint_sequence_is_monotonic(state: &dyn State) -> Outcome {
 
 async fn a_checkpoint_names_the_canonicalisation_its_keys_are_under(state: &dyn State) -> Outcome {
     let checkpoint = state
-        .checkpoint()
+        .checkpoint(T0)
         .await
         .map_err(|e| format!("checkpoint failed: {e}"))?;
     ensure_eq!(
         checkpoint.canon_version.as_str(),
         CANON_VERSION,
         "a checkpoint that does not name its canonicalisation cannot be joined against"
+    );
+    Ok(())
+}
+
+async fn a_checkpoint_is_stamped_with_the_time_it_was_given(state: &dyn State) -> Outcome {
+    // Nothing in this crate reads a clock, so the only time a backend has is
+    // the one it was handed. A backend that ignores it leaves the operator
+    // with a set of snapshot files nothing can date, which defeats most of
+    // what doc 15's dashboard wants them for.
+    let checkpoint = state
+        .checkpoint(T0)
+        .await
+        .map_err(|e| format!("checkpoint failed: {e}"))?;
+    ensure_eq!(
+        checkpoint.taken_ms,
+        T0,
+        "the checkpoint was stamped with a time nobody passed in"
     );
     Ok(())
 }

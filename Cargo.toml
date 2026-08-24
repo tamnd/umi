@@ -66,6 +66,11 @@ arrow = "59"
 parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "snap", "base64"] }
 zstd = "0.13"
 
+# Test only, but it belongs here rather than in one crate's dev-dependencies:
+# every crate that writes a file needs a directory that cleans itself up, and
+# two versions of that in one tree would be silly.
+tempfile = "3"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
