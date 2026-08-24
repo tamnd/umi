@@ -29,7 +29,8 @@ const ESCAPED: [char; 8] = ['\\', '`', '*', '_', '[', ']', '<', '&'];
 /// Links that do not resolve keep their text and lose their destination, which
 /// is better than emitting a relative link nobody downstream can use.
 pub fn render(dom: &Dom, root: usize, base: Option<&Url>) -> String {
-    let mut out = Writer::new(dom, base);
+    let layout = nested_tables(dom);
+    let mut out = Writer::new(dom, base, &layout);
     out.walk_children(root);
     out.finish()
 }
@@ -37,15 +38,19 @@ pub fn render(dom: &Dom, root: usize, base: Option<&Url>) -> String {
 struct Writer<'a> {
     dom: &'a Dom,
     base: Option<&'a Url>,
+    /// For every node, whether a `<table>` sits somewhere below it. See
+    /// `table`, which is the only reader.
+    layout: &'a [bool],
     blocks: Vec<String>,
     inline: String,
 }
 
 impl<'a> Writer<'a> {
-    fn new(dom: &'a Dom, base: Option<&'a Url>) -> Self {
+    fn new(dom: &'a Dom, base: Option<&'a Url>, layout: &'a [bool]) -> Self {
         Self {
             dom,
             base,
+            layout,
             blocks: Vec::new(),
             inline: String::new(),
         }
@@ -142,8 +147,14 @@ impl<'a> Writer<'a> {
                 self.flush();
             }
 
-            Tag::Html | Tag::Body | Tag::Article | Tag::Main | Tag::Section | Tag::Div
-            | Tag::P | Tag::Block => {
+            Tag::Html
+            | Tag::Body
+            | Tag::Article
+            | Tag::Main
+            | Tag::Section
+            | Tag::Div
+            | Tag::P
+            | Tag::Block => {
                 self.flush();
                 self.walk_children(id);
                 self.flush();
@@ -279,28 +290,28 @@ impl<'a> Writer<'a> {
         let dom = self.dom;
         let mut items: Vec<String> = Vec::new();
         let mut number = 1usize;
-        for &child in dom.children(id) {
-            // Anything that is not an item is skipped rather than promoted.
-            // Text directly inside a `<ul>` is almost always whitespace, and the
-            // rest is template debris.
-            match dom.tag(child) {
-                Some(Tag::Li) => {}
-                Some(Tag::Ul | Tag::Ol) => {
-                    // A nested list that is a sibling of the items rather than
-                    // inside one. Render it into the previous item, which is
-                    // where a browser shows it.
-                    let inner = self.render_children(child);
-                    if let Some(last) = items.last_mut()
-                        && !inner.is_empty()
-                    {
-                        last.push_str("\n\n");
-                        last.push_str(&indent(&inner, "  ", "  "));
-                    }
-                    continue;
+        for node in self.items_of(id) {
+            if matches!(dom.tag(node), Some(Tag::Ul | Tag::Ol)) {
+                // A nested list that is a sibling of the items rather than
+                // inside one. Render it into the previous item, which is where a
+                // browser shows it. Rendering the node and not its children is
+                // what keeps the bullets: the children on their own are loose
+                // `<li>` elements and come out as bare paragraphs.
+                let inner = self.render_node(node);
+                if let Some(last) = items.last_mut()
+                    && !inner.is_empty()
+                {
+                    last.push_str("\n\n");
+                    last.push_str(&indent(&inner, "  ", "  "));
                 }
-                _ => continue,
+                continue;
             }
-            let inner = self.render_children(child);
+            // An item, or a block the parser left loose inside the list, or a
+            // run of text. All three are items.
+            let inner = match dom.tag(node) {
+                Some(Tag::Li) => self.render_children(node),
+                _ => self.render_node(node),
+            };
             if inner.is_empty() {
                 // An empty item does not take a number with it, so a list whose
                 // second item is a spacer still reads 1, 2, 3.
@@ -320,10 +331,31 @@ impl<'a> Writer<'a> {
         }
     }
 
+    /// A table, which is two different things wearing the same tag.
+    ///
+    /// A table with a table inside it is a layout table. Markup of a certain age
+    /// nests them three deep to put a sidebar next to an article, and pipes are
+    /// the wrong answer for that: the real content ends up inside one cell of
+    /// one row, on one line, with every bar in it backslashed. So a table that
+    /// holds a table is transparent, exactly like a `<div>`, and the real data
+    /// table further down still comes out as a table when the walk reaches it.
+    ///
+    /// The test for it is "is there a table below me", not "am I below a table",
+    /// because the inner one is the one holding data on every page that does
+    /// this. It costs one bit per node, computed once per document.
     fn table(&mut self, id: usize) {
+        if self.layout.get(id).copied().unwrap_or(false) {
+            self.flush();
+            self.walk_children(id);
+            self.flush();
+            return;
+        }
+
         self.flush();
         let dom = self.dom;
         let mut rows: Vec<Vec<String>> = Vec::new();
+        // No table sits below this one, so every `<tr>` in the subtree is ours
+        // and there is nothing to stop descending at.
         for node in descendants(dom, id) {
             if dom.tag(node) != Some(Tag::Tr) {
                 continue;
@@ -355,10 +387,50 @@ impl<'a> Writer<'a> {
         self.blocks.push(lines.join("\n"));
     }
 
+    /// What a list should treat as its items, seeing through wrappers a parser
+    /// put in the way.
+    ///
+    /// html5ever reconstructs the open formatting elements when markup left a
+    /// `<b>` or an `<i>` unclosed, and the reconstruction can land between a
+    /// `<ul>` and its `<li>` children. A loop over direct children then finds no
+    /// items and drops the entire list, which is silent content loss on exactly
+    /// the sloppy markup the open web is full of. So formatting elements are
+    /// stepped through, and anything else that is not an item becomes one rather
+    /// than being skipped. Text that is only whitespace is the indentation
+    /// between two items and is not content.
+    fn items_of(&self, id: usize) -> Vec<usize> {
+        let dom = self.dom;
+        let mut out = Vec::new();
+        let mut stack: Vec<usize> = dom.children(id).iter().rev().copied().collect();
+        while let Some(node) = stack.pop() {
+            match dom.tag(node) {
+                Some(Tag::A | Tag::Code | Tag::Em | Tag::Other | Tag::Span | Tag::Strong) => {
+                    stack.extend(dom.children(node).iter().rev());
+                }
+                Some(_) => out.push(node),
+                None => {
+                    if let Kind::Text(raw) = dom.kind(node)
+                        && !raw.trim().is_empty()
+                    {
+                        out.push(node);
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// The children of a node rendered as blocks, for a list item or a quote.
     fn render_children(&self, id: usize) -> String {
-        let mut inner = Writer::new(self.dom, self.base);
+        let mut inner = Writer::new(self.dom, self.base, self.layout);
         inner.walk_children(id);
+        inner.finish()
+    }
+
+    /// A node itself rendered as blocks, tag and all.
+    fn render_node(&self, id: usize) -> String {
+        let mut inner = Writer::new(self.dom, self.base, self.layout);
+        inner.walk(id);
         inner.finish()
     }
 
@@ -408,6 +480,24 @@ impl<'a> Writer<'a> {
         }
         Some(out)
     }
+}
+
+/// For every node, whether a `<table>` appears anywhere below it.
+///
+/// One reverse pass rather than a search per table. The arena is built parent
+/// before child, so index order is document order and a node's descendants all
+/// sit after it, which makes the backwards loop a post order walk. Doing this
+/// per table instead would be a subtree scan per table, and a page that nests
+/// five hundred of them would pay for it.
+fn nested_tables(dom: &Dom) -> Vec<bool> {
+    let mut below = vec![false; dom.node_count()];
+    for id in (0..dom.node_count()).rev() {
+        below[id] = dom
+            .children(id)
+            .iter()
+            .any(|&child| below[child] || dom.tag(child) == Some(Tag::Table));
+    }
+    below
 }
 
 /// A subtree in document order, including the node itself.

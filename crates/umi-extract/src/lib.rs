@@ -120,11 +120,12 @@ pub fn extract(html: &[u8], url: &Url) -> Extracted {
     let signals = Signals {
         text_bytes: choice.stats.text,
         link_density: choice.stats.density(),
-        extracted_share: if raw == 0 {
-            0
-        } else {
-            choice.stats.text.saturating_mul(100) / raw
-        },
+        extracted_share: choice
+            .stats
+            .text
+            .saturating_mul(100)
+            .checked_div(raw)
+            .unwrap_or(0),
         top_node_share: choice.share,
         dropped_bytes: tree.dropped_bytes(),
     };
@@ -193,13 +194,21 @@ mod tests {
 
     #[test]
     fn a_plain_article_comes_out_as_markdown() {
+        // Long enough to clear step 3's 200 byte floor, because an article that
+        // does not clear it falls back to the body by design and this test is
+        // about the happy path rather than about the fallback.
         let out = page(
-            "<html><body><article><h2>Title</h2><p>One sentence that is long enough to count.</p>\
+            "<html><body><article><h2>Title</h2>\
+             <p>One sentence that is long enough to count, followed by a second one that \
+             carries the paragraph over the two hundred bytes that step three of the \
+             cascade insists on before it will trust anything at all.</p>\
              <ul><li>first</li><li>second</li></ul></article></body></html>",
         );
         assert_eq!(
             out.markdown,
-            "## Title\n\nOne sentence that is long enough to count.\n\n- first\n- second"
+            "## Title\n\nOne sentence that is long enough to count, followed by a second one \
+             that carries the paragraph over the two hundred bytes that step three of the \
+             cascade insists on before it will trust anything at all.\n\n- first\n- second"
         );
         assert!(out.declared_root);
         assert!(!out.boilerplate_uncertain);
@@ -212,7 +221,8 @@ mod tests {
              <nav><a href='/x'>home</a><a href='/y'>about</a></nav>\
              <div class='sidebar'><a href='/z'>related thing</a><a href='/w'>another</a></div>\
              <article><p>The article body is here and it is comfortably over the length that \
-             step three of the cascade insists on before it will trust a winner.</p></article>\
+             step three of the cascade insists on before it will trust a winner, which takes \
+             rather more words than you would think when you are writing the fixture.</p></article>\
              <footer>copyright</footer></body></html>",
         );
         assert!(out.markdown.starts_with("The article body is here"));
@@ -229,7 +239,10 @@ mod tests {
         html.push_str("</div></body></html>");
         let out = page(&html);
         assert!(out.boilerplate_uncertain, "a link farm is not a safe win");
-        assert!(out.markdown.contains("[link number 0](https://example.com/page/0)"));
+        assert!(
+            out.markdown
+                .contains("[link number 0](https://example.com/page/0)")
+        );
         assert!(out.signals.link_density > 66);
     }
 
@@ -291,7 +304,8 @@ mod tests {
              with a picture in it: <img src='/pic.png' alt='a cat'></p></article></body></html>",
         );
         assert!(
-            out.markdown.contains("[a cat](https://example.com/pic.png)"),
+            out.markdown
+                .contains("[a cat](https://example.com/pic.png)"),
             "{}",
             out.markdown
         );
@@ -342,16 +356,91 @@ mod tests {
     }
 
     #[test]
+    fn a_layout_table_is_transparent_and_the_data_table_inside_it_is_not() {
+        let out = page(
+            "<html><body><table><tr><td><a href=\"/\">Home</a></td>\
+             <td><p>A paragraph that exists to get the page over the length that step \
+             three of the cascade insists on before it will trust a winner.</p>\
+             <table><tr><th>Date</th><th>High</th></tr><tr><td>1 June</td><td>04:12</td></tr>\
+             </table></td></tr></table></body></html>",
+        );
+        assert!(
+            out.markdown
+                .contains("| Date | High |\n| --- | --- |\n| 1 June | 04:12 |"),
+            "{}",
+            out.markdown
+        );
+        // The outer table held the inner one, so it did not become a row of its
+        // own with the whole page escaped into one cell.
+        assert!(!out.markdown.contains("\\|"), "{}", out.markdown);
+        // And the rows came out once, not once per enclosing table.
+        assert_eq!(
+            out.markdown.matches("1 June").count(),
+            1,
+            "{}",
+            out.markdown
+        );
+    }
+
+    #[test]
+    fn list_items_survive_a_formatting_element_the_parser_reconstructed() {
+        // The `<b>` is never closed, so html5ever carries it into the list and
+        // the items are no longer direct children of the `<ul>`. A walk that
+        // only looks at direct children loses all three of them.
+        let out = page(
+            "<html><body><p>A paragraph that exists to get the page over the length \
+             that step three of the cascade insists on before it will trust a winner.\
+             <b>Bold that never closes\
+             <ul><li>An item</li><li>Another item</li><li>A third item</li></ul>\
+             </body></html>",
+        );
+        // Bullets and all, not three loose paragraphs. The items come out bold
+        // because the unclosed `<b>` really does carry into them, which is what
+        // a browser shows too.
+        for item in ["- **An item**", "- **Another item**", "- **A third item**"] {
+            assert!(out.markdown.contains(item), "{}", out.markdown);
+        }
+    }
+
+    #[test]
+    fn a_form_wrapping_the_whole_page_does_not_delete_the_page() {
+        // What WebForms serves. The form is the page, and the controls inside it
+        // are still not content.
+        let out = page(
+            "<html><body><form id=\"aspnetForm\" runat=\"server\">\
+             <input type=\"hidden\" name=\"__VIEWSTATE\" value=\"AAAA\">\
+             <div id=\"content\"><h1>The gauge is back</h1>\
+             <p>Repaired after four months out of service, and this paragraph runs on \
+             long enough that step three of the cascade will trust the winner.</p></div>\
+             <button>Submit</button></form></body></html>",
+        );
+        assert!(
+            out.markdown.contains("# The gauge is back"),
+            "{}",
+            out.markdown
+        );
+        assert!(
+            out.markdown.contains("Repaired after four months"),
+            "{}",
+            out.markdown
+        );
+        assert!(!out.markdown.contains("Submit"), "{}", out.markdown);
+    }
+
+    #[test]
     fn deeply_nested_markup_does_not_blow_the_stack() {
-        // 20000 levels, which is well past `dom::MAX_DEPTH` and well past what
-        // a recursive walk survives. The point of the test is that it returns.
+        // 8192 levels, thirty two times `dom::MAX_DEPTH` and well past what a
+        // recursive walk of any of these passes would survive. The point of the
+        // test is that it returns at all.
         let mut html = String::from("<html><body>");
-        for _ in 0..20_000 {
+        for _ in 0..8192 {
             html.push_str("<div>");
         }
-        html.push_str("The text at the bottom of a very deep hole, long enough that the \
-                       cascade has something to hold on to when it gets there.");
-        for _ in 0..20_000 {
+        html.push_str(
+            "The text at the bottom of a very deep hole, long enough that the \
+             cascade has something to hold on to when it gets there.",
+        );
+        for _ in 0..8192 {
             html.push_str("</div>");
         }
         html.push_str("</body></html>");

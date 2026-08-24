@@ -1,0 +1,14 @@
+<html>
+<head><title>The title tag that never closed
+<body>
+<h1>Everything below here is title text</h1>
+<p>A browser treats the contents of a title tag as raw character data and reads
+until it finds a closing tag. There is no closing tag in this file, so the whole
+document is the title and the body is empty, which is what Chrome and Firefox
+both do with it.</p>
+<p>The extractor is not allowed to be cleverer than the parser here. If we
+recovered the text a browser will not show, the markdown would disagree with the
+page a reader sees, and every downstream consumer inherits the disagreement. So
+this file exists to pin the empty result and to say out loud that it is correct.</p>
+</body>
+</html>

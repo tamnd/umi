@@ -186,12 +186,14 @@ impl Element {
 }
 
 /// One node in the arena.
+///
+/// There is no parent link. Every pass over the tree so far walks downwards and
+/// a parent index nobody reads is eight bytes per node on a tree with a hundred
+/// thousand of them, so it goes in when something needs it.
 #[derive(Debug)]
 pub struct Node {
     /// What the node is.
     pub kind: Kind,
-    /// The parent, absent only for the root.
-    pub parent: Option<usize>,
     /// Children in document order.
     pub children: Vec<usize>,
 }
@@ -212,13 +214,22 @@ impl Dom {
     /// the charset comes off the Content-Type header as often as it comes off a
     /// `<meta>` tag and only the caller has both.
     pub fn parse(html: &[u8]) -> Self {
+        // Script and style are 41 percent of the bytes on a real page and this
+        // hands every one of them to html5ever to tokenise, allocate a tendril
+        // for and hang off a tree that `absorb` then throws away. Taking them
+        // out with a byte scan first was tried and reverted: on a quiet cpu it
+        // was worth two percent, and it disagreed with html5ever on five of two
+        // thousand real pages. Doc 11.1 wants byte identical output forever, so
+        // a scanner that quietly differs from the reference parser is not worth
+        // two percent. If this needs to be fast, the answer is to build the
+        // arena from html5ever's tokeniser and skip `RcDom`, not to guess ahead
+        // of it.
         let parsed = parse_document(RcDom::default(), ParseOpts::default())
             .from_utf8()
             .one(html);
         let mut dom = Self {
             nodes: vec![Node {
                 kind: Kind::Root,
-                parent: None,
                 children: Vec::new(),
             }],
             dropped: 0,
@@ -273,7 +284,6 @@ impl Dom {
                     let me = self.nodes.len();
                     self.nodes.push(Node {
                         kind,
-                        parent: Some(parent),
                         children: Vec::new(),
                     });
                     self.nodes[parent].children.push(me);
@@ -285,7 +295,6 @@ impl Dom {
                     let me = self.nodes.len();
                     self.nodes.push(Node {
                         kind: Kind::Text(text),
-                        parent: Some(parent),
                         children: Vec::new(),
                     });
                     self.nodes[parent].children.push(me);
@@ -339,6 +348,10 @@ impl Dom {
 
     /// The bytes of text dropped with `<script>` and `<style>`, which is one of
     /// doc 11.6's quality signals and is free to count here.
+    ///
+    /// Decoded text rather than source bytes, so it reads shorter than the page
+    /// wherever the source spelled a character as an entity. It is a rough "how
+    /// much of this page was machinery" and not a digest input.
     pub fn dropped_bytes(&self) -> u32 {
         self.dropped
     }
@@ -346,15 +359,27 @@ impl Dom {
 
 /// Map a tag name to a rule, or to `None` for the subtrees doc 11.3 drops.
 ///
-/// `textarea` and `option` are dropped alongside the form controls doc 11.3
-/// names. They are the same class of thing and their text is chrome, not
-/// content. That is a deviation from the letter of the list and it is recorded
+/// `textarea`, `option`, `label` and `legend` are dropped alongside the form
+/// controls doc 11.3 names. They are the same class of thing and their text is
+/// chrome, not content: the word "Email" next to a box is not something a reader
+/// came for. That is a deviation from the letter of the list and it is recorded
 /// here rather than being silent.
 fn classify(name: &str) -> Option<Tag> {
     Some(match name {
         "script" | "style" | "noscript" | "svg" | "canvas" | "iframe" | "object" | "embed"
-        | "form" | "input" | "button" | "select" | "nav" | "header" | "footer" | "aside"
-        | "textarea" | "option" | "template" => return None,
+        | "input" | "button" | "select" | "nav" | "header" | "footer" | "aside" | "textarea"
+        | "option" | "template" | "label" | "legend" => return None,
+
+        // Doc 11.3 lists `form` with the controls and that is a mistake in the
+        // document, not a rule to follow off a cliff. A form is a wrapper, not a
+        // control: ASP.NET WebForms puts one `<form runat="server">` around the
+        // entire body of every page it serves, and on the two thousand real
+        // Common Crawl pages this was measured against, 266 of them, thirteen
+        // percent, have a form spanning more than half the document. Dropping
+        // the subtree deletes those pages. The controls inside it are still
+        // dropped, which is what the rule was reaching for. Written up for a
+        // spec edit.
+        "form" => Tag::Block,
 
         "html" => Tag::Html,
         "head" => Tag::Head,

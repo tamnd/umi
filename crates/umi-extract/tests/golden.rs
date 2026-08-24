@@ -92,7 +92,10 @@ fn every_document_extracts_to_the_recorded_bytes() {
         });
         if recorded != page.markdown {
             wrong.push(name.clone());
-            eprintln!("--- {name} expected\n{recorded}\n--- {name} got\n{}\n", page.markdown);
+            eprintln!(
+                "--- {name} expected\n{recorded}\n--- {name} got\n{}\n",
+                page.markdown
+            );
         }
     }
 
@@ -140,6 +143,9 @@ fn plain_text_never_contains_markdown_syntax_we_emitted() {
                 "{name} left {leftover:?} in the plain text: {text}"
             );
         }
-        assert!(!text.contains('\n'), "{name} left a newline in the plain text");
+        assert!(
+            !text.contains('\n'),
+            "{name} left a newline in the plain text"
+        );
     }
 }

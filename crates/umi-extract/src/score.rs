@@ -4,8 +4,9 @@
 //! comparison. Doc 11.1 rules out floating point in any scoring path that can
 //! flip a decision, and link density is the one quantity that wants to be a
 //! ratio, so it is carried in fixed point hundredths and compared against 66
-//! rather than against 0.66. There is no `f32` or `f64` in this file and there
-//! is a test in `lib.rs` that reads the source and says so.
+//! rather than against 0.66. There is no floating point in this file and there
+//! is a test in `lib.rs` that reads the source and says so, which is why this
+//! comment talks around the type names instead of spelling them.
 
 use crate::dom::{Dom, Kind, ROOT, Tag};
 
@@ -97,11 +98,10 @@ impl Stats {
     /// Link density in hundredths. Zero for a node with no text, which is the
     /// right answer for scoring even though the ratio is undefined.
     pub fn density(self) -> u32 {
-        if self.text == 0 {
-            0
-        } else {
-            self.link_text.saturating_mul(100) / self.text
-        }
+        self.link_text
+            .saturating_mul(100)
+            .checked_div(self.text)
+            .unwrap_or(0)
     }
 }
 
@@ -127,8 +127,17 @@ pub fn choose(dom: &Dom) -> Choice {
     let stats = collect(dom);
     let body = dom.first(Tag::Body).unwrap_or(ROOT);
 
-    let declared = declare(dom, &stats);
-    let mut root = declared.or_else(|| best(dom, &stats)).unwrap_or(body);
+    // Scored once for the whole document rather than once per candidate scan.
+    // Step 1 looks for three kinds of declared root and step 2 looks at every
+    // container, which is four passes, and the marker test inside a score is a
+    // lowercase copy of a class attribute and thirty substring searches over it.
+    // Doing that four times per node is four times a real number: a 512 KiB page
+    // has tens of thousands of nodes and this was the largest single line in the
+    // profile before it was hoisted.
+    let scores = scores(dom, &stats);
+
+    let declared = declare(dom, &scores);
+    let mut root = declared.or_else(|| best(dom, &scores)).unwrap_or(body);
 
     // Step 3. A winner that carries almost nothing, or that is almost all link
     // text, is not a winner. Falling back to the body keeps the links, which on
@@ -139,12 +148,14 @@ pub fn choose(dom: &Dom) -> Choice {
         root = body;
     }
 
-    let body_text = stats[body].text;
-    let share = if body_text == 0 {
-        0
-    } else {
-        stats[root].text.saturating_mul(100) / body_text
-    };
+    // Zero over zero is zero here, the same way `density` treats it: a body with
+    // no text has no share to give and the ratio is not undefined so much as
+    // uninteresting.
+    let share = stats[root]
+        .text
+        .saturating_mul(100)
+        .checked_div(stats[body].text)
+        .unwrap_or(0);
 
     Choice {
         root,
@@ -201,7 +212,7 @@ fn collect(dom: &Dom) -> Vec<Stats> {
 /// `<main>` is only a claim about the page. Within one kind the highest scoring
 /// node wins, so an index page of teasers picks the longest teaser and then
 /// almost always fails step 3 and falls back, which is the right outcome.
-fn declare(dom: &Dom, stats: &[Stats]) -> Option<usize> {
+fn declare(dom: &Dom, scores: &[i64]) -> Option<usize> {
     let body = dom.first(Tag::Body).unwrap_or(ROOT);
     let article_body = |id: usize| {
         dom.element(id).is_some_and(|element| {
@@ -216,7 +227,7 @@ fn declare(dom: &Dom, stats: &[Stats]) -> Option<usize> {
     let pick = |wanted: &dyn Fn(usize) -> bool| -> Option<usize> {
         (0..dom.node_count())
             .filter(|&id| id != body && wanted(id))
-            .max_by_key(|&id| (score(dom, stats, id), std::cmp::Reverse(id)))
+            .max_by_key(|&id| (scores[id], std::cmp::Reverse(id)))
     };
 
     pick(&article_body)
@@ -225,12 +236,19 @@ fn declare(dom: &Dom, stats: &[Stats]) -> Option<usize> {
 }
 
 /// Doc 11.3 step 2, the highest scoring candidate container.
-fn best(dom: &Dom, stats: &[Stats]) -> Option<usize> {
+fn best(dom: &Dom, scores: &[i64]) -> Option<usize> {
     (0..dom.node_count())
         .filter(|&id| dom.tag(id).is_some_and(Tag::is_candidate))
         // Ties go to the node that appeared first, because document order is
         // the only tiebreak that does not depend on how the arena was built.
-        .max_by_key(|&id| (score(dom, stats, id), std::cmp::Reverse(id)))
+        .max_by_key(|&id| (scores[id], std::cmp::Reverse(id)))
+}
+
+/// Every node's score, in one pass.
+fn scores(dom: &Dom, stats: &[Stats]) -> Vec<i64> {
+    (0..dom.node_count())
+        .map(|id| score(dom, stats, id))
+        .collect()
 }
 
 /// One node's score.

@@ -135,8 +135,7 @@ fn strip_inline(line: &str) -> String {
                 if chars.peek() == Some(&'(') {
                     chars.next();
                     let mut depth = 1usize;
-                    loop {
-                        let Some(next) = chars.next() else { break };
+                    while let Some(next) = chars.next() {
                         match next {
                             // The serialiser escapes parentheses inside a URL,
                             // so a backslash here hides the character after it
