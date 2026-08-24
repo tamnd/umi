@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head><title>Characters that mean something to markdown</title></head>
+<body>
+<article>
+  <h1>AT&amp;T, 5 &lt; 6, and *asterisks*</h1>
+  <p>Prose is full of characters that a markdown parser wants to read as markup.
+  Underscores in snake_case identifiers, asterisks used as *emphasis by hand*,
+  square brackets in [citation needed], backticks in `quoted` shell commands, and
+  ampersands in AT&amp;T all have to survive a round trip through the serialiser.</p>
+  <p>&#8220;Curly quotes&#8221; and an em dash &#8212; which we do not write ourselves
+  but which pages are full of &#8212; are just characters and pass straight through.</p>
+  <p>- A line that begins with a dash but is not a list.</p>
+  <p>1. A line that begins with a number and a dot but is not a list either.</p>
+  <p># Not a heading.</p>
+  <p>&gt; Not a quote.</p>
+  <p>A non&#160;breaking space is not ASCII whitespace and does not collapse.</p>
+</article>
+</body>
+</html>

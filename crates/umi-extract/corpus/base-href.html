@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Every link on this page is relative</title>
+  <base href="https://cdn.corpus.example/v2/docs/">
+</head>
+<body>
+<article>
+  <h1>Every link on this page is relative</h1>
+  <p>The base tag moves the whole document to a different origin as far as relative
+  links are concerned, which is a thing static site generators do when they push assets
+  to a CDN and forget that the HTML went with them.</p>
+  <ul>
+    <li><a href="install">A sibling page</a></li>
+    <li><a href="../index.html">One level up</a></li>
+    <li><a href="/absolute/path">An absolute path, which ignores the directory</a></li>
+    <li><a href="https://elsewhere.example/page">An absolute URL, which ignores all of it</a></li>
+    <li><a href="#section">A fragment, which points at this page and is dropped</a></li>
+    <li><a href="mailto:harbour@corpus.example">An email address, which is content</a></li>
+  </ul>
+  <p><img src="img/logo.png" alt="The logo"> is relative too.</p>
+</article>
+</body>
+</html>

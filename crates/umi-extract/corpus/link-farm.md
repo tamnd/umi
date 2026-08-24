@@ -1,0 +1,5 @@
+# Directory
+
+[Accounting](https://corpus.example/c/accounting) [Architecture](https://corpus.example/c/architecture) [Bakeries](https://corpus.example/c/bakeries) [Carpentry](https://corpus.example/c/carpentry) [Dentists](https://corpus.example/c/dentists) [Electricians](https://corpus.example/c/electricians) [Florists](https://corpus.example/c/florists) [Glaziers](https://corpus.example/c/glaziers) [Hairdressers](https://corpus.example/c/hairdressers) [Insurance](https://corpus.example/c/insurance) [Joiners](https://corpus.example/c/joiners) [Kitchens](https://corpus.example/c/kitchens) [Locksmiths](https://corpus.example/c/locksmiths) [Mechanics](https://corpus.example/c/mechanics) [Notaries](https://corpus.example/c/notaries) [Opticians](https://corpus.example/c/opticians) [Plumbers](https://corpus.example/c/plumbers) [Quarries](https://corpus.example/c/quarries) [Roofers](https://corpus.example/c/roofers) [Surveyors](https://corpus.example/c/surveyors)
+
+Pick a trade.

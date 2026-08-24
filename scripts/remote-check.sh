@@ -11,6 +11,24 @@
 #   scripts/remote-check.sh                          # fmt, clippy, test, doc
 #   scripts/remote-check.sh server2                  # the same, elsewhere
 #   scripts/remote-check.sh server3 test -p umi-fetch
+#   scripts/remote-check.sh server3 UMI_BLESS=1 test -p umi-extract
+#
+# Arguments before the cargo subcommand that look like NAME=value are exported
+# on the server, which is how the golden corpus gets blessed and how the bench
+# is pointed at a directory of real pages.
+#
+# The servers run other work and a benchmark that shares a cpu measures that
+# other work, so PREFIX puts something in front of cargo:
+#
+#   PREFIX=nice scripts/remote-check.sh server3 bench -p umi-extract
+#
+# For the real thing, compile first and then run the binary on its own, pinned
+# to one core at real time priority so it takes that cpu instead of queueing for
+# it. Do not put cargo itself under `chrt`: rustc is parallel and would inherit
+# real time priority on every core, on a machine running a live crawl.
+#
+#   scripts/remote-check.sh server3 bench -p umi-extract --no-run
+#   ssh server3 'cd umi-build && taskset -c 7 chrt --fifo 50 ./target/release/deps/extract-* --bench'
 set -euo pipefail
 
 host="${1:-server3}"
@@ -31,8 +49,15 @@ rsync -az --delete \
 # a stray profile override in CI copied into a shell would turn it off quietly.
 env='export PATH="$HOME/.cargo/bin:$PATH" CARGO_INCREMENTAL=1 CARGO_TERM_COLOR=never'
 
+while [ "$#" -gt 0 ] && [[ "$1" == [A-Z_]*=* ]]; do
+	env="$env $1"
+	shift
+done
+
+prefix="${PREFIX:-}"
+
 if [ "$#" -gt 0 ]; then
-	ssh "$host" "$env; cd $remote && time cargo $*"
+	ssh "$host" "$env; cd $remote && time $prefix cargo $*"
 	exit
 fi
 
