@@ -1,0 +1,509 @@
+//! What this backend has to get right, beyond conforming.
+//!
+//! The conformance suite in umi-state says what the trait promises and is the
+//! bulk of the coverage here. It cannot see inside a store, though, and half of
+//! what makes this backend the right default lives inside one: that the file is
+//! a portable SQLite database and not a serialisation format wearing one, that
+//! the schema is versioned and refuses a future it cannot read, and that the
+//! lease query walks an index rather than sorting the frontier. Those are the
+//! cases in this module.
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use rusqlite::Connection;
+use tempfile::TempDir;
+use umi_state::{
+    Candidate, Discovery, FetchOutcome, FetchResult, HostRow, LeaseRequest, Revalidator, State,
+    conformance,
+};
+use umi_types::{FetcherId, RowKey, Tier};
+
+use super::{APPLICATION_ID, SCHEMA_VERSION, SqliteConfig, SqliteState, schema, sql};
+
+/// The same fixed instant the conformance suite runs from.
+const T0: u64 = 1_700_000_000_000;
+
+/// A distinctive six byte value, for the test that looks at raw file bytes.
+/// Six bytes because that is a serial type SQLite stores as a plain big endian
+/// integer, and distinctive because the test asserts the reverse of it does not
+/// appear anywhere in the file.
+const MARKER_MS: u64 = 0x0001_0203_0405_0607 >> 8;
+
+fn fetcher() -> FetcherId {
+    FetcherId::LOCAL
+}
+
+/// A store on disk, with the directory that owns it.
+fn on_disk() -> (TempDir, SqliteState) {
+    let dir = TempDir::new().expect("a temp directory");
+    let state = SqliteState::open(dir.path().join("state.umistate")).expect("a new store");
+    (dir, state)
+}
+
+async fn admit_one(state: &SqliteState, url: &str) {
+    let candidate = Candidate::new(url, T0).expect("a crawlable url");
+    state.admit(&[candidate]).await.expect("admit");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sqlite_backend_conforms() {
+    // On disk rather than in memory, because the point of running the suite
+    // against this backend is to exercise the file, and because a `lease` that
+    // is durable before it returns is not something an in memory store can be
+    // wrong about.
+    let dir = TempDir::new().expect("a temp directory");
+    let n = AtomicU64::new(0);
+
+    conformance::check(|| async {
+        let id = n.fetch_add(1, Ordering::Relaxed);
+        SqliteState::open(dir.path().join(format!("case-{id}.umistate"))).expect("a fresh store")
+    })
+    .await
+    .assert_ok();
+}
+
+#[tokio::test]
+async fn a_store_reopens_with_everything_still_in_it() {
+    let dir = TempDir::new().expect("a temp directory");
+    let path = dir.path().join("state.umistate");
+
+    {
+        let state = SqliteState::open(&path).expect("a new store");
+        admit_one(&state, "https://example.com/one").await;
+        admit_one(&state, "https://example.com/two").await;
+        let leases = state
+            .lease(&LeaseRequest::new(fetcher(), T0, 1))
+            .await
+            .expect("lease");
+        assert_eq!(leases.len(), 1, "one url per host per politeness window");
+    }
+
+    let state = SqliteState::open(&path).expect("the same store again");
+    let stats = state.stats().await.expect("stats");
+    assert_eq!(stats.urls_seen, 2);
+    assert_eq!(
+        stats.leases_in_flight, 1,
+        "a lease is durable before it is handed out, so closing the store does not drop it"
+    );
+
+    // The lease counter is part of the file and not part of the process. If it
+    // restarted at zero, a completion from before the restart would be
+    // attributed to whatever url happened to get id 1 afterwards.
+    let more = state
+        .lease(&LeaseRequest::new(fetcher(), T0 + 60_000, 4))
+        .await
+        .expect("lease");
+    assert!(
+        more.iter().all(|lease| lease.id.raw() > 1),
+        "the lease counter restarted after reopening"
+    );
+}
+
+#[tokio::test]
+async fn the_file_says_what_it_is() {
+    let (dir, state) = on_disk();
+    admit_one(&state, "https://example.com/").await;
+    state.checkpoint(T0).await.expect("checkpoint");
+
+    let bytes = std::fs::read(dir.path().join("state.umistate")).expect("the file");
+    assert!(
+        bytes.starts_with(b"SQLite format 3\0"),
+        "this is supposed to be a database any sqlite tool can open"
+    );
+    // Offset 68 of the header is the application id, big endian, which is what
+    // `file` and every SQLite tool reads to tell one application's databases
+    // from another's. Reading it here also happens to be a direct check that
+    // the header is architecture independent.
+    assert_eq!(
+        &bytes[68..72],
+        &APPLICATION_ID.to_be_bytes(),
+        "the file does not identify itself as umi state"
+    );
+}
+
+#[tokio::test]
+async fn the_schema_version_is_stamped_and_a_newer_one_is_refused() {
+    let dir = TempDir::new().expect("a temp directory");
+    let path = dir.path().join("state.umistate");
+
+    {
+        let state = SqliteState::open(&path).expect("a new store");
+        let version: u32 = state
+            .lock()
+            .conn
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .map(|v| u32::try_from(v).unwrap_or(0))
+            .expect("user_version");
+        assert_eq!(version, SCHEMA_VERSION, "an empty file was not migrated");
+    }
+
+    // A file from a umi that knows more than this one. Opening it read only and
+    // ignoring the columns we do not understand would let the crawl run and
+    // quietly lose whatever the newer version was keeping, so it is refused.
+    {
+        let conn = Connection::open(&path).expect("the file");
+        conn.execute_batch(&format!("PRAGMA user_version = {}", SCHEMA_VERSION + 1))
+            .expect("stamp a newer version");
+    }
+    let err = SqliteState::open(&path).expect_err("a newer schema must be refused");
+    let message = err.to_string();
+    assert!(
+        message.contains("newer umi"),
+        "the error does not tell the operator what happened: {message}"
+    );
+}
+
+#[test]
+fn the_migration_list_covers_every_version() {
+    // Forward only and numbered, so the number is also the count. A version
+    // bump without a migration beside it would leave a store one step behind
+    // and nothing would say so until a query hit a column that was never added.
+    assert_eq!(schema::MIGRATIONS.len(), SCHEMA_VERSION as usize);
+}
+
+#[tokio::test]
+async fn opening_a_store_twice_does_not_migrate_it_twice() {
+    let dir = TempDir::new().expect("a temp directory");
+    let path = dir.path().join("state.umistate");
+    let first = SqliteState::open(&path).expect("a new store");
+    admit_one(&first, "https://example.com/").await;
+    drop(first);
+
+    let second = SqliteState::open(&path).expect("the same store again");
+    let stats = second.stats().await.expect("stats");
+    assert_eq!(
+        stats.urls_seen, 1,
+        "the second open re-ran a migration and dropped what was there"
+    );
+}
+
+#[tokio::test]
+async fn keys_are_stored_as_their_own_bytes() {
+    // The seen set is the case that matters most, because it is the biggest
+    // table and the one a person is most likely to want to query with plain
+    // SQL. A key stored as anything other than the bytes the key type sorts by
+    // would make that query need this crate, which defeats the point.
+    let (_dir, state) = on_disk();
+    let url = "https://example.com/one";
+    admit_one(&state, url).await;
+
+    let key = RowKey::for_url(url, None).expect("a crawlable url");
+    let stored: Vec<u8> = state
+        .lock()
+        .conn
+        .query_row("SELECT url_key FROM seen", [], |row| row.get(0))
+        .expect("the one row");
+    assert_eq!(stored, key.url.as_bytes(), "the seen set is not the key");
+}
+
+#[tokio::test]
+async fn the_file_holds_no_native_endian_integers() {
+    // This is the architecture portability claim, made in the only way a test
+    // on one machine can make it. SQLite writes integers into a record big
+    // endian whatever the host is, so a value stored here appears in the file
+    // most significant byte first, and the little endian spelling of it does
+    // not appear at all. If anything in this crate ever writes a Rust integer
+    // to a blob, this is what notices.
+    let (dir, state) = on_disk();
+    let url = "https://example.com/one";
+    admit_one(&state, url).await;
+
+    let lease = state
+        .lease(&LeaseRequest::new(fetcher(), T0, 1))
+        .await
+        .expect("lease")
+        .pop()
+        .expect("one lease");
+    state
+        .complete(&[FetchOutcome {
+            lease: lease.id,
+            key: lease.key,
+            finished_ms: MARKER_MS,
+            tier_used: Tier::Plain,
+            result: FetchResult::Fetched {
+                status: 200,
+                content_hash: [7u8; 8],
+                revalidate: Revalidator::default(),
+            },
+        }])
+        .await
+        .expect("complete");
+    // Fold the write ahead log in, so the value is in the file being read.
+    state.checkpoint(T0).await.expect("checkpoint");
+
+    let bytes = std::fs::read(dir.path().join("state.umistate")).expect("the file");
+    let big: Vec<u8> = MARKER_MS.to_be_bytes()[2..].to_vec();
+    let little: Vec<u8> = big.iter().rev().copied().collect();
+    assert!(
+        bytes.windows(big.len()).any(|w| w == big),
+        "the timestamp is not in the file big endian, so this test is not testing what it thinks"
+    );
+    assert!(
+        !bytes.windows(little.len()).any(|w| w == little),
+        "something wrote a native endian integer, which is a file that will not move to arm"
+    );
+}
+
+#[tokio::test]
+async fn the_lease_query_walks_the_index() {
+    // A correctness test cannot catch this. Without the index the query returns
+    // exactly the same rows in exactly the same order, it just sorts the whole
+    // frontier to get there, which is fine at ten thousand urls and is the
+    // whole crawl at a hundred million.
+    let (_dir, state) = on_disk();
+    let guard = state.lock();
+    let mut stmt = guard
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", sql::SELECT_READY))
+        .expect("the lease query parses");
+    let plan: Vec<String> = stmt
+        .query_map([0i64, 0i64], |row| row.get::<_, String>("detail"))
+        .expect("a plan")
+        .collect::<rusqlite::Result<_>>()
+        .expect("a plan");
+    let plan = plan.join("\n");
+
+    assert!(
+        plan.contains("ledger_ready"),
+        "the lease query is not using the partial index:\n{plan}"
+    );
+    assert!(
+        !plan.contains("TEMP B-TREE"),
+        "the lease query is sorting the frontier instead of walking it:\n{plan}"
+    );
+}
+
+#[test]
+fn the_index_and_the_query_agree_on_what_is_schedulable() {
+    // Both are built from the same macro, so this cannot fail as written. It is
+    // here because the day somebody decides one of the two needs a fourth state
+    // and edits it in place, this says out loud that the partial index stops
+    // applying.
+    assert!(schema::MIGRATIONS[0].contains(schema::SCHEDULABLE));
+    assert!(sql::SELECT_READY.contains(schema::SCHEDULABLE));
+    assert!(sql::SELECT_READY_IN_PLDS.contains(schema::SCHEDULABLE));
+}
+
+#[test]
+fn the_sql_host_defaults_are_the_rust_ones() {
+    // A host nobody has fetched yet has no record, so the lease query has to
+    // invent one, and the values it invents are `COALESCE` literals rather than
+    // anything the compiler checks. This is the check.
+    let sql = sql::SELECT_READY;
+    assert!(
+        sql.contains(&format!(
+            "COALESCE(hosts.adaptive_delay_ms, {})",
+            HostRow::INITIAL_DELAY_MS
+        )),
+        "the default delay in SQL is not doc 07.6's starting delay"
+    );
+    assert!(
+        sql.contains(&format!(
+            "COALESCE(hosts.tier_preferred, {})",
+            Tier::default().as_u8()
+        )),
+        "the default preferred tier in SQL is not the Rust default"
+    );
+    assert!(
+        sql.contains(&format!(
+            "COALESCE(hosts.tier_max, {})",
+            Tier::default().as_u8()
+        )),
+        "the default tier ceiling in SQL is not the Rust default"
+    );
+}
+
+#[tokio::test]
+async fn a_default_host_behaves_the_same_whether_its_record_exists_or_not() {
+    // The other half of the check above, made through the trait rather than by
+    // reading the SQL. Two stores, identical except that one has been told
+    // about the host in so many words, have to hand out the same work.
+    let (_a, implied) = on_disk();
+    let (_b, explicit) = on_disk();
+
+    let url = "https://example.com/one";
+    admit_one(&implied, url).await;
+    admit_one(&explicit, url).await;
+
+    let key = RowKey::for_url(url, None).expect("a crawlable url");
+    explicit
+        .put_host(&[HostRow::new(key.host, key.pld)])
+        .await
+        .expect("put_host");
+
+    let one = implied
+        .lease(&LeaseRequest::new(fetcher(), T0, 4))
+        .await
+        .expect("lease");
+    let two = explicit
+        .lease(&LeaseRequest::new(fetcher(), T0, 4))
+        .await
+        .expect("lease");
+
+    assert_eq!(one.len(), two.len());
+    assert_eq!(one[0].url, two[0].url);
+    assert_eq!(one[0].not_before_ms, two[0].not_before_ms);
+    assert_eq!(one[0].tier, two[0].tier);
+}
+
+#[tokio::test]
+async fn a_checkpoint_is_a_database_of_its_own() {
+    let (dir, state) = on_disk();
+    admit_one(&state, "https://example.com/one").await;
+
+    let first = state.checkpoint(T0).await.expect("checkpoint");
+    let path = first.path.clone().expect("a snapshot file");
+    assert!(
+        path.exists(),
+        "the checkpoint named a file that is not there"
+    );
+    assert_eq!(first.stats.urls_seen, 1);
+    assert!(first.digest.is_some(), "a snapshot with no digest to check");
+
+    // Admitting more must not reach back into a snapshot already taken. That is
+    // the whole reason analytics reads a checkpoint instead of the live store.
+    admit_one(&state, "https://example.com/two").await;
+    let snapshot = Connection::open(&path).expect("the snapshot opens on its own");
+    let seen: i64 = snapshot
+        .query_row("SELECT COUNT(*) FROM seen", [], |row| row.get(0))
+        .expect("the snapshot has the schema");
+    assert_eq!(seen, 1, "the snapshot moved after it was taken");
+
+    let second = state.checkpoint(T0 + 1).await.expect("checkpoint");
+    assert!(second.sequence > first.sequence);
+    assert_eq!(second.stats.urls_seen, 2);
+    assert_ne!(
+        second.path.as_deref(),
+        Some(path.as_path()),
+        "the second checkpoint overwrote the first"
+    );
+    drop(dir);
+}
+
+#[tokio::test]
+async fn checkpoints_can_be_turned_off_without_turning_off_the_barrier() {
+    // An operator short of disk wants the durability barrier and the sequence
+    // number without a copy of the database every hour.
+    let dir = TempDir::new().expect("a temp directory");
+    let state = SqliteState::open_with(SqliteConfig {
+        snapshots: false,
+        ..SqliteConfig::at(dir.path().join("state.umistate"))
+    })
+    .expect("a new store");
+    admit_one(&state, "https://example.com/").await;
+
+    let checkpoint = state.checkpoint(T0).await.expect("checkpoint");
+    assert_eq!(checkpoint.sequence, 1);
+    assert!(checkpoint.digest.is_none(), "nothing was snapshotted");
+    assert!(
+        !dir.path().join("state.umistate.checkpoints").exists(),
+        "snapshots are off and a snapshot directory appeared anyway"
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_host_keeps_urls_out_of_the_frontier_across_a_restart() {
+    // Doc 07.7 commits to applying a block within an hour of a valid request
+    // and to never silently reversing one. A block the process was holding in
+    // memory and nothing else would be reversed by a restart.
+    let dir = TempDir::new().expect("a temp directory");
+    let path = dir.path().join("state.umistate");
+    let key = RowKey::for_url("https://blocked.example.com/", None).expect("a crawlable url");
+
+    {
+        let state = SqliteState::open(&path).expect("a new store");
+        state
+            .put_host(&[HostRow {
+                blocked: true,
+                ..HostRow::new(key.host, key.pld)
+            }])
+            .await
+            .expect("put_host");
+    }
+
+    let state = SqliteState::open(&path).expect("the same store again");
+    let report = state
+        .admit(&[Candidate::new("https://blocked.example.com/one", T0).expect("a crawlable url")])
+        .await
+        .expect("admit");
+    assert_eq!(report.excluded, 1, "a block did not survive a restart");
+    assert_eq!(report.admitted, 0);
+
+    let leases = state
+        .lease(&LeaseRequest::new(fetcher(), T0, 4))
+        .await
+        .expect("lease");
+    assert!(leases.is_empty(), "a blocked host was leased");
+}
+
+#[tokio::test]
+async fn a_url_from_an_untrusted_fetcher_is_held_and_not_leased() {
+    let (_dir, state) = on_disk();
+    let mut candidate = Candidate::new("https://example.com/one", T0).expect("a crawlable url");
+    candidate.discovery = Discovery::Unverified(FetcherId::from_bytes([7u8; 32]));
+
+    let report = state.admit(&[candidate]).await.expect("admit");
+    assert_eq!(report.held, 1);
+    assert_eq!(report.admitted, 0);
+
+    let leases = state
+        .lease(&LeaseRequest::new(fetcher(), T0, 4))
+        .await
+        .expect("lease");
+    assert!(leases.is_empty(), "a held url was handed out anyway");
+
+    let stats = state.stats().await.expect("stats");
+    assert_eq!(stats.urls_held, 1);
+    assert_eq!(
+        stats.urls_seen, 1,
+        "a held url is still seen, or the same url from a trusted source later is admitted twice"
+    );
+}
+
+#[tokio::test]
+async fn etags_are_interned_once_however_often_they_repeat() {
+    // ETags repeat heavily within a site, which is why the ledger stores a
+    // reference instead of the text. A pool that grew a row per fetch would
+    // turn that saving into a cost.
+    let (_dir, state) = on_disk();
+    for n in 0..4 {
+        admit_one(&state, &format!("https://example.com/{n}")).await;
+    }
+
+    let mut now = T0;
+    for _ in 0..4 {
+        let Some(lease) = state
+            .lease(&LeaseRequest::new(fetcher(), now, 1))
+            .await
+            .expect("lease")
+            .pop()
+        else {
+            break;
+        };
+        now = lease.not_before_ms + 1000;
+        state
+            .complete(&[FetchOutcome {
+                lease: lease.id,
+                key: lease.key,
+                finished_ms: now,
+                tier_used: Tier::Plain,
+                result: FetchResult::Fetched {
+                    status: 200,
+                    content_hash: [1u8; 8],
+                    revalidate: Revalidator {
+                        etag: Some("\"same-everywhere\"".to_owned()),
+                        last_modified_ms: None,
+                    },
+                },
+            }])
+            .await
+            .expect("complete");
+    }
+
+    let pooled: i64 = state
+        .lock()
+        .conn
+        .query_row("SELECT COUNT(*) FROM etags", [], |row| row.get(0))
+        .expect("the pool");
+    assert_eq!(pooled, 1, "the same etag was interned {pooled} times");
+}

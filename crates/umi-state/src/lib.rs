@@ -344,6 +344,12 @@ pub trait State: Send + Sync + 'static {
     /// a checkpoint taken under a different canonicalisation is looking at keys
     /// it cannot join against.
     ///
+    /// `now_ms` is what [`Checkpoint::taken_ms`] is stamped with. Doc 08.4
+    /// writes this method without a time argument, but a backend cannot fill
+    /// that field without reading a clock, and nothing in this crate reads a
+    /// clock. Leaving the field at zero would have been the alternative, and a
+    /// snapshot an operator cannot date is not much of an artefact.
+    ///
     /// **Durability: durable.** Everything a completed
     /// [`complete`](State::complete) recorded before this call is in the
     /// snapshot.
@@ -351,7 +357,7 @@ pub trait State: Send + Sync + 'static {
     /// # Errors
     ///
     /// Whatever the store reports.
-    async fn checkpoint(&self) -> Result<Checkpoint>;
+    async fn checkpoint(&self, now_ms: u64) -> Result<Checkpoint>;
 
     /// The counters an operator watches.
     ///

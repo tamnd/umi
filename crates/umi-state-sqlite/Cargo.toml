@@ -13,3 +13,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+umi-types = { workspace = true }
+umi-state = { workspace = true }
+async-trait = { workspace = true }
+blake3 = { workspace = true }
+rusqlite = { workspace = true }
+# Only for `block_in_place`, so a long transaction does not sit on a runtime
+# worker thread. Nothing here spawns and nothing here needs a reactor.
+tokio = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile = { workspace = true }
