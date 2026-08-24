@@ -199,7 +199,11 @@ impl Robots {
     /// turns into "withhold this page". That was not hypothetical: it withheld
     /// a real page out of the two thousand this was measured against. A leading
     /// agent name such as `googlebot: noindex` is addressed to somebody who is
-    /// not us, and the whole value goes with it, for the reason on [`robots`].
+    /// not us, and the whole value goes with it. The reason a directive naming
+    /// another crawler is left alone rather than obeyed is written up on this
+    /// module's page level reader, which is the other half of the same rule:
+    /// telling one crawler's name from an ordinary `meta` name needs a list of
+    /// crawler names, and that list is doc 07's job rather than this crate's.
     pub fn parse(value: &str) -> Self {
         let mut robots = Self::default();
         for (index, token) in value.split(',').enumerate() {
