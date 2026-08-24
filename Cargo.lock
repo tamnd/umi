@@ -679,6 +679,9 @@ version = "0.0.1"
 [[package]]
 name = "umi-robots"
 version = "0.0.1"
+dependencies = [
+ "umi-types",
+]
 
 [[package]]
 name = "umi-seed"

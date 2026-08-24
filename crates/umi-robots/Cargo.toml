@@ -13,3 +13,9 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+
+[dev-dependencies]
+# Only for tests/no_bypass.rs, which checks that canonicalisation and robots
+# matching agree on the alphabet they compare in. Neither crate can show that
+# on its own.
+umi-types = { workspace = true }
