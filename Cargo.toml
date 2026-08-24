@@ -40,7 +40,7 @@ async-trait = "0.1"
 # chunk trees, block checksums and manifest digests are all blake3, so
 # there is one hash in the tree rather than four.
 blake3 = "1"
-clap = { version = "4.5", features = ["derive", "wrap_help"] }
+clap = { version = "4.6", features = ["derive", "wrap_help"] }
 thiserror = "2"
 
 # URL handling. `url` gives WHATWG parsing and `idna` gives UTS-46 with
@@ -51,19 +51,19 @@ percent-encoding = "2"
 
 # Extraction. html5ever is the parser doc 11.3 names, and markup5ever_rcdom
 # is the tree it builds into.
-html5ever = "0.29"
-markup5ever_rcdom = "0.5"
-tendril = "0.4"
+html5ever = "0.39"
+markup5ever_rcdom = "0.39"
+tendril = "0.5"
 unicode-normalization = "0.1"
 
 # Fetch. rustls only, no openssl-sys anywhere in the default tree, which
 # is gate 2.2 in doc 16 and is asserted in CI.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "stream", "charset", "http2"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "stream", "charset", "http2"] }
 
 # Storage and publishing.
-rusqlite = { version = "0.32", features = ["bundled"] }
-arrow = "53"
-parquet = { version = "53", default-features = false, features = ["arrow", "zstd", "snap", "base64"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+arrow = "59"
+parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "snap", "base64"] }
 zstd = "0.13"
 
 serde = { version = "1", features = ["derive"] }
