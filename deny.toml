@@ -16,6 +16,12 @@ allow = [
   "ISC",
   "Unicode-3.0",
   "Zlib",
+  # webpki-root-certs is the Mozilla CA root bundle that rustls-platform-verifier
+  # falls back to, and CDLA-Permissive-2.0 is a data licence rather than a code
+  # one. It grants use, modification and redistribution with no conditions
+  # attached to either the data or anything built from it, which is the same
+  # deal the permissive code licences above give us.
+  "CDLA-Permissive-2.0",
 ]
 
 [sources]

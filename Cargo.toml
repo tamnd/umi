@@ -56,9 +56,15 @@ markup5ever_rcdom = "0.39"
 tendril = "0.5"
 unicode-normalization = "0.1"
 
-# Fetch. rustls only, no openssl-sys anywhere in the default tree, which
-# is gate 2.2 in doc 16 and is asserted in CI.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "stream", "charset", "http2"] }
+# Fetch. rustls only, no openssl-sys anywhere in the default tree, which is
+# gate 2.2 in doc 16 and is asserted in CI. Roots come from the platform store
+# through rustls-platform-verifier, which is what reqwest 0.13 does on its own
+# and is the right default for a fetcher somebody else runs: a host behind a
+# corporate root should work without us shipping a way to add one.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "brotli", "zstd", "deflate", "stream", "charset", "http2"] }
+http = "1"
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Storage and publishing.
 rusqlite = { version = "0.40", features = ["bundled"] }

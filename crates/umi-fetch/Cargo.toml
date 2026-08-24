@@ -13,3 +13,13 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+umi-types = { workspace = true }
+
+blake3 = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
