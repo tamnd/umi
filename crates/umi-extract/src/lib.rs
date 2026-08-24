@@ -28,12 +28,17 @@
 mod dom;
 mod links;
 mod markdown;
+mod meta;
 mod score;
 mod text;
 
 use url::Url;
 
 pub use links::{Link, LinkKind, Links, MAX_ANCHOR, MAX_LINKS, Rel, Robots};
+pub use meta::{
+    DescriptionSource, Heading, MAX_DERIVED_DESCRIPTION, MAX_DESCRIPTION, MAX_FEEDS, MAX_HEADING,
+    MAX_HEADINGS, MAX_TITLE, Meta, Structured, TitleSource,
+};
 pub use text::plain_text;
 
 /// The extractor version, which doc 11.10 says appears in the doc 04 receipt,
@@ -94,8 +99,15 @@ pub struct Extracted {
     /// were never told to forget.
     pub links: Links,
     /// What the page's `meta robots` said, merged with any `X-Robots-Tag` the
-    /// caller passed to [`extract_with_robots`].
+    /// caller passed to [`extract_with_headers`].
     pub robots: Robots,
+    /// Doc 11.6's metadata and snippets.
+    ///
+    /// Thinned rather than emptied when the content is withheld: the title, the
+    /// description and the headings go, and the canonical URL, the dates, the
+    /// feeds and the vocabulary flags stay, because none of those are content
+    /// and all of them are facts the frontier needs.
+    pub meta: Meta,
     /// Why the content is not here, when it is not.
     ///
     /// When this is set, `markdown` is empty and so is everything derived from
@@ -141,19 +153,37 @@ impl Extracted {
 /// belongs to the caller, because the charset comes off the Content-Type header
 /// as often as it comes off a `<meta>` tag and only the caller has both.
 pub fn extract(html: &[u8], url: &Url) -> Extracted {
-    extract_with_robots(html, url, None)
+    extract_with_headers(html, url, Headers::default())
 }
 
-/// Extract a document, with an `X-Robots-Tag` header value the caller saw.
+/// The response headers that change what extraction produces.
 ///
-/// Doc 11.4 obeys `noindex` from either the header or the `meta robots` tag,
-/// and only the fetch path has the header. Whichever says no, wins.
-pub fn extract_with_robots(html: &[u8], url: &Url, x_robots_tag: Option<&str>) -> Extracted {
+/// Doc 11.5 keeps sixteen headers and two of them say something this crate has
+/// to act on, so those two are what it takes. Passing the pair rather than the
+/// whole map keeps the input to this crate down to bytes, a URL and this, which
+/// is the thing doc 11.1's "same input, same output" promise is measured
+/// against.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Headers<'a> {
+    /// `X-Robots-Tag`, which can withhold the content the same way a `meta
+    /// robots` tag can.
+    pub x_robots_tag: Option<&'a str>,
+    /// `Link`, which is the other place a `rel=canonical` is allowed to live.
+    /// Used only when the document does not carry one.
+    pub link: Option<&'a str>,
+}
+
+/// Extract a document, with the response headers the caller saw.
+///
+/// Doc 11.4 obeys `noindex` from either the `X-Robots-Tag` header or the `meta
+/// robots` tag, and only the fetch path has the header. Whichever says no, wins.
+pub fn extract_with_headers(html: &[u8], url: &Url, headers: Headers<'_>) -> Extracted {
     let tree = dom::Dom::parse(html);
     let base = base_of(&tree, url);
     let choice = score::choose(&tree);
 
-    let robots = links::robots(&tree).union(x_robots_tag.map(Robots::parse).unwrap_or_default());
+    let robots =
+        links::robots(&tree).union(headers.x_robots_tag.map(Robots::parse).unwrap_or_default());
     let found = links::collect(&tree, choice.root, base.as_str(), robots);
 
     // The links are collected before this and kept regardless. Doc 11.4 is
@@ -165,6 +195,15 @@ pub fn extract_with_robots(html: &[u8], url: &Url, x_robots_tag: Option<&str>) -
         String::new()
     } else {
         markdown::render(&tree, choice.root, Some(&base))
+    };
+
+    // Doc 11.4 withholds the title, the description and the snippets alongside
+    // the markdown, and doc 11.6's other fields are not content, so a withheld
+    // page takes the thinner of the two rather than nothing at all.
+    let meta = if withheld.is_some() {
+        meta::frontier(&tree, &found, headers.link)
+    } else {
+        meta::collect(&tree, choice.root, &body, &found, headers.link)
     };
 
     let raw = u32::try_from(html.len()).unwrap_or(u32::MAX);
@@ -190,6 +229,7 @@ pub fn extract_with_robots(html: &[u8], url: &Url, x_robots_tag: Option<&str>) -
         signals,
         links: found,
         robots,
+        meta,
         content_withheld: withheld,
         version: VERSION,
     }
@@ -235,6 +275,7 @@ mod tests {
             ("lib.rs", include_str!("lib.rs")),
             ("dom.rs", include_str!("dom.rs")),
             ("links.rs", include_str!("links.rs")),
+            ("meta.rs", include_str!("meta.rs")),
             ("score.rs", include_str!("score.rs")),
             ("markdown.rs", include_str!("markdown.rs")),
             ("text.rs", include_str!("text.rs")),
@@ -675,7 +716,14 @@ mod tests {
         let url = Url::parse("https://example.com/a/b").expect("the test url parses");
         let html =
             format!("<html><body><article>{BODY}<a href='/one'>one</a></article></body></html>");
-        let out = extract_with_robots(html.as_bytes(), &url, Some("noindex, nofollow"));
+        let out = extract_with_headers(
+            html.as_bytes(),
+            &url,
+            Headers {
+                x_robots_tag: Some("noindex, nofollow"),
+                ..Headers::default()
+            },
+        );
         assert_eq!(out.content_withheld, Some(Withheld::Noindex));
         assert!(out.robots.nofollow);
         assert_eq!(out.links.links.len(), 1);
@@ -773,5 +821,325 @@ mod tests {
             out.links.links[0].url,
             "https://cdn.example.org/root/deep/page"
         );
+    }
+
+    #[test]
+    fn the_title_prefers_the_title_tag_then_open_graph_then_the_first_heading() {
+        let out = page(&format!(
+            "<html><head><title>The real title</title>\
+             <meta property='og:title' content='The social title'></head>\
+             <body><article><h1>The heading</h1>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.title.as_deref(), Some("The real title"));
+        assert_eq!(out.meta.title_source, Some(TitleSource::Title));
+
+        let out = page(&format!(
+            "<html><head><meta property='og:title' content='The social title'></head>\
+             <body><article><h1>The heading</h1>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.title.as_deref(), Some("The social title"));
+        assert_eq!(out.meta.title_source, Some(TitleSource::OpenGraph));
+
+        let out = page(&format!(
+            "<html><body><article><h1>The heading</h1>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.title.as_deref(), Some("The heading"));
+        assert_eq!(out.meta.title_source, Some(TitleSource::Heading));
+    }
+
+    #[test]
+    fn an_empty_title_tag_falls_through_to_the_next_rule() {
+        // Templates ship `<title></title>` and a page with one has no title, not
+        // an empty one.
+        let out = page(&format!(
+            "<html><head><title>  </title>\
+             <meta property='og:title' content='The social title'></head>\
+             <body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.title.as_deref(), Some("The social title"));
+    }
+
+    #[test]
+    fn a_masthead_heading_is_not_the_title() {
+        // The `h1` in the header is the site's name. The content root is what
+        // tells it from the article's own heading.
+        let out = page(&format!(
+            "<html><body><header><h1>The Daily Example</h1></header>\
+             <article><h1>What actually happened</h1>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.title.as_deref(), Some("What actually happened"));
+    }
+
+    #[test]
+    fn the_description_prefers_the_meta_tag_and_says_when_it_is_ours() {
+        let out = page(&format!(
+            "<html><head><meta name='description' content='What the author wrote'>\
+             <meta property='og:description' content='The social one'></head>\
+             <body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(
+            out.meta.description.as_deref(),
+            Some("What the author wrote")
+        );
+        assert_eq!(out.meta.description_source, Some(DescriptionSource::Meta));
+        assert!(!out.meta.description_derived());
+
+        let out = page(&format!(
+            "<html><head><meta name='twitter:description' content='The bird one'></head>\
+             <body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(
+            out.meta.description_source,
+            Some(DescriptionSource::Twitter)
+        );
+    }
+
+    #[test]
+    fn a_page_with_no_description_gets_one_from_its_first_paragraph() {
+        let out = page(&format!(
+            "<html><body><article><h2>A heading first</h2>{BODY}</article></body></html>"
+        ));
+        assert_eq!(
+            out.meta.description_source,
+            Some(DescriptionSource::FirstParagraph)
+        );
+        assert!(out.meta.description_derived());
+        let description = out.meta.description.expect("the fallback produced one");
+        // The heading is not the description, the prose is, and it is cut on a
+        // word boundary rather than mid word.
+        assert!(
+            description.starts_with("A paragraph that exists"),
+            "{description}"
+        );
+        assert!(description.len() <= MAX_DERIVED_DESCRIPTION);
+        assert!(!description.ends_with(' '));
+        assert!(BODY.contains(&description[..40]));
+    }
+
+    #[test]
+    fn the_headings_come_from_the_content_and_stop_at_h3() {
+        let out = page(&format!(
+            "<html><body><nav><h2>Sections</h2></nav>\
+             <article><h1>One</h1>{BODY}<h2>Two</h2><h3>Three</h3><h4>Four</h4></article>\
+             <footer><h2>Contact</h2></footer></body></html>"
+        ));
+        let headings: Vec<_> = out
+            .meta
+            .headings
+            .iter()
+            .map(|heading| (heading.level, heading.text.as_str()))
+            .collect();
+        assert_eq!(headings, [(1, "One"), (2, "Two"), (3, "Three")]);
+    }
+
+    #[test]
+    fn the_canonical_and_the_feeds_come_out_resolved() {
+        let out = page(&format!(
+            "<html><head><link rel='canonical' href='/real'>\
+             <link rel='alternate' type='application/rss+xml' href='/feed.xml'>\
+             <link rel='alternate' hreflang='fr' href='/fr/'>\
+             </head><body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(
+            out.meta.canonical.as_deref(),
+            Some("https://example.com/real")
+        );
+        // A translation is an alternate too, and it is not a feed.
+        assert_eq!(out.meta.feeds, ["https://example.com/feed.xml"]);
+    }
+
+    #[test]
+    fn a_link_header_carries_the_canonical_when_the_page_does_not() {
+        let url = Url::parse("https://example.com/a/b").expect("the test url parses");
+        let html = format!("<html><body><article>{BODY}</article></body></html>");
+        let out = extract_with_headers(
+            html.as_bytes(),
+            &url,
+            Headers {
+                link: Some("<https://example.com/real>; rel=\"canonical\""),
+                ..Headers::default()
+            },
+        );
+        assert_eq!(
+            out.meta.canonical.as_deref(),
+            Some("https://example.com/real")
+        );
+    }
+
+    #[test]
+    fn the_document_wins_over_the_link_header() {
+        let url = Url::parse("https://example.com/a/b").expect("the test url parses");
+        let html = format!(
+            "<html><head><link rel='canonical' href='/from-the-page'></head>\
+             <body><article>{BODY}</article></body></html>"
+        );
+        let out = extract_with_headers(
+            html.as_bytes(),
+            &url,
+            Headers {
+                link: Some("<https://example.com/from-the-header>; rel=canonical"),
+                ..Headers::default()
+            },
+        );
+        assert_eq!(
+            out.meta.canonical.as_deref(),
+            Some("https://example.com/from-the-page")
+        );
+    }
+
+    #[test]
+    fn json_ld_gives_up_five_fields_and_keeps_none_of_the_rest() {
+        let out = page(&format!(
+            "<html><head><script type='application/ld+json'>{{\
+             \"@context\": \"https://schema.org\", \"@type\": \"NewsArticle\",\
+             \"headline\": \"What happened\", \"datePublished\": \"2026-01-02T03:04:05Z\",\
+             \"dateModified\": \"2026-01-03T00:00:00Z\",\
+             \"author\": {{\"@type\": \"Person\", \"name\": \"A Reporter\"}},\
+             \"articleBody\": \"the whole article repeated again\"\
+             }}</script></head><body><article>{BODY}</article></body></html>"
+        ));
+        let structured = &out.meta.structured;
+        // The author's `Person` is not one of the page's types. The walk goes
+        // down `@graph`, whose members are all statements about the page, and
+        // not into an arbitrary nested object, where every `@type` is a fact
+        // about a field rather than about the document.
+        assert_eq!(structured.types, ["NewsArticle"]);
+        assert_eq!(structured.headline.as_deref(), Some("What happened"));
+        assert_eq!(structured.author.as_deref(), Some("A Reporter"));
+        assert_eq!(
+            structured.published.as_deref(),
+            Some("2026-01-02T03:04:05Z")
+        );
+        assert_eq!(structured.modified.as_deref(), Some("2026-01-03T00:00:00Z"));
+        // The blob is not kept, which is the point of keeping five fields.
+        assert!(!format!("{structured:?}").contains("repeated again"));
+        // And the script never reached the content.
+        assert!(!out.markdown.contains("repeated again"), "{}", out.markdown);
+    }
+
+    #[test]
+    fn json_ld_in_a_graph_is_still_read_and_broken_json_is_not_fatal() {
+        let out = page(&format!(
+            "<html><head>\
+             <script type='application/ld+json'>{{not json at all</script>\
+             <script type='text/javascript'>var datePublished = \"1999\";</script>\
+             <script type='application/ld+json'>{{\"@graph\": [\
+             {{\"@type\": \"WebPage\"}},\
+             {{\"@type\": \"Article\", \"datePublished\": \"2026-05-06\"}}]}}</script>\
+             </head><body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.structured.types, ["WebPage", "Article"]);
+        assert_eq!(out.meta.structured.published.as_deref(), Some("2026-05-06"));
+        // A plain script is a script, not structured data.
+        assert!(!out.meta.structured.types.contains(&"1999".to_owned()));
+    }
+
+    #[test]
+    fn microdata_and_rdfa_are_noticed_and_not_parsed() {
+        let out = page(&format!(
+            "<html><body><article itemscope itemtype='https://schema.org/Article'>\
+             {BODY}</article></body></html>"
+        ));
+        assert!(out.meta.microdata);
+        assert!(!out.meta.rdfa);
+
+        let out = page(&format!(
+            "<html><body><article typeof='Article'>{BODY}</article></body></html>"
+        ));
+        assert!(out.meta.rdfa);
+        assert!(!out.meta.microdata);
+
+        // A page with neither is not flagged by an `itemprop` on its own, which
+        // turns up all over pages that carry no vocabulary.
+        let out = page(&format!(
+            "<html><body><article><span itemprop='name'>x</span>{BODY}</article></body></html>"
+        ));
+        assert!(!out.meta.microdata);
+        assert!(!out.meta.rdfa);
+    }
+
+    #[test]
+    fn the_declared_language_is_recorded_as_the_page_wrote_it() {
+        let out = page(&format!(
+            "<html lang='EN-GB'><body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.declared_lang.as_deref(), Some("en-gb"));
+        let out = page(&format!(
+            "<html><body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.declared_lang, None);
+    }
+
+    #[test]
+    fn the_dates_stay_in_separate_columns_when_they_disagree() {
+        let out = page(&format!(
+            "<html><head><meta property='article:published_time' content='2026-01-01'>\
+             <meta property='article:modified_time' content='2026-02-02'>\
+             <script type='application/ld+json'>{{\"@type\": \"Article\",\
+             \"datePublished\": \"2020-12-31\"}}</script></head>\
+             <body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.meta.published.as_deref(), Some("2026-01-01"));
+        assert_eq!(out.meta.modified.as_deref(), Some("2026-02-02"));
+        assert_eq!(out.meta.structured.published.as_deref(), Some("2020-12-31"));
+        assert_eq!(out.meta.structured.modified, None);
+    }
+
+    #[test]
+    fn a_withheld_page_keeps_the_frontier_metadata_and_loses_the_content_metadata() {
+        let out = page(&format!(
+            "<html lang='en'><head><meta name='robots' content='noindex'>\
+             <title>A title nobody gets</title>\
+             <meta name='description' content='A description nobody gets'>\
+             <link rel='canonical' href='/real'>\
+             <link rel='alternate' type='application/atom+xml' href='/feed'>\
+             <meta property='article:modified_time' content='2026-03-03'>\
+             <script type='application/ld+json'>{{\"@type\": \"Article\",\
+             \"headline\": \"A headline nobody gets\", \"datePublished\": \"2026-03-01\",\
+             \"author\": {{\"name\": \"Nobody\"}}}}</script></head>\
+             <body><article><h1>A heading nobody gets</h1>{BODY}</article></body></html>"
+        ));
+        assert_eq!(out.content_withheld, Some(Withheld::Noindex));
+
+        // Content, and content under another name, all gone.
+        assert_eq!(out.meta.title, None);
+        assert_eq!(out.meta.title_source, None);
+        assert_eq!(out.meta.description, None);
+        assert!(out.meta.headings.is_empty());
+        assert_eq!(out.meta.structured.headline, None);
+        assert_eq!(out.meta.structured.author, None);
+        let dump = format!("{:?}", out.meta);
+        for secret in ["nobody gets", "Nobody"] {
+            assert!(!dump.contains(secret), "{dump}");
+        }
+
+        // Facts about the page, all kept.
+        assert_eq!(
+            out.meta.canonical.as_deref(),
+            Some("https://example.com/real")
+        );
+        assert_eq!(out.meta.feeds, ["https://example.com/feed"]);
+        assert_eq!(out.meta.modified.as_deref(), Some("2026-03-03"));
+        assert_eq!(out.meta.structured.published.as_deref(), Some("2026-03-01"));
+        assert_eq!(out.meta.structured.types, ["Article"]);
+        assert_eq!(out.meta.declared_lang.as_deref(), Some("en"));
+    }
+
+    #[test]
+    fn the_metadata_caps_hold() {
+        let long = "word ".repeat(200);
+        let out = page(&format!(
+            "<html><head><title>{long}</title>\
+             <meta name='description' content='{}'></head>\
+             <body><article>{BODY}{}</article></body></html>",
+            "d".repeat(4096),
+            "<h2>a heading</h2>".repeat(MAX_HEADINGS + 10)
+        ));
+        assert_eq!(out.meta.title.expect("a title").len(), MAX_TITLE);
+        assert_eq!(
+            out.meta.description.expect("a description").len(),
+            MAX_DESCRIPTION
+        );
+        assert_eq!(out.meta.headings.len(), MAX_HEADINGS);
     }
 }
