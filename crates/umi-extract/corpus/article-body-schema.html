@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Schema markup on a page with no article tag</title>
+  <script type="application/ld+json">
+  {"@context":"https://schema.org","@type":"NewsArticle","headline":"The gauge is back",
+   "datePublished":"2026-06-01T09:00:00Z","author":{"@type":"Person","name":"A Secretary"}}
+  </script>
+</head>
+<body>
+<div id="page" itemscope itemtype="https://schema.org/NewsArticle">
+  <div class="masthead"><a href="/">The Local</a> <a href="/subscribe">Subscribe</a></div>
+  <h1 itemprop="headline">The gauge is back</h1>
+  <div class="byline" itemprop="author">By a secretary</div>
+  <div itemprop="articleBody">
+    <p>The tide gauge on the north wall has been repaired and is reading correctly for
+    the first time since February, when a piece of driftwood the size of a door took
+    out the float housing during the storm.</p>
+    <p>The replacement was paid for out of the maintenance fund, which means the
+    resurfacing of the slipway moves to next year, which surprised nobody at the
+    meeting where it was announced.</p>
+  </div>
+  <div class="related-posts"><a href="/a">Storm damage</a> <a href="/b">Slipway plans</a></div>
+</div>
+</body>
+</html>

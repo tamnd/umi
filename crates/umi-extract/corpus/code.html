@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html>
+<head><title>Reading the gauge over serial</title></head>
+<body>
+<article>
+  <h1>Reading the gauge over serial</h1>
+  <p>The gauge speaks a line protocol at 9600 baud and the only thing it will tell you
+  is the current reading in millimetres, which is enough. Open the port and read.</p>
+  <pre><code class="language-rust">fn read(port: &amp;mut Serial) -&gt; io::Result&lt;i32&gt; {
+    let mut line = String::new();
+    port.read_line(&amp;mut line)?;
+    line.trim().parse().map_err(io::Error::other)
+}
+</code></pre>
+  <p>On the shell side, use <code>stty</code> to set the port up first, and note that
+  the inline example below contains a backtick so the fence has to be longer.</p>
+  <pre>stty -F /dev/ttyUSB0 9600 raw
+cat /dev/ttyUSB0 | while read -r mm; do echo "`date -Is` $mm"; done
+</pre>
+  <p>A code span with a backtick in it: <code>echo `date`</code>, and one without:
+  <code>stty -a</code>.</p>
+</article>
+</body>
+</html>

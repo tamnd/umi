@@ -13,3 +13,21 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+umi-types = { workspace = true }
+
+blake3 = { workspace = true }
+html5ever = { workspace = true }
+markup5ever_rcdom = { workspace = true }
+unicode-normalization = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+blake3 = { workspace = true }
+hex = { workspace = true }
+
+# Not criterion. Doc 11.9's question is milliseconds per page across a corpus,
+# where the tail across documents is the interesting statistic, and that is a
+# sort over `Instant`, not a statistical harness for microsecond comparisons.
+[[bench]]
+name = "extract"
+harness = false
