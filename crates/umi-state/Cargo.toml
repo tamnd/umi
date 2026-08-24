@@ -13,3 +13,11 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+umi-types = { workspace = true }
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Only to drive the async tests. Nothing in this crate needs a runtime, and
+# nothing in it spawns, so a backend is free to be built on something else.
+tokio = { workspace = true, features = ["rt", "macros"] }

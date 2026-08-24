@@ -107,6 +107,157 @@ fixed_key!(
     "A full blake3-256 digest: response bodies, extractions, chunk roots and\nmanifest entries all use this.\n\nThe rule from `docs/spec/17-open-questions.md` section 17.4 is that digests\nare taken over logical values and never over encoded bytes, except when\nchecking that one specific file arrived intact."
 );
 
+/// The identity of a fetcher: its ed25519 public key, as it appears in
+/// `docs/spec/04-fetch-protocol.md`.
+///
+/// This is not derived from anything, which is why it is spelled out here
+/// rather than built with the same macro as the key types. A fetcher chooses
+/// its own keypair, the coordinator learns the public half at handshake, and
+/// every lease, receipt and published row carries it so that work can be
+/// attributed and reputation can be kept per doc 06.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct FetcherId([u8; 32]);
+
+impl FetcherId {
+    /// The width of a fetcher id in bytes.
+    pub const LEN: usize = 32;
+
+    /// The coordinator's own id, used for work it fetches itself.
+    ///
+    /// An all zero key is not a valid ed25519 public key, so nothing that
+    /// completes a handshake can ever collide with it.
+    pub const LOCAL: Self = Self([0u8; 32]);
+
+    /// Wrap a public key that has already been decoded.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Borrow the public key.
+    #[must_use]
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Whether this is the coordinator itself rather than a remote fetcher.
+    #[must_use]
+    pub const fn is_local(&self) -> bool {
+        // Written as a loop because array equality is not const yet, and this
+        // being const is what lets a match arm compare against `LOCAL`.
+        let mut i = 0;
+        while i < Self::LEN {
+            if self.0[i] != 0 {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+}
+
+impl fmt::Display for FetcherId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in &self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for FetcherId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_local() {
+            f.write_str("FetcherId(local)")
+        } else {
+            write!(f, "FetcherId({self})")
+        }
+    }
+}
+
+/// The fetch ladder from `docs/spec/05-anti-bot-ladder.md` section 5.2.
+///
+/// The ordering is the cost ordering, so `<` really does mean cheaper, and the
+/// escalation rules in 5.8 are written as comparisons against it. Tiers live
+/// here rather than in `umi-fetch` because the state layer stores the tier a
+/// host prefers, the protocol negotiates which tiers a fetcher can run, and
+/// the file format records the tier a page came from.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[repr(u8)]
+pub enum Tier {
+    /// Conditional request against a known revalidator. No body if it holds.
+    Revalidate = 0,
+    /// Plain HTTP with an honest identity. The default and the bulk of the
+    /// crawl.
+    #[default]
+    Plain = 1,
+    /// A matched browser TLS and HTTP/2 fingerprint, for hosts whose bot
+    /// management refuses a non browser stack.
+    Emulated = 2,
+    /// Headless Chromium, for pages that are a client rendered shell.
+    Rendered = 3,
+    /// A supervised real browser. Allowlisted, opt in, never dispatched to a
+    /// fetcher that did not ask for it.
+    Supervised = 4,
+}
+
+impl Tier {
+    /// Every tier, cheapest first.
+    pub const ALL: [Self; 5] = [
+        Self::Revalidate,
+        Self::Plain,
+        Self::Emulated,
+        Self::Rendered,
+        Self::Supervised,
+    ];
+
+    /// Recover a tier from the byte a stored row or a protocol frame holds.
+    #[must_use]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Revalidate),
+            1 => Some(Self::Plain),
+            2 => Some(Self::Emulated),
+            3 => Some(Self::Rendered),
+            4 => Some(Self::Supervised),
+            _ => None,
+        }
+    }
+
+    /// The byte a stored row or a protocol frame holds.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The next tier up, or `None` at the top of the ladder.
+    #[must_use]
+    pub const fn escalate(self) -> Option<Self> {
+        Self::from_u8(self as u8 + 1)
+    }
+
+    /// The next tier down, or `None` at the bottom.
+    #[must_use]
+    pub const fn de_escalate(self) -> Option<Self> {
+        match self as u8 {
+            0 => None,
+            n => Self::from_u8(n - 1),
+        }
+    }
+}
+
+impl fmt::Display for Tier {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Revalidate => "T0",
+            Self::Plain => "T1",
+            Self::Emulated => "T2",
+            Self::Rendered => "T3",
+            Self::Supervised => "T4",
+        })
+    }
+}
+
 /// The ordering the state layer stores rows in.
 ///
 /// Sorting by pay level domain, then host, then URL puts everything a
@@ -227,6 +378,38 @@ mod tests {
         let short = UrlKey::derive(url);
         let long = UrlKeyFull::derive(url);
         assert_eq!(&long.as_bytes()[..UrlKey::LEN], short.as_bytes());
+    }
+
+    #[test]
+    fn the_tier_ladder_is_ordered_by_cost() {
+        // Doc 05.8 writes escalation as "start at preferred, stop at max", so
+        // the comparison operators have to mean what that sentence assumes.
+        assert!(Tier::Revalidate < Tier::Plain);
+        assert!(Tier::Plain < Tier::Emulated);
+        assert!(Tier::Emulated < Tier::Rendered);
+        assert!(Tier::Rendered < Tier::Supervised);
+        assert_eq!(Tier::default(), Tier::Plain);
+    }
+
+    #[test]
+    fn a_tier_round_trips_through_the_byte_a_row_stores() {
+        for tier in Tier::ALL {
+            assert_eq!(Tier::from_u8(tier.as_u8()), Some(tier));
+        }
+        assert_eq!(Tier::from_u8(5), None);
+        assert_eq!(Tier::Supervised.escalate(), None);
+        assert_eq!(Tier::Revalidate.de_escalate(), None);
+        assert_eq!(Tier::Plain.de_escalate(), Some(Tier::Revalidate));
+    }
+
+    #[test]
+    fn the_local_fetcher_id_cannot_be_a_real_key() {
+        // An all zero ed25519 public key is not on the curve, so no fetcher
+        // that finished a handshake can present one.
+        assert!(FetcherId::LOCAL.is_local());
+        assert!(!FetcherId::from_bytes([1u8; 32]).is_local());
+        assert_eq!(format!("{:?}", FetcherId::LOCAL), "FetcherId(local)");
+        assert_eq!(FetcherId::from_bytes([1u8; 32]).to_string().len(), 64);
     }
 
     #[test]

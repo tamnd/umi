@@ -31,6 +31,11 @@ umi-publish = { path = "crates/umi-publish", version = "0.0.1" }
 umi-seed = { path = "crates/umi-seed", version = "0.0.1" }
 
 anyhow = "1"
+# The state trait is used through `Box<dyn State>`, because the backend is
+# chosen from config at runtime. Native async fn in traits is stable on 1.98
+# but is not dyn compatible, so the boxing has to happen somewhere and this
+# crate does it in one place instead of in every signature.
+async-trait = "0.1"
 # The hash the whole spec is written around: url keys, body digests,
 # chunk trees, block checksums and manifest digests are all blake3, so
 # there is one hash in the tree rather than four.
