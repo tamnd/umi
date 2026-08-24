@@ -1,0 +1,268 @@
+//! Every statement this backend runs, in one place.
+//!
+//! They are here rather than inline at the call sites for two reasons. A
+//! statement that is a constant can be prepared once and cached by rusqlite
+//! across calls, which matters when `admit` runs the same three statements
+//! twelve thousand times a second. And a person auditing what this crate does
+//! to a file can read this module instead of reading the whole backend.
+//!
+//! Column lists are spelled out everywhere and `SELECT *` appears nowhere. A
+//! star would keep compiling after a migration added a column and would quietly
+//! shift every read in [`row`](crate::row) onto the wrong column.
+//!
+//! The lease query is assembled from four macros instead of being written out
+//! twice. It has to end up as a single string literal, because the partial
+//! index only applies when SQLite can match the query's `WHERE` against the
+//! index's, and the domain restricted variant differs from the plain one by a
+//! single clause in the middle. Macros are what [`concat!`] will take.
+
+use crate::schema::schedulable;
+
+/// Remember one small thing across restarts, such as the lease counter.
+pub const PUT_META: &str = "
+INSERT INTO meta (key, value) VALUES (?1, ?2)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+
+/// Claim a url for the seen set.
+///
+/// `OR IGNORE` rather than a select and then an insert, so the check and the
+/// claim are one statement and one b-tree descent. The number of rows changed
+/// is the answer: one means this caller is the first to see the url, zero means
+/// somebody already had it. This is the hottest statement in the system and
+/// doc 08.1 gives it a budget of 12500 a second.
+pub const INSERT_SEEN: &str = "INSERT OR IGNORE INTO seen (url_key) VALUES (?1)";
+
+/// Put an admitted url in the frontier.
+///
+/// Also `OR IGNORE`. The seen set has already decided this url is new, so a
+/// conflict here means the ledger and the seen set disagree, which can only
+/// happen if a crash lost the tail of the write ahead log between the two
+/// tables. Keeping the older row is right in that case: it is the one with the
+/// fetch history on it.
+pub const INSERT_LEDGER: &str = "
+INSERT OR IGNORE INTO ledger (
+    pld, host, url_key, url, url_key_full, depth, priority, state,
+    next_due_ms, last_fetch_ms, last_change_ms, fetch_count, change_count,
+    content_hash, etag_ref, last_mod_ms, status, tier_used, fail_streak
+) VALUES (
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+)";
+
+/// Hold a url found by a fetcher we do not trust yet, per doc 06.2 layer 7.
+pub const INSERT_PEN: &str = "
+INSERT OR IGNORE INTO pen (
+    fetcher, url_key, pld, host, url, depth, priority, discovered_ms
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
+
+/// The columns the lease scan reads, and the joins behind them.
+///
+/// A host with no record behind it has to behave exactly like `HostRow::new`,
+/// because a host nobody has fetched yet is the normal case at the start of a
+/// crawl and it would be absurd for it to be unleasable. That is what the
+/// `COALESCE` defaults are for, and `the_sql_host_defaults_are_the_rust_ones`
+/// in the tests asserts the literals here are still the constants in umi-state.
+macro_rules! lease_columns {
+    () => {
+        "
+SELECT ledger.pld                              AS pld,
+       ledger.host                             AS host,
+       ledger.url_key                          AS url_key,
+       ledger.url                              AS url,
+       ledger.depth                            AS depth,
+       ledger.priority                         AS priority,
+       ledger.fetch_count                      AS fetch_count,
+       ledger.last_mod_ms                      AS last_mod_ms,
+       etags.etag                              AS etag,
+       COALESCE(hosts.adaptive_delay_ms, 1000) AS adaptive_delay_ms,
+       hosts.crawl_delay_ms                    AS crawl_delay_ms,
+       COALESCE(hosts.next_allowed_ms, 0)      AS next_allowed_ms,
+       COALESCE(hosts.tier_preferred, 1)       AS tier_preferred,
+       COALESCE(hosts.tier_max, 1)             AS tier_max,
+       COALESCE(hosts.lying_revalidator, 0)    AS lying_revalidator
+  FROM ledger
+  LEFT JOIN hosts ON hosts.host = ledger.host
+  LEFT JOIN etags ON etags.id = ledger.etag_ref
+ WHERE "
+    };
+}
+
+/// What a row has to satisfy to be worth handing out, minus the domain
+/// restriction.
+///
+/// The lease clause is not `lease_id IS NULL`. An expired lease is work the
+/// fetcher holding it failed to return, and doc 08.4 says that goes back in the
+/// frontier without anybody having to call `release` for it, so the expiry is
+/// part of the test.
+///
+/// The tier clause is `MIN(preferred, max)` and not `preferred` alone, because
+/// a host whose preferred tier sits above its own ceiling is served at the
+/// ceiling. It is `TierPolicy::reachable_by` written in SQL, which is the point.
+macro_rules! lease_conditions {
+    () => {
+        "
+   AND ledger.next_due_ms <= ?1
+   AND (ledger.lease_id IS NULL OR ledger.lease_expires <= ?1)
+   AND COALESCE(hosts.blocked, 0) = 0
+   AND COALESCE(hosts.refusing, 0) = 0
+   AND COALESCE(hosts.next_allowed_ms, 0) <= ?1
+   AND MIN(COALESCE(hosts.tier_preferred, 1), COALESCE(hosts.tier_max, 1)) <= ?2"
+    };
+}
+
+/// The order doc 08.4 promises, spelled to match the `ledger_ready` index
+/// column for column so SQLite walks it instead of sorting.
+///
+/// If this and the index ever drift apart the query still returns the right
+/// rows in the right order, it just sorts the whole frontier on every lease
+/// call to get there. That is a performance bug no correctness test would
+/// catch, which is why `the_lease_query_walks_the_index` reads the query plan.
+macro_rules! lease_order {
+    () => {
+        "
+ ORDER BY ledger.priority DESC, ledger.next_due_ms,
+          ledger.pld, ledger.host, ledger.url_key"
+    };
+}
+
+/// Ready work, anywhere in the frontier.
+pub const SELECT_READY: &str = concat!(
+    lease_columns!(),
+    schedulable!(),
+    lease_conditions!(),
+    lease_order!()
+);
+
+/// The same, restricted to the domains the caller asked for.
+///
+/// A temp table and a subquery rather than an `IN (?, ?, ...)` list, because
+/// the scheduler in doc 09.4 asks for whatever is resident and that can be
+/// thousands of domains, well past `SQLITE_MAX_VARIABLE_NUMBER`. A query that
+/// works up to some number of domains and then starts failing is worse than one
+/// that never had the limit.
+pub const SELECT_READY_IN_PLDS: &str = concat!(
+    lease_columns!(),
+    schedulable!(),
+    lease_conditions!(),
+    "
+   AND ledger.pld IN (SELECT pld FROM lease_plds)",
+    lease_order!()
+);
+
+/// Temp, so it goes when the connection does, and emptied on every call because
+/// the resident set changes between them.
+pub const CREATE_LEASE_PLDS: &str = "
+CREATE TEMP TABLE IF NOT EXISTS lease_plds (pld BLOB PRIMARY KEY) WITHOUT ROWID;
+DELETE FROM lease_plds;";
+
+/// One domain the caller will accept work from.
+pub const INSERT_LEASE_PLD: &str = "INSERT OR IGNORE INTO lease_plds (pld) VALUES (?1)";
+
+/// Mark a row in flight, in the same transaction as the lease it describes.
+pub const MARK_LEASED: &str = "
+UPDATE ledger SET lease_id = ?1, lease_expires = ?2
+ WHERE pld = ?3 AND host = ?4 AND url_key = ?5";
+
+/// Move a host's politeness timer forward, creating the host record if this is
+/// the first work we have ever handed out for it.
+///
+/// Only `next_allowed_ms` is touched on conflict. Every other field on a host
+/// record belongs to `put_host` and to the robots and tier logic above this
+/// crate, and a lease quietly overwriting an adaptive delay that doc 07.6 spent
+/// an hour learning would be a real loss.
+pub const BUMP_HOST_CLOCK: &str = "
+INSERT INTO hosts (
+    host, pld, adaptive_delay_ms, next_allowed_ms,
+    tier_preferred, tier_max, tier_last_success, tier_blocks,
+    tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
+    sitemaps, fetches, failures, consecutive_failures, blocked, refusing
+) VALUES (?1, ?2, ?4, ?3, ?5, ?5, ?5, 0, 0, 0, 0, 0, '', 0, 0, 0, 0, 0)
+ON CONFLICT(host) DO UPDATE SET next_allowed_ms = ?3";
+
+/// The row `complete` needs before it can work out what changed.
+pub const SELECT_LEDGER: &str = "
+SELECT host, url_key_full, depth, priority, state, next_due_ms, last_fetch_ms,
+       last_change_ms, fetch_count, change_count, content_hash, etag_ref,
+       last_mod_ms, status, tier_used, fail_streak
+  FROM ledger
+ WHERE pld = ?1 AND host = ?2 AND url_key = ?3";
+
+/// Write back what a fetch turned up, and drop the lease in the same statement.
+///
+/// Dropping the lease here rather than in a second statement is what makes a
+/// completion atomic. A crash between the two would leave a row that is both
+/// recorded and in flight, and the next lease call would hand out a url that
+/// had only just been fetched.
+pub const UPDATE_LEDGER: &str = "
+UPDATE ledger SET
+    priority       = ?1,
+    state          = ?2,
+    next_due_ms    = ?3,
+    last_fetch_ms  = ?4,
+    last_change_ms = ?5,
+    fetch_count    = ?6,
+    change_count   = ?7,
+    content_hash   = ?8,
+    etag_ref       = ?9,
+    last_mod_ms    = ?10,
+    status         = ?11,
+    tier_used      = ?12,
+    fail_streak    = ?13,
+    lease_id       = NULL,
+    lease_expires  = NULL
+ WHERE pld = ?14 AND host = ?15 AND url_key = ?16";
+
+/// Give a url back without recording anything about it.
+///
+/// `next_due_ms` and `fail_streak` are deliberately untouched. A fetcher going
+/// away says nothing at all about the url, so it goes back in the frontier
+/// exactly as it was and is leasable again at once.
+pub const CLEAR_LEASE: &str = "
+UPDATE ledger SET lease_id = NULL, lease_expires = NULL WHERE lease_id = ?1";
+
+/// Everything known about one host.
+pub const SELECT_HOST: &str = "
+SELECT host, pld, robots_digest, robots_fetched_ms, robots_expires_ms,
+       robots_authoritative, adaptive_delay_ms, crawl_delay_ms, next_allowed_ms,
+       tier_preferred, tier_max, tier_last_success, tier_blocks,
+       tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
+       content_usage, sitemaps, fetches, failures, consecutive_failures,
+       blocked, refusing
+  FROM hosts
+ WHERE host = ?1";
+
+/// Write a host record whole.
+///
+/// Last write wins, which is what the trait says. The caller read the record,
+/// changed it and is handing back the result, so merging here would be this
+/// crate second guessing the robots and tier logic that owns those fields.
+pub const PUT_HOST: &str = "
+INSERT OR REPLACE INTO hosts (
+    host, pld, robots_digest, robots_fetched_ms, robots_expires_ms,
+    robots_authoritative, adaptive_delay_ms, crawl_delay_ms, next_allowed_ms,
+    tier_preferred, tier_max, tier_last_success, tier_blocks,
+    tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
+    content_usage, sitemaps, fetches, failures, consecutive_failures,
+    blocked, refusing
+) VALUES (
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+)";
+
+/// Put an ETag in the pool and get back the reference a ledger row stores.
+///
+/// The `DO UPDATE` looks pointless and is not. `DO NOTHING` makes the statement
+/// return no rows when the ETag is already there, so the caller would need a
+/// second select for the common case. Assigning the column to itself makes the
+/// upsert always produce a row, and `RETURNING` then gives the id whether it
+/// was new or not.
+pub const INTERN_ETAG: &str = "
+INSERT INTO etags (etag) VALUES (?1)
+ON CONFLICT(etag) DO UPDATE SET etag = excluded.etag
+RETURNING id";
+
+/// The frontier broken down by state, for [`stats`](crate::SqliteState::stats).
+///
+/// One grouped scan rather than five counting queries. It is still a scan of
+/// the ledger, so this is not something to call in a loop.
+pub const COUNT_BY_STATE: &str = "SELECT state, COUNT(*) FROM ledger GROUP BY state";

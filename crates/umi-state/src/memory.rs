@@ -559,17 +559,14 @@ impl State for MemoryState {
         Ok(self.lock().resident.iter().copied().collect())
     }
 
-    async fn checkpoint(&self) -> Result<Checkpoint> {
+    async fn checkpoint(&self, now_ms: u64) -> Result<Checkpoint> {
         let mut inner = self.lock();
         inner.checkpoint_seq += 1;
         let sequence = inner.checkpoint_seq;
         let stats = inner.stats();
         Ok(Checkpoint {
             sequence,
-            // The caller's clock is not available here and this reference does
-            // not read one, so the timestamp is left at zero rather than
-            // invented. A real backend stamps it from the checkpoint request.
-            taken_ms: 0,
+            taken_ms: now_ms,
             canon_version: CANON_VERSION.to_owned(),
             path: None,
             digest: None,
