@@ -29,25 +29,54 @@ That second point deserves its own line, because the whole capacity plan turns o
 
 The target is 250 pages per second **per host**, so 750 pages per second across server1, server2 and server3.
 
-**Bandwidth is what to verify first.**
+**Bandwidth was verified first, and both of the numbers in this section turned out to be wrong.** Gate 1.1 in doc 16 ran on 2026-08-24 and what follows is the measured version. The original estimate is kept at the end of the section, because the size of the error is itself worth remembering.
 
-Common Crawl's CC-MAIN-2026-30 published 2.14 billion pages and 364 TiB of uncompressed content, which is about 170 KB per page across all content types. Call the average fetched document 150 KB to be slightly optimistic about HTML being lighter than the mixed average.
+The page size assumption was the larger mistake. The original derivation took Common Crawl's 364 TiB over 2.14 billion pages, which is about 170 KB per page, and rounded to 150 KB. That figure averages over all content types and over uncompressed bytes, and a crawler pays neither. What it pays is the compressed response, and that is measurable rather than assumable. Across 20705569 rows with `fetch_status = 200` from `open-index/ccrawl-urls` on CC-MAIN-2026-25:
 
 ```
-per host:   250 pages/s x 150 KB  = 37.5 MB/s  = 300 Mbit/s sustained inbound
-            37.5 MB/s x 86400     = 3.24 TB/day inbound
-            3.24 TB/day x 30      = 97 TB/month inbound
+all types      mean 53.1 KB   p50 21.8 KB   p90 101.5 KB   p99 475.6 KB
 
-fleet:      750 pages/s           = 112.5 MB/s = 900 Mbit/s sustained inbound
-                                  = 292 TB/month inbound
+text/html               6128452 rows      45.2 KB mean
+application/xhtml+xml    715516 rows      28.4 KB mean
+application/pdf           31528 rows    1187.0 KB mean
+text/plain                 4187 rows      14.9 KB mean
+```
+
+PDFs are half a percent of documents at 26 times the mean size. Doc 11.3 already defers the PDF handler to milestone 5 on extraction cost grounds, and the bandwidth argument points the same way.
+
+At 53.1 KB the requirement is 2.8 times smaller than this section originally claimed:
+
+```
+per host:   250 pages/s x 53.1 KB = 13.3 MB/s  = 106 Mbit/s sustained inbound
+                                  = 1.15 TB/day = 34.4 TB/month inbound
+
+fleet:      750 pages/s           = 39.8 MB/s  = 319 Mbit/s sustained inbound
+                                  = 103 TB/month inbound
 
 outbound:   750 pages/s x 6 KB    = 4.5 MB/s   = 36 Mbit/s
                                   = 11.8 TB/month across the whole fleet
 ```
 
-Outbound is comfortable at 11.8 TB against a 96 TB fleet allowance, and that includes all publishing to Hugging Face. Inbound at 300 Mbit/s per host needs a 1 Gbit/s port to have any headroom at all, and needs inbound to be unmetered or generously metered. Both are checkable in an afternoon and both are milestone 1 gates in doc 16.
+The measured capacity, eight concurrent streams for 60 seconds with bytes counted at the interface, against Hetzner and Cachefly endpoints:
 
-Two fallbacks exist if inbound is metered. Conditional revalidation is the big one: a 304 costs about 500 bytes against 150 KB, so a revisit heavy mix is nearly free on bandwidth, and doc 09 already prefers it. Range limiting is the other: cap fetches at 512 KB and abort past it, which loses the tail of very large documents and saves real money. Neither changes the architecture.
+| Host | idle baseline | inbound | outbound | pages/s at 53.1 KB |
+| --- | --- | --- | --- | --- |
+| server1 | 3 Mbit/s | 77 Mbit/s | not measured | 181 |
+| server2 | 3 Mbit/s | 216 Mbit/s | 143 Mbit/s | 509 |
+| server3 | 56 Mbit/s | 270 Mbit/s | 313 Mbit/s | 636, or 504 net of idle |
+| **fleet** | | **563 Mbit/s** | | **1325** |
+
+None of the three reports a NIC link speed, all read `-1`, so the port ceiling is unknown and these are floors rather than caps.
+
+**Bandwidth is not the constraint this section was written to worry about.** The failure case it feared was 81 pages/s per host. The fleet instead has roughly 1.8 times the headroom the 750 pages/s target needs. Two things change as a result.
+
+server1 is the weak box at 181 pages/s, short of the 250 target, and it also has essentially no free memory. Doc 15 gives it the coordinator role, which is the right assignment for a reason other than the one written down there: it should carry the least fetching, not the most.
+
+Metering is now the binding open question rather than raw speed. At 250 pages/s a host moves 34.4 TB/month inbound, which is just over a typical 32 TB allowance, and a 32 TB inbound cap works out to 232 pages/s. That is marginally under target rather than catastrophically under it. `vnstat` is not installed on any of the three boxes so there is no history to read, and installing it is the follow up that settles this within a month.
+
+The two fallbacks are unchanged and are now comfortable rather than essential. Conditional revalidation is the big one: a 304 costs about 500 bytes against 53 KB, so a revisit heavy mix is nearly free, and doc 09 already prefers it. Range limiting is the other: cap fetches at 512 KB and abort past it, which at p99 of 475.6 KB loses well under 1 percent of documents. Neither changes the architecture.
+
+For the record, the original estimate in this section read 300 Mbit/s per host and 900 Mbit/s fleet wide, against 97 TB and 292 TB per month. It was wrong by 2.8x in the safe direction, which is the direction an unverified assumption should be wrong in, but it was wrong enough that it would have driven the design toward a community fleet dependency from day one that the hardware does not actually require.
 
 **100 billion pages is 4.2 years away at this rate.**
 
