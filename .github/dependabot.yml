@@ -25,5 +25,12 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # The ref on this one is a Rust version and not an action version,
+      # so dependabot reads `@1.98` as something to bump and helpfully
+      # rewrites the minimum supported version check into a check of a
+      # completely different compiler. The `@stable` uses elsewhere are
+      # unaffected, which is why this is an ignore rather than a pin.
+      - dependency-name: dtolnay/rust-toolchain
     commit-message:
       prefix: ci
