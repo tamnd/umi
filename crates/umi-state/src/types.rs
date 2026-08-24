@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, UrlKeyFull};
 
-/// A URL's fixed point score, from `docs/spec/09-frontier-and-scheduling.md`
+/// A URL's fixed point score, from `docs/spec/09-frontier-and-freshness.md`
 /// section 9.2.
 ///
 /// The convention is that the whole `u16` range maps onto the unit interval,

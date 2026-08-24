@@ -175,7 +175,7 @@ impl fmt::Debug for FetcherId {
     }
 }
 
-/// The fetch ladder from `docs/spec/05-anti-bot-ladder.md` section 5.2.
+/// The fetch ladder from `docs/spec/05-fetch-tiers.md` section 5.2.
 ///
 /// The ordering is the cost ordering, so `<` really does mean cheaper, and the
 /// escalation rules in 5.8 are written as comparisons against it. Tiers live
