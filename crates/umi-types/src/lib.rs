@@ -10,6 +10,10 @@
 
 use core::fmt;
 
+pub mod canon;
+
+pub use canon::{CanonError, canonicalize, pay_level_domain};
+
 /// The canonicalisation version these keys are derived under.
 ///
 /// Changing URL canonicalisation changes every key in the system, so it is
@@ -116,6 +120,39 @@ pub struct RowKey {
     pub host: HostId,
     /// The URL fingerprint.
     pub url: UrlKey,
+}
+
+impl RowKey {
+    /// Derive the three keys for a URL, canonicalising it first.
+    ///
+    /// This is the only sanctioned way to make a `RowKey`, because a key
+    /// derived from a URL that skipped canonicalisation is a key nothing else
+    /// in the system will ever match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonError`] when the URL is not a crawlable http(s) URL.
+    pub fn for_url(url: &str, base: Option<&str>) -> Result<Self, CanonError> {
+        let canonical = canonicalize(url, base)?;
+        let host = host_of(&canonical).ok_or(CanonError::NoHost)?;
+        Ok(Self {
+            pld: PldId::derive(pay_level_domain(host).as_bytes()),
+            host: HostId::derive(host.as_bytes()),
+            url: UrlKey::derive(canonical.as_bytes()),
+        })
+    }
+}
+
+/// The host of an already canonical URL, found by slicing rather than
+/// reparsing. Canonical form is `scheme://host[:port]/...` with no userinfo,
+/// which makes this exact.
+fn host_of(canonical: &str) -> Option<&str> {
+    let after_scheme = canonical.split_once("://")?.1;
+    let authority = after_scheme.split(['/', '?']).next()?;
+    Some(match authority.rsplit_once(':') {
+        Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+        _ => authority,
+    })
 }
 
 /// Process exit codes, as defined in `docs/spec/14-cli.md` section 14.9.

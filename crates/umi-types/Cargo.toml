@@ -14,3 +14,5 @@ workspace = true
 
 [dependencies]
 blake3.workspace = true
+url.workspace = true
+idna.workspace = true

@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# cargo-fuzz needs nightly and passes sanitiser flags this workspace does not
+# want. It has its own lockfile and its own toolchain, so it stays out.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.0.1"
@@ -19,6 +22,13 @@ umi-types = { path = "crates/umi-types", version = "0.0.1" }
 umi-state = { path = "crates/umi-state", version = "0.0.1" }
 umi-file = { path = "crates/umi-file", version = "0.0.1" }
 umi-proto = { path = "crates/umi-proto", version = "0.0.1" }
+umi-extract = { path = "crates/umi-extract", version = "0.0.1" }
+umi-robots = { path = "crates/umi-robots", version = "0.0.1" }
+umi-fetch = { path = "crates/umi-fetch", version = "0.0.1" }
+umi-frontier = { path = "crates/umi-frontier", version = "0.0.1" }
+umi-state-sqlite = { path = "crates/umi-state-sqlite", version = "0.0.1" }
+umi-publish = { path = "crates/umi-publish", version = "0.0.1" }
+umi-seed = { path = "crates/umi-seed", version = "0.0.1" }
 
 anyhow = "1"
 # The hash the whole spec is written around: url keys, body digests,
@@ -27,6 +37,33 @@ anyhow = "1"
 blake3 = "1"
 clap = { version = "4.5", features = ["derive", "wrap_help"] }
 thiserror = "2"
+
+# URL handling. `url` gives WHATWG parsing and `idna` gives UTS-46 with
+# transitional processing off, which is what doc 11.2 step 4 asks for.
+url = "2"
+idna = "1"
+percent-encoding = "2"
+
+# Extraction. html5ever is the parser doc 11.3 names, and markup5ever_rcdom
+# is the tree it builds into.
+html5ever = "0.29"
+markup5ever_rcdom = "0.5"
+tendril = "0.4"
+unicode-normalization = "0.1"
+
+# Fetch. rustls only, no openssl-sys anywhere in the default tree, which
+# is gate 2.2 in doc 16 and is asserted in CI.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "stream", "charset", "http2"] }
+
+# Storage and publishing.
+rusqlite = { version = "0.32", features = ["bundled"] }
+arrow = "53"
+parquet = { version = "53", default-features = false, features = ["arrow", "zstd", "snap", "base64"] }
+zstd = "0.13"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

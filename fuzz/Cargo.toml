@@ -1,0 +1,32 @@
+# Long soak fuzzing. Separate workspace on purpose: cargo-fuzz needs nightly
+# and the main workspace is pinned to 1.98 stable, so this must not be a
+# member or `cargo build --workspace` would try to build it under the pin and
+# fail on the sanitiser flags.
+#
+# The invariants here also run on every push as an ordinary test, in
+# crates/umi-types/tests/canon_idempotence.rs, against a deterministic corpus.
+# This target is for finding what a hand written corpus does not think of.
+#
+#   cargo +nightly fuzz run canon -- -max_total_time=3600
+[package]
+name = "umi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+umi-types = { path = "../crates/umi-types" }
+
+[[bin]]
+name = "canon"
+path = "fuzz_targets/canon.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = true

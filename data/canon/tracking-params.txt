@@ -1,0 +1,76 @@
+# Tracking and session parameters removed by step 10 of URL canonicalisation.
+#
+# This file is the list. It is compiled into the binary with include_str! and
+# it is published to open-index/umi-meta alongside every dataset, so anyone
+# who wants to reproduce a umi url key can, without reading our source. That
+# is the whole reason it is a file: a constant in a Rust source tree is not
+# something a Python user reproducing our keys can reach.
+#
+# Adding a line here changes every key derived from a URL carrying that
+# parameter, so it is a canonicalisation version bump and not a patch. See
+# docs/spec/11-extraction-and-dedup.md section 11.2.
+#
+# Syntax, one rule per line:
+#   name        remove this parameter whenever it appears
+#   prefix*     remove any parameter whose name starts with prefix
+#   name?       remove only when the value looks like a session token
+# Comparison is case insensitive. Blank lines and # comments are ignored.
+
+# Google and the ad networks that copied its parameter naming.
+utm_*
+gclid
+gclsrc
+dclid
+wbraid
+gbraid
+_ga
+_gl
+
+# Other ad platforms.
+fbclid
+msclkid
+twclid
+igshid
+yclid
+ttclid
+li_fat_id
+epik
+rdt_cid
+wickedid
+s_kwcid
+
+# Email service providers.
+mc_cid
+mc_eid
+mkt_tok
+vero_id
+vero_conv
+_hsenc
+_hsmi
+oly_anon_id
+oly_enc_id
+
+# Analytics vendors with their own prefix conventions.
+at_*
+piwik_*
+pk_*
+matomo_*
+
+# Referrer and placement hints that name where a link was clicked rather than
+# what it points at.
+ref_src
+ref_url
+spm
+scm
+
+# Session identifiers. These are the dangerous half of the list, because a
+# session parameter left in place turns one page into unbounded URLs, and a
+# content parameter removed by mistake merges two pages and silently loses
+# one. Anything ambiguous gets the `?` suffix and is judged by its value.
+sessionid
+jsessionid
+phpsessid
+aspsessionid*
+cfid
+cftoken
+sid?
