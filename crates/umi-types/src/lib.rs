@@ -258,6 +258,32 @@ impl fmt::Display for Tier {
     }
 }
 
+/// The conditional request headers a previous fetch earned us.
+///
+/// This is the entire input to a T0 revalidate in `docs/spec/05-fetch-tiers.md`
+/// section 5.3, and it sits here rather than in the state layer because both
+/// ends of doc 04's protocol need it: the coordinator reads it off the ledger
+/// and puts it in a lease, and the fetcher turns it into `If-None-Match` and
+/// `If-Modified-Since`. A community fetcher implements the protocol and not
+/// the scheduler, so making it link the state crate for two fields would be
+/// the wrong shape.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Revalidator {
+    /// The `ETag` exactly as the origin sent it, quotes and any `W/` included.
+    pub etag: Option<String>,
+    /// `Last-Modified`, parsed, in milliseconds since the Unix epoch.
+    pub last_modified_ms: Option<u64>,
+}
+
+impl Revalidator {
+    /// Whether there is anything worth sending. An empty revalidator means a
+    /// conditional request would be an unconditional one with extra steps.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.etag.is_none() && self.last_modified_ms.is_none()
+    }
+}
+
 /// The ordering the state layer stores rows in.
 ///
 /// Sorting by pay level domain, then host, then URL puts everything a

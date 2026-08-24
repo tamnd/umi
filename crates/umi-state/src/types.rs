@@ -12,6 +12,13 @@ use std::time::Duration;
 
 use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, UrlKeyFull};
 
+// A fetcher needs this to build a conditional request and needs nothing else
+// from the state layer, so it lives in umi-types and is re-exported here. Doc
+// 04.5 is the reason: a community fetcher implements the protocol, not the
+// scheduler, and making it link the state crate for one two field struct
+// would be the wrong shape.
+pub use umi_types::Revalidator;
+
 /// A URL's fixed point score, from `docs/spec/09-frontier-and-freshness.md`
 /// section 9.2.
 ///
@@ -247,24 +254,6 @@ pub struct Lease {
     /// What to put in `If-None-Match` and `If-Modified-Since`, when we have
     /// fetched this URL before and the host is not a known liar about it.
     pub revalidate: Option<Revalidator>,
-}
-
-/// The conditional request headers a previous fetch earned us.
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
-pub struct Revalidator {
-    /// The `ETag` exactly as the origin sent it, quotes and any `W/` included.
-    pub etag: Option<String>,
-    /// `Last-Modified`, parsed, in milliseconds since the Unix epoch.
-    pub last_modified_ms: Option<u64>,
-}
-
-impl Revalidator {
-    /// Whether there is anything worth sending. An empty revalidator means a
-    /// conditional request would be an unconditional one with extra steps.
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.etag.is_none() && self.last_modified_ms.is_none()
-    }
 }
 
 /// What happened to one leased URL.
