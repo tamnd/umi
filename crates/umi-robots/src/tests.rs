@@ -591,6 +591,42 @@ fn an_html_error_page_served_as_robots_txt_does_not_block_the_site() {
     assert_eq!(robots.rule_count(), 0);
 }
 
+#[test]
+fn an_html_error_page_served_as_robots_txt_yields_no_rules() {
+    // Measured at 24 of 638 real hosts, so a crawl hits this several million
+    // times over 100B pages. The site has no robots.txt and its server
+    // answers 200 with a styled error page instead of 404.
+    //
+    // Nothing in it may become a rule. A stray `Disallow` conjured out of an
+    // error page would take a whole site out of the frontier on the strength
+    // of a misconfigured web server, and the site would have no way to tell
+    // that had happened. The protection is that a field name has to be one we
+    // know or be followed by a colon, and markup is neither.
+    let body = "\
+<!DOCTYPE html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <title>404 Not Found</title>
+  <style>body { color: #333; background: #fff; font-size: 14px; }</style>
+  <script src=\"https://example.com/a.js\"></script>
+</head>
+<body>
+  <p>Disallow all robots from this page</p>
+  <a href=\"/sitemap.xml\">Sitemap: our sitemap</a>
+</body>
+</html>
+";
+    let robots = Robots::parse(body.as_bytes());
+    assert_eq!(robots.rule_count(), 0);
+    assert!(robots.allows("/").is_allowed());
+    assert!(robots.allows("/anything/at/all").is_allowed());
+    assert!(!robots.is_blanket_disallow());
+    // The `<a href>` line has a colon in it and the text before that colon is
+    // not a field we know, so it does not become a sitemap either.
+    assert!(robots.sitemaps().is_empty());
+}
+
 // ---------------------------------------------------------------------------
 // The two helpers the conformance suite tests directly. Upstream calls these
 // `TestGetPathParamsQuery` and `TestMaybeEscapePattern`; they are here rather
