@@ -182,6 +182,14 @@ fn collect(dom: &Dom) -> Vec<Stats> {
         let mut link_text = 0u32;
         let mut paragraphs = 0u32;
         for &child in dom.children(id) {
+            // A `<nav>` is in the tree so the link pass can read it and is not
+            // in the document as far as anything else is concerned, so its text
+            // does not count towards an ancestor's totals. Without this line a
+            // footer full of links would push every page's link density up and
+            // change which subtree wins.
+            if dom.chrome(child) {
+                continue;
+            }
             text = text.saturating_add(stats[child].text);
             link_text = link_text.saturating_add(stats[child].link_text);
             paragraphs = paragraphs.saturating_add(stats[child].paragraphs);
@@ -224,9 +232,12 @@ fn declare(dom: &Dom, scores: &[i64]) -> Option<usize> {
         })
     };
 
+    // An `<article>` inside a `<footer>` is a teaser, not the page. Chrome is
+    // not eligible to be the content root for the same reason its text does not
+    // count: as far as this pass is concerned it is not in the document.
     let pick = |wanted: &dyn Fn(usize) -> bool| -> Option<usize> {
         (0..dom.node_count())
-            .filter(|&id| id != body && wanted(id))
+            .filter(|&id| id != body && !dom.chrome(id) && wanted(id))
             .max_by_key(|&id| (scores[id], std::cmp::Reverse(id)))
     };
 
@@ -238,7 +249,7 @@ fn declare(dom: &Dom, scores: &[i64]) -> Option<usize> {
 /// Doc 11.3 step 2, the highest scoring candidate container.
 fn best(dom: &Dom, scores: &[i64]) -> Option<usize> {
     (0..dom.node_count())
-        .filter(|&id| dom.tag(id).is_some_and(Tag::is_candidate))
+        .filter(|&id| !dom.chrome(id) && dom.tag(id).is_some_and(Tag::is_candidate))
         // Ties go to the node that appeared first, because document order is
         // the only tiebreak that does not depend on how the arena was built.
         .max_by_key(|&id| (scores[id], std::cmp::Reverse(id)))

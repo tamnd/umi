@@ -106,6 +106,10 @@ impl<'a> Writer<'a> {
             // markdown as a stray first paragraph.
             Tag::Head | Tag::Title | Tag::Meta | Tag::Link | Tag::Base => {}
 
+            // Chrome is in the tree only so the link pass can walk it. It is not
+            // content, so nothing is printed and nothing below it is visited.
+            Tag::Chrome => {}
+
             Tag::Span | Tag::Other => self.walk_children(id),
             Tag::Br => self.space(),
 
@@ -403,6 +407,12 @@ impl<'a> Writer<'a> {
         let mut out = Vec::new();
         let mut stack: Vec<usize> = dom.children(id).iter().rev().copied().collect();
         while let Some(node) = stack.pop() {
+            // Chrome is not an item. Without this a `<nav>` between two `<li>`
+            // would become an empty bullet, which is a thing this list of items
+            // is specifically written to avoid doing.
+            if dom.chrome(node) {
+                continue;
+            }
             match dom.tag(node) {
                 Some(Tag::A | Tag::Code | Tag::Em | Tag::Other | Tag::Span | Tag::Strong) => {
                     stack.extend(dom.children(node).iter().rev());
@@ -492,10 +502,11 @@ impl<'a> Writer<'a> {
 fn nested_tables(dom: &Dom) -> Vec<bool> {
     let mut below = vec![false; dom.node_count()];
     for id in (0..dom.node_count()).rev() {
-        below[id] = dom
-            .children(id)
-            .iter()
-            .any(|&child| below[child] || dom.tag(child) == Some(Tag::Table));
+        below[id] = dom.children(id).iter().any(|&child| {
+            // A table inside a footer does not make the enclosing table a layout
+            // table, because the footer is not going to be serialised at all.
+            !dom.chrome(child) && (below[child] || dom.tag(child) == Some(Tag::Table))
+        });
     }
     below
 }
@@ -508,6 +519,9 @@ fn descendants(dom: &Dom, id: usize) -> Vec<usize> {
     let mut order = Vec::new();
     let mut stack = vec![id];
     while let Some(node) = stack.pop() {
+        if dom.chrome(node) {
+            continue;
+        }
         order.push(node);
         stack.extend(dom.children(node).iter().rev());
     }

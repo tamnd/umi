@@ -11,6 +11,15 @@
 //! The conversion is also where doc 11.3's drop list is applied. A `<script>`
 //! subtree never reaches the arena, so nothing downstream has to remember to
 //! skip it.
+//!
+//! That list has two halves, and they are not the same rule. Most of it is
+//! "these bytes are not content and nothing else wants them", and those really
+//! do never arrive. But `nav`, `header`, `footer` and `aside` are not content
+//! and are still wanted: doc 11.4 asks for a navigation link kind, and says the
+//! reason it wants one is that navigation links are how you discover a site's
+//! structure. Deleting those four subtrees before the link pass runs would throw
+//! away most of the links doc 11.4 is asking for. So they arrive as
+//! [`Tag::Chrome`], marked, out of the content and still walkable.
 
 use html5ever::tendril::TendrilSink;
 use html5ever::{ParseOpts, parse_document};
@@ -38,7 +47,7 @@ pub const MAX_DEPTH: u32 = 256;
 /// and the metadata pass needs the `<meta>` attributes. None of those reach the
 /// output. Everything else is dropped here so that a page with 400 inline styles
 /// does not pay to carry them.
-const KEPT_ATTRS: [&str; 15] = [
+const KEPT_ATTRS: [&str; 16] = [
     "alt",
     "charset",
     "class",
@@ -54,6 +63,10 @@ const KEPT_ATTRS: [&str; 15] = [
     "rel",
     "src",
     "title",
+    // `type` on a `<link>`, which is the only thing that tells an RSS feed from
+    // a translation: doc 11.4's feed kind needs `rel="alternate"` and a feed
+    // media type together, because either one on its own means something else.
+    "type",
 ];
 
 /// A tag we have a rule for.
@@ -126,6 +139,13 @@ pub enum Tag {
     /// A block level tag with no markdown of its own, such as `<figure>` or
     /// `<dd>`. Breaks the paragraph, serialises its children, prints nothing.
     Block,
+    /// `<nav>`, `<header>`, `<footer>` and `<aside>`: site furniture that doc
+    /// 11.3 drops from the content and doc 11.4 still wants the links out of.
+    ///
+    /// It contributes nothing to the markdown, nothing to any score and nothing
+    /// to any text total, exactly as if it had never been parsed. The only pass
+    /// that looks inside one is the link pass. See [`Dom::chrome`].
+    Chrome,
     /// Any other tag. Transparent and inline, so `<sub>` in the middle of a
     /// sentence does not cut the sentence in three.
     Other,
@@ -196,6 +216,8 @@ pub struct Node {
     pub kind: Kind,
     /// Children in document order.
     pub children: Vec<usize>,
+    /// This node is a [`Tag::Chrome`] element or sits under one.
+    pub chrome: bool,
 }
 
 /// A parsed document.
@@ -231,6 +253,7 @@ impl Dom {
             nodes: vec![Node {
                 kind: Kind::Root,
                 children: Vec::new(),
+                chrome: false,
             }],
             dropped: 0,
         };
@@ -243,24 +266,39 @@ impl Dom {
     /// Iterative rather than recursive, because the input is hostile by
     /// definition and 50000 nested tags would otherwise be a stack overflow
     /// before `MAX_DEPTH` had a chance to apply. Children are pushed in reverse
-    /// so that popping visits them in document order.
+    /// so that popping visits them in document order, which is also why a node's
+    /// index is greater than every index before it in the document and why every
+    /// pass downstream can treat `0..node_count()` as document order.
     fn absorb(&mut self, document: &Handle) {
-        let mut stack: Vec<(Handle, usize, u32)> = vec![(document.clone(), ROOT, 0)];
-        while let Some((handle, parent, depth)) = stack.pop() {
+        let mut stack: Vec<(Handle, usize, u32, bool)> = vec![(document.clone(), ROOT, 0, false)];
+        while let Some((handle, parent, depth, chrome)) = stack.pop() {
+            let mut chrome = chrome;
             let (kind, keep_children) = match &handle.data {
                 NodeData::Document => (None, true),
                 NodeData::Text { contents } => {
                     let text = contents.borrow().to_string();
+                    // Text inside chrome counts as dropped, because that is what
+                    // it was before chrome was kept and this signal should not
+                    // move for a change nobody can see in the output.
+                    if chrome {
+                        self.dropped = self.dropped.saturating_add(text.len() as u32);
+                    }
                     (Some(Kind::Text(text)), false)
                 }
                 NodeData::Element { name, attrs, .. } => {
                     let local = name.local.as_ref();
                     match classify(local) {
                         None => {
-                            self.dropped += dropped_bytes(&handle);
+                            // Already inside chrome, so this subtree's text is
+                            // counted by whichever of the two rules gets there
+                            // first and never by both.
+                            if !chrome {
+                                self.dropped += dropped_bytes(&handle);
+                            }
                             continue;
                         }
                         Some(tag) => {
+                            chrome = chrome || tag == Tag::Chrome;
                             let attrs = attrs
                                 .borrow()
                                 .iter()
@@ -285,6 +323,7 @@ impl Dom {
                     self.nodes.push(Node {
                         kind,
                         children: Vec::new(),
+                        chrome,
                     });
                     self.nodes[parent].children.push(me);
                     (me, depth + 1)
@@ -296,6 +335,7 @@ impl Dom {
                     self.nodes.push(Node {
                         kind: Kind::Text(text),
                         children: Vec::new(),
+                        chrome,
                     });
                     self.nodes[parent].children.push(me);
                     (me, depth)
@@ -306,7 +346,7 @@ impl Dom {
 
             if keep_children {
                 for child in handle.children.borrow().iter().rev() {
-                    stack.push((child.clone(), me, next_depth));
+                    stack.push((child.clone(), me, next_depth, chrome));
                 }
             }
         }
@@ -326,6 +366,16 @@ impl Dom {
     /// A node's children.
     pub fn children(&self, id: usize) -> &[usize] {
         &self.nodes[id].children
+    }
+
+    /// Whether a node is site furniture: a `<nav>`, `<header>`, `<footer>` or
+    /// `<aside>`, or anything under one.
+    ///
+    /// Every pass except the link pass treats a true here as "this node is not
+    /// in the document", which is what doc 11.3's drop list says and what the
+    /// tree did before chrome was kept.
+    pub fn chrome(&self, id: usize) -> bool {
+        self.nodes[id].chrome
     }
 
     /// A node's element, or `None` for the root and for text.
@@ -367,8 +417,13 @@ impl Dom {
 fn classify(name: &str) -> Option<Tag> {
     Some(match name {
         "script" | "style" | "noscript" | "svg" | "canvas" | "iframe" | "object" | "embed"
-        | "input" | "button" | "select" | "nav" | "header" | "footer" | "aside" | "textarea"
-        | "option" | "template" | "label" | "legend" => return None,
+        | "input" | "button" | "select" | "textarea" | "option" | "template" | "label"
+        | "legend" => return None,
+
+        // Doc 11.3 drops these four and doc 11.4 wants their links, so they are
+        // kept out of the content without being deleted. See the module docs.
+        // Written up for a spec edit.
+        "nav" | "header" | "footer" | "aside" => Tag::Chrome,
 
         // Doc 11.3 lists `form` with the controls and that is a mistake in the
         // document, not a rule to follow off a cliff. A form is a wrapper, not a
