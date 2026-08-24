@@ -1,0 +1,12 @@
+# Git rewrites line endings on checkout unless told not to, and on Windows the
+# default is to hand the working tree CRLF. For source that is harmless. For the
+# extraction corpus it is not: doc 11.1 says the same input bytes produce byte
+# identical output on every machine, forever, and a checkout that quietly turns
+# every LF in a fixture into CRLF is a different input. The golden test caught
+# this the first time it ran on windows-latest.
+#
+# So the corpus is checked out exactly as it is stored. `-text` turns off the
+# translation and nothing else: these still diff as text, which they have to,
+# because the point of keeping expected markdown next to each input is that a
+# change reads as a diff rather than as a hash that moved.
+crates/*/corpus/** -text
