@@ -1,7 +1,8 @@
 //! Turn a fetched HTML document into markdown, plain text and quality signals.
 //!
-//! This crate implements doc 11.3 and the parts of doc 11.6 that do not need
-//! the link pass yet. The rule it is built around is doc 11.1: given the same
+//! This crate implements doc 11.3 and doc 11.4, and the parts of doc 11.6 that
+//! do not need language detection. The rule it is built around is doc 11.1:
+//! given the same
 //! input bytes and the same version of this crate, the output is byte identical
 //! on every machine, forever. Doc 04 pushes extraction to fetchers we do not
 //! control and doc 06 compares digests across independent fetchers to decide
@@ -25,12 +26,14 @@
 //! ```
 
 mod dom;
+mod links;
 mod markdown;
 mod score;
 mod text;
 
 use url::Url;
 
+pub use links::{Link, LinkKind, Links, MAX_ANCHOR, MAX_LINKS, Rel, Robots};
 pub use text::plain_text;
 
 /// The extractor version, which doc 11.10 says appears in the doc 04 receipt,
@@ -43,9 +46,9 @@ pub const VERSION: &str = concat!("umi-extract/", env!("CARGO_PKG_VERSION"));
 
 /// The quality signals from doc 11.6 that this crate can compute today.
 ///
-/// Doc 11.6 lists seven. Five are here. `link_count` arrives with the link pass
-/// and `stopword_coverage` arrives with language detection, and both are listed
-/// in doc 11.6 as separate work. They are computed and published, never applied:
+/// Doc 11.6 lists seven. Six are here. `stopword_coverage` arrives with
+/// language detection, which doc 11.6 lists as separate work. They are computed
+/// and published, never applied:
 /// nothing is dropped for scoring badly, because a consumer can filter on a
 /// column and cannot recover a page we threw away.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -63,6 +66,8 @@ pub struct Signals {
     pub top_node_share: u32,
     /// Bytes of text dropped with `<script>` and `<style>`.
     pub dropped_bytes: u32,
+    /// Links kept, after canonicalisation, deduplication and the 5000 cap.
+    pub link_count: u32,
 }
 
 /// One extracted document.
@@ -82,8 +87,33 @@ pub struct Extracted {
     pub base: Url,
     /// Doc 11.6's quality signals.
     pub signals: Signals,
+    /// Doc 11.4's links, in document order.
+    ///
+    /// Present even when the content is withheld, because a page we may not
+    /// index is still a fact about the frontier and its links are the part we
+    /// were never told to forget.
+    pub links: Links,
+    /// What the page's `meta robots` said, merged with any `X-Robots-Tag` the
+    /// caller passed to [`extract_with_robots`].
+    pub robots: Robots,
+    /// Why the content is not here, when it is not.
+    ///
+    /// When this is set, `markdown` is empty and so is everything derived from
+    /// it. Withholding happens in this crate rather than downstream for the same
+    /// reason doc 11.3's drop list is applied during the parse: a rule that
+    /// every consumer has to remember is a rule that one of them will forget.
+    pub content_withheld: Option<Withheld>,
     /// The version that produced this, for the receipt and the Parquet column.
     pub version: &'static str,
+}
+
+/// Why a row carries no content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Withheld {
+    /// The page said `noindex`, in a `meta robots` tag or an `X-Robots-Tag`
+    /// header. Doc 11.4 obeys it.
+    Noindex,
 }
 
 impl Extracted {
@@ -111,10 +141,31 @@ impl Extracted {
 /// belongs to the caller, because the charset comes off the Content-Type header
 /// as often as it comes off a `<meta>` tag and only the caller has both.
 pub fn extract(html: &[u8], url: &Url) -> Extracted {
+    extract_with_robots(html, url, None)
+}
+
+/// Extract a document, with an `X-Robots-Tag` header value the caller saw.
+///
+/// Doc 11.4 obeys `noindex` from either the header or the `meta robots` tag,
+/// and only the fetch path has the header. Whichever says no, wins.
+pub fn extract_with_robots(html: &[u8], url: &Url, x_robots_tag: Option<&str>) -> Extracted {
     let tree = dom::Dom::parse(html);
     let base = base_of(&tree, url);
     let choice = score::choose(&tree);
-    let body = markdown::render(&tree, choice.root, Some(&base));
+
+    let robots = links::robots(&tree).union(x_robots_tag.map(Robots::parse).unwrap_or_default());
+    let found = links::collect(&tree, choice.root, base.as_str(), robots);
+
+    // The links are collected before this and kept regardless. Doc 11.4 is
+    // explicit that a `noindex` page is still written as a row with its URL,
+    // status, headers and link set, and that the links are still followed
+    // unless the same directive also said `nofollow`.
+    let withheld = robots.noindex.then_some(Withheld::Noindex);
+    let body = if withheld.is_some() {
+        String::new()
+    } else {
+        markdown::render(&tree, choice.root, Some(&base))
+    };
 
     let raw = u32::try_from(html.len()).unwrap_or(u32::MAX);
     let signals = Signals {
@@ -128,6 +179,7 @@ pub fn extract(html: &[u8], url: &Url) -> Extracted {
             .unwrap_or(0),
         top_node_share: choice.share,
         dropped_bytes: tree.dropped_bytes(),
+        link_count: u32::try_from(found.links.len()).unwrap_or(u32::MAX),
     };
 
     Extracted {
@@ -136,6 +188,9 @@ pub fn extract(html: &[u8], url: &Url) -> Extracted {
         declared_root: choice.declared,
         base,
         signals,
+        links: found,
+        robots,
+        content_withheld: withheld,
         version: VERSION,
     }
 }
@@ -179,6 +234,7 @@ mod tests {
         for (name, source) in [
             ("lib.rs", include_str!("lib.rs")),
             ("dom.rs", include_str!("dom.rs")),
+            ("links.rs", include_str!("links.rs")),
             ("score.rs", include_str!("score.rs")),
             ("markdown.rs", include_str!("markdown.rs")),
             ("text.rs", include_str!("text.rs")),
@@ -475,5 +531,247 @@ mod tests {
     fn the_version_is_stamped_on_every_row() {
         assert!(VERSION.starts_with("umi-extract/"));
         assert_eq!(page("<p>hi</p>").version, VERSION);
+    }
+
+    /// Long enough that step 3 of the cascade trusts the winner, so a links test
+    /// is testing links rather than accidentally testing the fallback.
+    const BODY: &str = "<p>A paragraph that exists to carry this page over the two hundred \
+                        bytes that step three of the cascade insists on before it will trust \
+                        a winner, which takes rather more words than you would think when \
+                        you sit down to write one of these.</p>";
+
+    fn link_of<'a>(out: &'a Extracted, url: &str) -> &'a Link {
+        out.links
+            .links
+            .iter()
+            .find(|link| link.url == url)
+            .unwrap_or_else(|| panic!("no link to {url} in {:?}", out.links.links))
+    }
+
+    #[test]
+    fn a_body_anchor_and_a_navigation_anchor_are_told_apart() {
+        // The nav, the header and the footer are all dropped from the content by
+        // doc 11.3 and all three still have to hand over their links, which is
+        // the whole reason the arena keeps them.
+        let out = page(&format!(
+            "<html><body>\
+             <header><a href='/logo'>Home</a></header>\
+             <nav><a href='/about'>About</a></nav>\
+             <div class='sidebar'><a href='/related'>Related</a></div>\
+             <article>{BODY}<a href='/cited'>a source</a></article>\
+             <footer><a href='/terms'>Terms</a></footer></body></html>"
+        ));
+
+        assert_eq!(
+            link_of(&out, "https://example.com/cited").kind,
+            LinkKind::Body
+        );
+        for nav in ["/logo", "/about", "/related", "/terms"] {
+            let url = format!("https://example.com{nav}");
+            assert_eq!(link_of(&out, &url).kind, LinkKind::Nav, "{url}");
+        }
+        // And none of it reached the content.
+        assert!(!out.markdown.contains("Terms"), "{}", out.markdown);
+        assert!(!out.markdown.contains("About"), "{}", out.markdown);
+        assert!(out.markdown.contains("[a source]"), "{}", out.markdown);
+    }
+
+    #[test]
+    fn a_nav_inside_the_content_root_is_still_navigation() {
+        let out = page(&format!(
+            "<html><body><article>{BODY}<a href='/cited'>a source</a>\
+             <nav><a href='/next-page'>Next</a></nav></article></body></html>"
+        ));
+        assert_eq!(
+            link_of(&out, "https://example.com/cited").kind,
+            LinkKind::Body
+        );
+        assert_eq!(
+            link_of(&out, "https://example.com/next-page").kind,
+            LinkKind::Nav
+        );
+    }
+
+    #[test]
+    fn a_link_element_is_a_sitemap_a_feed_or_a_plain_link() {
+        let out = page(&format!(
+            "<html><head>\
+             <link rel='sitemap' href='/sitemap.xml'>\
+             <link rel='alternate' type='application/rss+xml' href='/feed.xml'>\
+             <link rel='canonical' href='/canonical'>\
+             </head><body><article>{BODY}</article></body></html>"
+        ));
+        assert_eq!(
+            link_of(&out, "https://example.com/sitemap.xml").kind,
+            LinkKind::Sitemap
+        );
+        assert_eq!(
+            link_of(&out, "https://example.com/feed.xml").kind,
+            LinkKind::Feed
+        );
+        let canonical = link_of(&out, "https://example.com/canonical");
+        assert_eq!(canonical.kind, LinkKind::Link);
+        assert!(canonical.rel.has(Rel::CANONICAL));
+        // A `<link>` has no text, and an empty anchor is not the same as a
+        // missing one.
+        assert!(canonical.anchor.is_empty());
+    }
+
+    #[test]
+    fn the_rel_bitmask_arrives_on_the_link() {
+        let out = page(&format!(
+            "<html><body><article>{BODY}\
+             <a href='/paid' rel='NoFollow sponsored noopener made-up'>an ad</a>\
+             <a href='/plain'>not an ad</a></article></body></html>"
+        ));
+        let paid = link_of(&out, "https://example.com/paid");
+        assert!(paid.rel.has(Rel::NOFOLLOW));
+        assert!(paid.rel.has(Rel::SPONSORED));
+        assert!(paid.rel.has(Rel::NOOPENER));
+        assert!(!paid.rel.has(Rel::UGC));
+        assert_eq!(link_of(&out, "https://example.com/plain").rel, Rel::NONE);
+        // `nofollow` on the link is recorded and not obeyed, so the link is here
+        // rather than being dropped, which is the point of recording it.
+        assert_eq!(out.signals.link_count, 2);
+    }
+
+    #[test]
+    fn a_page_level_nofollow_marks_every_link_on_the_page() {
+        let out = page(&format!(
+            "<html><head><meta name='robots' content='nofollow'></head>\
+             <body><article>{BODY}<a href='/one'>one</a></article>\
+             <nav><a href='/two'>two</a></nav></body></html>"
+        ));
+        assert!(out.robots.nofollow);
+        assert!(!out.robots.noindex);
+        assert_eq!(out.links.links.len(), 2);
+        for link in &out.links.links {
+            assert!(link.rel.has(Rel::NOFOLLOW), "{link:?}");
+        }
+        // Page level nofollow says nothing about indexing, so the content stays.
+        assert!(out.content_withheld.is_none());
+        assert!(!out.markdown.is_empty());
+    }
+
+    #[test]
+    fn a_noindex_page_is_still_a_row_and_still_has_its_links() {
+        let out = page(&format!(
+            "<html><head><meta name='robots' content='noindex'></head>\
+             <body><article>{BODY}<a href='/one'>one</a></article></body></html>"
+        ));
+        assert_eq!(out.content_withheld, Some(Withheld::Noindex));
+        assert!(out.markdown.is_empty());
+        assert!(out.text().is_empty());
+        // The links survive, and they are not marked nofollow, because `noindex`
+        // on its own says nothing about following.
+        assert_eq!(out.links.links.len(), 1);
+        assert_eq!(out.links.links[0].url, "https://example.com/one");
+        assert!(!out.links.links[0].rel.has(Rel::NOFOLLOW));
+        assert_eq!(out.signals.link_count, 1);
+    }
+
+    #[test]
+    fn an_x_robots_tag_header_withholds_the_same_way_the_meta_tag_does() {
+        let url = Url::parse("https://example.com/a/b").expect("the test url parses");
+        let html =
+            format!("<html><body><article>{BODY}<a href='/one'>one</a></article></body></html>");
+        let out = extract_with_robots(html.as_bytes(), &url, Some("noindex, nofollow"));
+        assert_eq!(out.content_withheld, Some(Withheld::Noindex));
+        assert!(out.robots.nofollow);
+        assert_eq!(out.links.links.len(), 1);
+        assert!(out.links.links[0].rel.has(Rel::NOFOLLOW));
+    }
+
+    #[test]
+    fn a_robots_tag_naming_another_crawler_is_not_ours_to_obey() {
+        let out = page(&format!(
+            "<html><head><meta name='googlebot' content='noindex'></head>\
+             <body><article>{BODY}</article></body></html>"
+        ));
+        assert!(out.content_withheld.is_none());
+        assert!(!out.markdown.is_empty());
+    }
+
+    #[test]
+    fn a_page_keeps_five_thousand_links_and_says_it_had_more() {
+        let mut html = String::from("<html><body><article>");
+        html.push_str(BODY);
+        for n in 0..(MAX_LINKS + 500) {
+            html.push_str(&format!("<a href='/p/{n}'>link {n}</a> "));
+        }
+        html.push_str("</article></body></html>");
+        let out = page(&html);
+        assert_eq!(out.links.links.len(), MAX_LINKS);
+        assert!(out.links.truncated);
+        assert_eq!(out.signals.link_count, MAX_LINKS as u32);
+        // The first 5000 in document order, not an arbitrary 5000.
+        assert_eq!(out.links.links[0].url, "https://example.com/p/0");
+        assert_eq!(
+            out.links.links[MAX_LINKS - 1].url,
+            format!("https://example.com/p/{}", MAX_LINKS - 1)
+        );
+    }
+
+    #[test]
+    fn a_page_under_the_cap_does_not_claim_to_be_truncated() {
+        let out = page(&format!(
+            "<html><body><article>{BODY}<a href='/one'>one</a></article></body></html>"
+        ));
+        assert!(!out.links.truncated);
+    }
+
+    #[test]
+    fn the_same_triple_twice_is_one_link_and_a_different_anchor_is_two() {
+        let out = page(&format!(
+            "<html><body><article>{BODY}\
+             <a href='/same'>label</a><a href='/same'>label</a>\
+             <a href='/same'>a different label</a></article></body></html>"
+        ));
+        assert_eq!(out.links.links.len(), 2);
+        assert_eq!(out.links.links[0].anchor, "label");
+        assert_eq!(out.links.links[1].anchor, "a different label");
+    }
+
+    #[test]
+    fn schemes_that_are_not_http_are_dropped_and_counted_apart() {
+        let out = page(&format!(
+            "<html><body><article>{BODY}\
+             <a href='mailto:someone@example.com'>mail</a>\
+             <a href='javascript:void(0)'>menu</a>\
+             <a href='tel:+15550100'>call</a>\
+             <a href='/real'>real</a></article></body></html>"
+        ));
+        assert_eq!(out.links.links.len(), 1);
+        assert_eq!(out.links.links[0].url, "https://example.com/real");
+        assert_eq!(out.links.dropped_scheme, 3);
+        assert_eq!(out.links.dropped, 0);
+        // No trace of the address anywhere in what we would store.
+        assert!(!format!("{:?}", out.links).contains("someone@example.com"));
+    }
+
+    #[test]
+    fn anchor_text_is_the_whole_subtree_collapsed_and_capped() {
+        let long = "word ".repeat(100);
+        let out = page(&format!(
+            "<html><body><article>{BODY}\
+             <a href='/img'><img src='/i.png' alt='ignored'> <span>two</span>\n<b>words</b></a>\
+             <a href='/long'>{long}</a></article></body></html>"
+        ));
+        assert_eq!(link_of(&out, "https://example.com/img").anchor, "two words");
+        let cut = &link_of(&out, "https://example.com/long").anchor;
+        assert!(cut.len() <= MAX_ANCHOR, "{} bytes", cut.len());
+        assert!(cut.starts_with("word word"));
+    }
+
+    #[test]
+    fn links_resolve_against_the_base_tag_like_the_markdown_does() {
+        let out = page(&format!(
+            "<html><head><base href='https://cdn.example.org/root/'></head>\
+             <body><article>{BODY}<a href='deep/page'>a link</a></article></body></html>"
+        ));
+        assert_eq!(
+            out.links.links[0].url,
+            "https://cdn.example.org/root/deep/page"
+        );
     }
 }
