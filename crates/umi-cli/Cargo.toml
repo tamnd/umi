@@ -1,0 +1,21 @@
+[package]
+name = "umi-cli"
+description = "The umi command line: focused crawls, community fetching and operator commands"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "umi"
+path = "src/main.rs"
+
+[dependencies]
+umi-types.workspace = true
+clap.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "umi-publish"
+description = "Parquet conversion, the Hugging Face client, manifests and GC"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

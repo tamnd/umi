@@ -1,0 +1,15 @@
+[package]
+name = "umi-proto"
+description = "The umi/1 wire contract: leases, deliveries and receipts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

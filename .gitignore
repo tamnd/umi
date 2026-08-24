@@ -1,0 +1,15 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Crawl output. A focused crawl writes a directory next to wherever it
+# was run, and doc 13.5 says that directory is state plus parquet.
+/crawls
+*.umi
+*.parquet
+state.sqlite*
+
+# Local operator config, which holds a Hugging Face token often enough
+# that it should never be one `git add -A` away from being published.
+/umi.toml
+/.umi

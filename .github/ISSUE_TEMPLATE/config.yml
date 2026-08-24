@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: umi is crawling my site badly
+    url: https://umi.dev/bot
+    about: Block requests, the published identity, and the address ranges. This path stops the whole fleet and is answered before anything else.
+  - name: Security report
+    url: https://github.com/tamnd/umi/security/advisories/new
+    about: Anything that would let somebody poison a corpus, forge a receipt, or aim the fleet at a third party.

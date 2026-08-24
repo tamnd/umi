@@ -1,0 +1,15 @@
+[package]
+name = "umi-fetch"
+description = "The tier ladder, the HTTP clients and the browser pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,168 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Every job below inherits the toolchain from rust-toolchain.toml, which
+  # pins 1.98. That makes the ordinary jobs the minimum supported version
+  # check as well, and it means a laptop and a runner disagree about the
+  # compiler only if somebody edits that file. The `stable` job is the one
+  # that deliberately breaks the pin, so that a change landing in a newer
+  # release is seen here rather than in somebody's editor months later.
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features
+      - run: cargo build --workspace
+
+  # The pin says 1.98 and the README says 1.98, so a build that only works
+  # on something newer is a bug in one of them. This job asserts it out
+  # loud instead of trusting the file.
+  msrv:
+    name: msrv is 1.98
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98
+      - uses: Swatinem/rust-cache@v2
+      - name: The pin, the manifest and the toolchain all say 1.98
+        run: |
+          set -e
+          grep -q 'channel = "1.98"' rust-toolchain.toml
+          grep -q 'rust-version = "1.98"' Cargo.toml
+          test "$(rustc +1.98 --version | cut -d' ' -f2)" = 1.98.0
+      - env:
+          RUSTUP_TOOLCHAIN: "1.98"
+        run: cargo build --workspace --all-features --locked
+
+  # RUSTUP_TOOLCHAIN beats rust-toolchain.toml, which is how this job gets
+  # past the pin. Allowed to fail: a new lint in a release nobody has
+  # adopted yet is information, not a broken build.
+  stable:
+    name: current stable
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  docs:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # The specification is the deliverable that came before the code, and it
+  # is written to a house style. A style nothing checks is a style that
+  # lasts about three commits.
+  spec:
+    name: spec
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./scripts/check-spec.sh
+      # Doc comments across the workspace cite spec sections by filename.
+      # A citation pointing at a file that no longer exists is worse than
+      # no citation, because it reads as authoritative.
+      - name: Every spec file cited from the code exists
+        run: |
+          set -e
+          missing=0
+          for ref in $(grep -rho --exclude-dir=target --exclude-dir=.git --exclude-dir=spec 'docs/spec/[0-9][0-9]-[a-z0-9-]*\.md' . | sort -u); do
+            if [ ! -f "$ref" ]; then
+              echo "cited but missing: $ref"
+              missing=1
+            fi
+          done
+          exit $missing
+
+  # Nothing here has an implementation yet, so the one runtime claim worth
+  # making is that the command line parses and that an unbuilt command
+  # says so rather than pretending. `umi --help` also has to work on a
+  # machine with no config and no state.
+  cli:
+    name: cli surface
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - name: The parser is wired up
+        run: |
+          set -e
+          ./target/debug/umi --help > /dev/null
+          ./target/debug/umi crawl --help > /dev/null
+          ./target/debug/umi fetch --help > /dev/null
+          ./target/debug/umid --help > /dev/null
+          # Exit 1 with a milestone pointer is the contract for a command
+          # that is specified and not built. A zero here would mean a
+          # command silently did nothing.
+          if ./target/debug/umi doctor; then
+            echo "umi doctor exited 0 but nothing is implemented"
+            exit 1
+          fi

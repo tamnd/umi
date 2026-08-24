@@ -1,0 +1,23 @@
+[package]
+name = "umid"
+description = "The umi coordinator daemon: state, scheduling, the fetch protocol, the writer and the publisher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "umid"
+path = "src/main.rs"
+
+[dependencies]
+umi-types.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

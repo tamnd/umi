@@ -1,0 +1,29 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    groups:
+      # One pull request for the routine churn. Patch bumps across a
+      # thirty crate tree arriving one at a time is how a dependency
+      # update becomes something nobody reads.
+      patch:
+        update-types: [patch]
+      tokio:
+        patterns: ["tokio", "tokio-*", "tower", "tower-*", "hyper", "hyper-*"]
+    commit-message:
+      prefix: deps
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

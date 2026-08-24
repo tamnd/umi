@@ -1,0 +1,35 @@
+name: Bug
+description: Something built does not do what the spec says it does.
+labels: ["kind/bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If umi fetched something it should not have, please use the crawler behaviour link on the issue chooser instead. That path is faster and it stops the whole fleet rather than one machine.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `umi --version`.
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: ubuntu 24.04 x86_64, or macos 15 arm64
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command, the output, and what you expected instead. Logs from `UMI_LOG=debug` help.
+    validations:
+      required: true
+  - type: input
+    id: spec
+    attributes:
+      label: Which spec section it contradicts
+      description: Optional, but it turns a report into a fix.
+      placeholder: docs/spec/07-politeness-and-identity.md section 7.2

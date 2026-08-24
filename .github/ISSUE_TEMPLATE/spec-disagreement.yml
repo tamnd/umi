@@ -1,0 +1,34 @@
+name: Something in the spec is wrong
+description: A design decision in docs/spec that is wrong, too expensive, or already solved better somewhere else.
+labels: ["kind/spec"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This is the most useful issue you can open right now. The spec is written and almost nothing is built, so a bad decision costs an argument today and a rewrite in six months.
+  - type: input
+    id: where
+    attributes:
+      label: Which document and section
+      placeholder: docs/spec/09-frontier-and-freshness.md section 9.4
+    validations:
+      required: true
+  - type: textarea
+    id: claim
+    attributes:
+      label: What the spec says
+      description: Quote it, so we are arguing about the same sentence.
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Why that is wrong
+      description: If you have measured something relevant, this is the place for the numbers, including ones that disagree with each other.
+    validations:
+      required: true
+  - type: textarea
+    id: alternative
+    attributes:
+      label: What should happen instead, and what it costs
+      description: Every alternative has a cost. Naming it makes the case stronger, not weaker.

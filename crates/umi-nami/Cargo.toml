@@ -1,0 +1,15 @@
+[package]
+name = "umi-nami"
+description = "The experimental single file state engine, 波"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
