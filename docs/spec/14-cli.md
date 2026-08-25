@@ -245,6 +245,24 @@ $ umi doctor
 
 Two of these lines are load bearing. The `openssl-sys` check is doc 05.5's CI assertion run at runtime, because the BoringSSL symbol prefix conflict produces link failures and segfaults rather than clean errors and it is worth catching before a crawl rather than during one. The bandwidth measurements are doc 01's milestone 1 gate, and having them in `doctor` means the number gets measured on every box every time rather than once by whoever set it up.
 
+`--bandwidth` is the gate itself rather than the sample. It runs eight concurrent streams for sixty seconds in each direction, `--bandwidth-secs` changes the sixty, and it moves a few gigabytes and takes a couple of minutes, which is why the plain `doctor` takes a one request sample and says out loud that the sample is too small to be the gate.
+
+```
+$ umi doctor --bandwidth
+  measuring 60 s in each direction over 8 streams, this takes about 2 minutes
+  inbound 466.4 Mbit/s, 3.50 GB in 60.0 s
+      https://ash-speed.hetzner.com/1GB.bin  249 MB
+      https://fsn1-speed.hetzner.com/1GB.bin  359 MB
+      https://hel1-speed.hetzner.com/1GB.bin  313 MB
+      https://cachefly.cachefly.net/100mb.test  2578 MB
+      the interface counters saw 3.57 GB over the same window, which includes whatever else this box is doing
+  ...
+  inbound sustained     466 Mbit/s, 1098 pages/s at 53.1 KB              ok
+  outbound sustained    519 Mbit/s, 10807 pages/s at 6.0 KB             ok
+```
+
+The per endpoint block is not decoration. The first attempt at doc 16's gate 1.1 reported single digit megabits on all three boxes and looked like a catastrophic result, and it was wrong: the endpoint it used returned one byte and what got measured was background noise. A speed test that moves no bytes is indistinguishable from a slow link, because both report a small number, so the measurement asserts it moved a plausible number of bytes before it is allowed to be a measurement, and it names what each endpoint delivered so that a dead endpoint reads as a dead endpoint.
+
 ## 14.9 Output and exit codes
 
 Human readable when stdout is a terminal, machine readable otherwise, and `--json` forces the machine form. No colour when `NO_COLOR` is set or stdout is not a terminal. Progress goes to stderr so that `umi cat ... | head` behaves.

@@ -69,6 +69,11 @@ pub struct Options {
     pub offline: bool,
     /// The directory the crawl would write into.
     pub out: std::path::PathBuf,
+    /// Run doc 16's gate 1.1 for real, for this many seconds per direction,
+    /// rather than the one request sample. `None` is the default because this
+    /// moves gigabytes and takes minutes, and `umi doctor` is a thing people
+    /// run before a crawl rather than a thing people run once a quarter.
+    pub bandwidth: Option<u64>,
 }
 
 /// Run every check and print the report.
@@ -91,7 +96,10 @@ pub fn doctor(options: &Options) -> Result<Vec<Check>, Error> {
         checks.push(Check::new("inbound sample", "--offline", Verdict::Skip));
         checks.push(Check::new("clock skew", "--offline", Verdict::Skip));
     } else {
-        checks.push(bandwidth());
+        match options.bandwidth {
+            Some(seconds) => checks.extend(sustained(seconds)),
+            None => checks.push(bandwidth()),
+        }
         checks.push(clock_skew());
     }
 
@@ -326,6 +334,121 @@ fn available_memory_mb() -> Option<u64> {
     Some(pages * page_size / 1024 / 1024)
 }
 
+/// Doc 16's gate 1.1 for real: sustained, both directions, named endpoints.
+///
+/// Two report lines, plus a block on stderr naming what each endpoint
+/// delivered. The block is not decoration. Doc 01's first attempt at this gate
+/// was ruined by an endpoint that returned one byte, and the only thing that
+/// would have caught it at the time was a per endpoint number to look at.
+fn sustained(seconds: u64) -> Vec<Check> {
+    let options = crate::bandwidth::Options {
+        seconds,
+        ..crate::bandwidth::Options::default()
+    };
+    eprintln!(
+        "  measuring {seconds} s in each direction over {} streams, this takes about {} minutes",
+        options.streams,
+        (seconds * 2).div_ceil(60)
+    );
+    let (inbound, outbound) = match crate::bandwidth::measure(&options) {
+        Ok(both) => both,
+        Err(cause) => return vec![Check::new("bandwidth", cause, Verdict::Skip)],
+    };
+    vec![
+        report(&inbound, &options, 53_100.0),
+        report(&outbound, &options, 6_000.0),
+    ]
+}
+
+/// One direction, turned into a line and a block.
+///
+/// `per_page` is what a page costs in that direction: doc 01's measured 53.1 KB
+/// of fetched response inbound, doc 10.2's 6 KB of published output outbound.
+fn report(
+    direction: &crate::bandwidth::Direction,
+    options: &crate::bandwidth::Options,
+    per_page: f64,
+) -> Check {
+    let name = if direction.name == "inbound" {
+        "inbound sustained"
+    } else {
+        "outbound sustained"
+    };
+    eprintln!(
+        "  {} {:.1} Mbit/s, {:.2} GB in {:.1} s",
+        direction.name,
+        direction.mbit(),
+        direction.bytes as f64 / 1e9,
+        direction.elapsed.as_secs_f64(),
+    );
+    for (endpoint, bytes) in &direction.per_endpoint {
+        // Megabytes rather than gigabytes, because the number that matters
+        // most here is the one near zero and `0.00 GB` does not say whether an
+        // endpoint was slow or absent.
+        eprintln!("      {endpoint}  {:.0} MB", *bytes as f64 / 1e6);
+    }
+    if let Some(interface) = direction.interface {
+        eprintln!(
+            "      the interface counters saw {:.2} GB over the same window, \
+             which includes whatever else this box is doing",
+            interface as f64 / 1e9
+        );
+    }
+    for error in &direction.errors {
+        eprintln!("      {error}");
+    }
+
+    if !direction.plausible(options) {
+        let dead = direction.dead();
+        let detail = if dead.is_empty() {
+            format!(
+                "only {:.2} GB in {:.1} s, not a measurement",
+                direction.bytes as f64 / 1e9,
+                direction.elapsed.as_secs_f64()
+            )
+        } else {
+            format!(
+                "{} of {} endpoints delivered nothing",
+                dead.len(),
+                direction.per_endpoint.len()
+            )
+        };
+        return Check::new(name, detail, Verdict::Bad);
+    }
+
+    let seconds = direction.elapsed.as_secs_f64().max(0.001);
+    let pages = direction.bytes as f64 / seconds / per_page;
+    // 250 pages a second per host is doc 01's target and doc 16's gate 3.
+    // Between 150 and 250 is server1, which is a real box that stays in the
+    // fleet doing less fetching rather than a box that fails a check.
+    let verdict = if pages >= 250.0 {
+        Verdict::Ok
+    } else if pages >= 150.0 {
+        Verdict::Warn
+    } else {
+        Verdict::Bad
+    };
+    // A dead endpoint on a run that otherwise looks fine still belongs in the
+    // summary, because it means the rate came off three endpoints rather than
+    // four and is a floor rather than the link. server1 reads cachefly at zero
+    // every time, and the line should say so without anybody reading the block
+    // above it.
+    let dead = match direction.dead().len() {
+        0 => String::new(),
+        1 => ", 1 endpoint dead".to_owned(),
+        many => format!(", {many} endpoints dead"),
+    };
+    Check::new(
+        name,
+        format!(
+            "{:.0} Mbit/s, {pages:.0} pages/s at {:.1} KB{dead}",
+            direction.mbit(),
+            per_page / 1000.0
+        ),
+        verdict,
+    )
+}
+
 /// Doc 01's milestone 1 gate, measured rather than assumed.
 ///
 /// One range request against a large public object on the Hugging Face CDN,
@@ -383,20 +506,38 @@ fn clock_skew() -> Check {
             .user_agent(umi_fetch::USER_AGENT)
             .build()?;
         let response = client.head("https://huggingface.co/").send().await?;
-        Ok::<Option<String>, reqwest::Error>(
+        let header = |name: http::header::HeaderName| {
             response
                 .headers()
-                .get(http::header::DATE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_owned),
-        )
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        Ok::<(Option<String>, Option<String>), reqwest::Error>((
+            header(http::header::DATE),
+            header(http::header::AGE),
+        ))
     });
     match result {
-        Ok(Some(date)) => match umi_fetch::date::parse(&date) {
+        Ok((Some(date), age)) => match umi_fetch::date::parse(&date) {
             Some(remote_ms) => {
+                // `Age` matters and leaving it out is how this check spent a
+                // day reporting a minute of skew on three boxes whose clocks
+                // were within a second of each other. huggingface.co is behind
+                // CloudFront, a cache hit carries the `Date` the origin wrote
+                // when it filled the cache, and `Age` is how long ago that was.
+                // RFC 9111 puts the origin's idea of now at `Date` plus `Age`,
+                // which is the number to compare a clock against.
+                let age_ms = age
+                    .as_deref()
+                    .and_then(|value| value.trim().parse::<i64>().ok())
+                    .unwrap_or(0)
+                    .clamp(0, 86_400)
+                    * 1000;
                 let local_ms = now_ms();
                 let skew = i64::try_from(local_ms).unwrap_or(i64::MAX)
-                    - i64::try_from(remote_ms).unwrap_or(i64::MAX);
+                    - i64::try_from(remote_ms).unwrap_or(i64::MAX)
+                    - age_ms;
                 // A `Date` header has one second resolution, so anything under
                 // two seconds is indistinguishable from correct.
                 let verdict = if skew.abs() < 2000 {
@@ -406,9 +547,14 @@ fn clock_skew() -> Check {
                 } else {
                     Verdict::Bad
                 };
+                let cached = if age_ms > 0 {
+                    format!(", off a cache {} s old", age_ms / 1000)
+                } else {
+                    String::new()
+                };
                 Check::new(
                     "clock skew",
-                    format!("{skew:+} ms against huggingface.co"),
+                    format!("{skew:+} ms against huggingface.co{cached}"),
                     verdict,
                 )
             }
@@ -418,7 +564,7 @@ fn clock_skew() -> Check {
                 Verdict::Skip,
             ),
         },
-        Ok(None) => Check::new("clock skew", "no Date header came back", Verdict::Skip),
+        Ok((None, _)) => Check::new("clock skew", "no Date header came back", Verdict::Skip),
         Err(cause) => Check::new("clock skew", format!("{cause}"), Verdict::Bad),
     }
 }

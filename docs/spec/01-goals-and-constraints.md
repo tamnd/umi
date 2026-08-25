@@ -57,22 +57,24 @@ outbound:   750 pages/s x 6 KB    = 4.5 MB/s   = 36 Mbit/s
                                   = 11.8 TB/month across the whole fleet
 ```
 
-The measured capacity, eight concurrent streams for 60 seconds with bytes counted at the interface, against Hetzner and Cachefly endpoints:
+The measured capacity, from `umi doctor --bandwidth` on each box: eight concurrent streams for 60 seconds in each direction, against three Hetzner endpoints and Cachefly inbound and Cloudflare's speed test outbound.
 
-| Host | idle baseline | inbound | outbound | pages/s at 53.1 KB |
-| --- | --- | --- | --- | --- |
-| server1 | 3 Mbit/s | 77 Mbit/s | not measured | 181 |
-| server2 | 3 Mbit/s | 216 Mbit/s | 143 Mbit/s | 509 |
-| server3 | 56 Mbit/s | 270 Mbit/s | 313 Mbit/s | 636, or 504 net of idle |
-| **fleet** | | **563 Mbit/s** | | **1325** |
+| Host | inbound | outbound | pages/s at 53.1 KB |
+| --- | --- | --- | --- |
+| server1 | 178 Mbit/s | 182 Mbit/s | 420 |
+| server2 | 247 Mbit/s | 219 Mbit/s | 582 |
+| server3 | 466 Mbit/s | 519 Mbit/s | 1098 |
+| **fleet** | **892 Mbit/s** | **920 Mbit/s** | **2100** |
 
-None of the three reports a NIC link speed, all read `-1`, so the port ceiling is unknown and these are floors rather than caps.
+Those are one run each and the run to run spread is wide: server1 came back anywhere from 143 to 187 Mbit/s inbound across four runs on the same afternoon, and the endpoint mix moved too, with Cachefly delivering 54 MB in one run and 429 MB in the next. Treat the table as the order of magnitude rather than as four significant figures. None of the three reports a NIC link speed, all read `-1`, so the port ceiling is unknown and these are floors rather than caps in that direction too.
 
-**Bandwidth is not the constraint this section was written to worry about.** The failure case it feared was 81 pages/s per host. The fleet instead has roughly 1.8 times the headroom the 750 pages/s target needs. Two things change as a result.
+The first set of numbers this section carried was lower across the board, at 77, 216 and 270 Mbit/s inbound with server1's outbound unmeasured because the test got OOM killed. Those came from a shell script rather than from `umi doctor`, they counted bytes only at the interface, and they let a stalled stream run past the end of the window, which turns a rate into a smaller rate. The current numbers count what the process received, cancel at the deadline, and measure both directions on all three boxes.
 
-server1 is the weak box at 181 pages/s, short of the 250 target, and it also has essentially no free memory. Doc 15 gives it the coordinator role, which is the right assignment for a reason other than the one written down there: it should carry the least fetching, not the most.
+**Bandwidth is not the constraint this section was written to worry about.** The failure case it feared was 81 pages/s per host. The fleet instead has roughly 2.8 times the headroom the 750 pages/s target needs, and every individual box clears 250 pages/s on its own. Two things change as a result.
 
-Metering is now the binding open question rather than raw speed. At 250 pages/s a host moves 34.4 TB/month inbound, which is just over a typical 32 TB allowance, and a 32 TB inbound cap works out to 232 pages/s. That is marginally under target rather than catastrophically under it. `vnstat` is not installed on any of the three boxes so there is no history to read, and installing it is the follow up that settles this within a month.
+server1 is still the weak box, at 420 pages/s inbound against server3's 1098, and more to the point it has essentially no free memory: `umi doctor` reports 373 MB available against the 1536 MB a crawl budgets, and calls the box not ready. Doc 15 gives it the coordinator role, which is the right assignment for a reason other than the one written down there: it should carry the least fetching, not the most.
+
+Metering is now the binding open question rather than raw speed. At 250 pages/s a host moves 34.4 TB/month inbound, which is just over a typical 32 TB allowance, and a 32 TB inbound cap works out to 232 pages/s. That is marginally under target rather than catastrophically under it. `vnstat` is now running on server2 and server3, collecting the history that settles this, and server1 needs it installed by somebody with root. A month of data answers the question and nothing before then does.
 
 The two fallbacks are unchanged and are now comfortable rather than essential. Conditional revalidation is the big one: a 304 costs about 500 bytes against 53 KB, so a revisit heavy mix is nearly free, and doc 09 already prefers it. Range limiting is the other: cap fetches at 512 KB and abort past it, which at p99 of 475.6 KB loses well under 1 percent of documents. Neither changes the architecture.
 
