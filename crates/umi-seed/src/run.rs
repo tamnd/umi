@@ -264,8 +264,28 @@ impl Drop for SeedStream {
             let _ = child.kill();
             let _ = child.wait();
         }
-        if let Some((handle, _)) = self.stderr.take() {
-            let _ = handle.join();
-        }
+        // The stderr forwarder is dropped rather than joined, which is the
+        // opposite of what [`finish`](SeedStream::finish) does and is
+        // deliberate.
+        //
+        // That thread ends when its read returns zero, and the read returns
+        // zero when the last write handle on the pipe closes. Killing the child
+        // closes the child's handle and nothing else's, so joining here is a
+        // bet that the child was the only holder. On Unix it usually is,
+        // because a seeder run through `sh -c` is exec'd into the shell rather
+        // than forked from it. On Windows it is not: `sh` comes from Git for
+        // Windows, terminating it does not reliably take its descendants with
+        // it, and anything it left running keeps the write end open. Joining
+        // then blocks forever, which is a hang inside a `Drop` and takes the
+        // whole process with it.
+        //
+        // `finish` can afford the join because it has already waited for the
+        // child to exit on its own. `Drop` has not, so it cannot.
+        //
+        // So the thread is detached. It holds a pipe and a `Vec` of at most a
+        // few kilobytes, it exits as soon as the write end goes away, and
+        // nobody is going to read the tail it is filling because the stream
+        // that owned it is gone.
+        drop(self.stderr.take());
     }
 }
