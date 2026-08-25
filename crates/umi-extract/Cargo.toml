@@ -18,6 +18,9 @@ umi-types = { workspace = true }
 blake3 = { workspace = true }
 html5ever = { workspace = true }
 markup5ever_rcdom = { workspace = true }
+# Doc 11.6 reads five fields out of JSON-LD, and JSON-LD in the wild is invalid
+# often enough that a hand written reader would spend all its time on recovery.
+serde_json = { workspace = true }
 unicode-normalization = { workspace = true }
 url = { workspace = true }
 

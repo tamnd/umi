@@ -26,6 +26,7 @@
 //! cargo bench -p umi-extract                              # the golden corpus
 //! UMI_BENCH_CORPUS=~/umi-bench/pages cargo bench -p umi-extract   # real pages
 //! UMI_BENCH_REPEAT=20 cargo bench -p umi-extract          # a small corpus, more passes
+//! UMI_BENCH_META=1 cargo bench -p umi-extract             # what doc 11.6 finds out there
 //! chrt --fifo 50 cargo bench -p umi-extract               # take the cpu on a busy machine
 //! ```
 
@@ -35,7 +36,7 @@ use std::time::Instant;
 
 use html5ever::tendril::TendrilSink;
 use markup5ever_rcdom::RcDom;
-use umi_extract::extract;
+use umi_extract::{DescriptionSource, TitleSource, extract};
 use url::Url;
 
 /// Doc 05.4 caps a stored body at 512 KiB, so the fetcher never hands the
@@ -171,6 +172,16 @@ fn main() {
         println!("per document digests written to {path}");
     }
 
+    // What doc 11.6 actually finds on real pages. A metadata reader that returns
+    // nothing passes every unit test that only checks the shape of what it
+    // returns, and the way to catch that is to point it at two thousand pages
+    // off the live web and read the percentages. The numbers are also the
+    // argument for the precedence lists: if `og:title` never fires, it did not
+    // need to be in the list.
+    if std::env::var("UMI_BENCH_META").is_ok() {
+        coverage(&documents, &url);
+    }
+
     // Per document numbers for anyone who wants to know what predicts the tail.
     // The top five in the report tell you which pages are slow and nothing about
     // why, and the why is a question for a scatter plot rather than for a guess.
@@ -193,6 +204,86 @@ fn main() {
         contention,
     );
 }
+
+/// How often each of doc 11.6's fields is there to be found.
+///
+/// One extract per document, outside the timed loops, because this is a
+/// question about the corpus rather than about the clock.
+fn coverage(documents: &[(String, Vec<u8>)], url: &Url) {
+    let mut counts = vec![0usize; ROWS.len()];
+    let mut headings = 0usize;
+    for (_, html) in documents {
+        let page = extract(html, url);
+        let meta = &page.meta;
+        let hit = [
+            meta.title.is_some(),
+            meta.title_source == Some(TitleSource::Title),
+            meta.title_source == Some(TitleSource::OpenGraph),
+            meta.title_source == Some(TitleSource::Heading),
+            meta.description.is_some(),
+            meta.description_source == Some(DescriptionSource::Meta),
+            meta.description_source == Some(DescriptionSource::OpenGraph),
+            meta.description_source == Some(DescriptionSource::Twitter),
+            meta.description_derived(),
+            meta.canonical.is_some(),
+            meta.published.is_some() || meta.modified.is_some(),
+            !meta.headings.is_empty(),
+            !meta.feeds.is_empty(),
+            meta.declared_lang.is_some(),
+            !meta.structured.types.is_empty(),
+            meta.structured.published.is_some() || meta.structured.modified.is_some(),
+            meta.structured.author.is_some(),
+            meta.structured.headline.is_some(),
+            meta.microdata,
+            meta.rdfa,
+            page.content_withheld.is_some(),
+        ];
+        for (count, hit) in counts.iter_mut().zip(hit) {
+            *count += usize::from(hit);
+        }
+        headings += meta.headings.len();
+    }
+
+    let total = documents.len().max(1);
+    println!("\ndoc 11.6 coverage over {total} documents");
+    for (row, count) in ROWS.iter().zip(&counts) {
+        println!("{row:>28}  {count:6}  {:3} percent", count * 100 / total);
+    }
+    // Tenths by integer division, because this crate does not do floating point
+    // and a report line is not the place to start.
+    let tenths = headings * 10 / total;
+    println!(
+        "{:>28}  {headings:6}  {}.{} per page",
+        "headings kept",
+        tenths / 10,
+        tenths % 10
+    );
+}
+
+/// The rows of the coverage report, in the order [`coverage`] fills them.
+const ROWS: [&str; 21] = [
+    "title",
+    "  from title",
+    "  from og:title",
+    "  from first h1",
+    "description",
+    "  from meta",
+    "  from og",
+    "  from twitter",
+    "  ours, not theirs",
+    "canonical",
+    "article dates",
+    "headings",
+    "feeds",
+    "lang attribute",
+    "json-ld types",
+    "json-ld dates",
+    "json-ld author",
+    "json-ld headline",
+    "microdata",
+    "rdfa",
+    "withheld, noindex",
+];
 
 fn load(dir: &Path) -> Vec<(String, Vec<u8>)> {
     let mut out: Vec<(String, Vec<u8>)> = fs::read_dir(dir)

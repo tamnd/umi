@@ -141,17 +141,36 @@ mod tests {
                 "{name} is on the published list, which doc 11.5 forbids"
             );
         }
+        // Every spelling an origin might use, including the ones no origin
+        // should: mixed case, shouted, and the same forbidden header sent twice.
+        // `http` folds a header name to lowercase on the way in, so this cannot
+        // regress here, but the rule is a promise about what reaches storage
+        // rather than about one library's behaviour, and the day the fetch path
+        // grows a second way to build a `HeaderMap` this is the test that
+        // notices.
         let map = headers(&[
-            ("set-cookie", "session=abc; HttpOnly"),
-            ("authorization", "Bearer nope"),
-            ("www-authenticate", "Basic realm=\"x\""),
-            ("content-type", "text/html"),
+            ("Set-Cookie", "session=abc; HttpOnly"),
+            ("SET-COOKIE", "other=def"),
+            ("AUTHORIZATION", "Bearer nope"),
+            ("Proxy-Authorization", "Basic nope"),
+            ("WWW-Authenticate", "Basic realm=\"x\""),
+            ("Content-Type", "text/html"),
         ]);
+        assert!(
+            map.keys()
+                .all(|name| name.as_str() == name.as_str().to_ascii_lowercase()),
+            "the map is supposed to arrive folded to lowercase"
+        );
         let out = kept(&map);
         assert_eq!(
             out,
             vec![("content-type".to_owned(), "text/html".to_owned())]
         );
+        // Not in the names, not in the values, not anywhere.
+        let dump = format!("{out:?}");
+        for secret in ["session=abc", "other=def", "Bearer nope", "cookie", "auth"] {
+            assert!(!dump.contains(secret), "{secret} survived into {dump}");
+        }
     }
 
     #[test]

@@ -225,7 +225,24 @@ pub struct Node {
 pub struct Dom {
     nodes: Vec<Node>,
     dropped: u32,
+    ld_json: Vec<String>,
+    microdata: bool,
+    rdfa: bool,
 }
+
+/// How many `application/ld+json` blocks are collected from one page.
+///
+/// Doc 11.6 keeps five fields out of them and explicitly does not keep the blob,
+/// because on an e-commerce page the blob is routinely larger than the article.
+/// A page with three hundred product blocks has nothing more to say after the
+/// first few and this stops the parse carrying them all.
+const MAX_LD_JSON: usize = 16;
+
+/// How many bytes of one `application/ld+json` block are collected.
+///
+/// Same reason. A megabyte of product feed in a `<script>` tag is a real thing
+/// and the five fields worth having are never a megabyte in.
+const MAX_LD_JSON_BYTES: usize = 256 * 1024;
 
 impl Dom {
     /// Parse a document.
@@ -256,6 +273,9 @@ impl Dom {
                 chrome: false,
             }],
             dropped: 0,
+            ld_json: Vec::new(),
+            microdata: false,
+            rdfa: false,
         };
         dom.absorb(&parsed.document);
         dom
@@ -287,8 +307,18 @@ impl Dom {
                 }
                 NodeData::Element { name, attrs, .. } => {
                     let local = name.local.as_ref();
+                    self.note_vocabulary(&attrs.borrow());
                     match classify(local) {
                         None => {
+                            // `<script type="application/ld+json">` is the one
+                            // dropped subtree with something in it we want. Doc
+                            // 11.6 reads five fields out of it, and the script
+                            // still does not enter the tree, so no pass
+                            // downstream has to learn that some scripts are
+                            // different from other scripts.
+                            if local == "script" {
+                                self.note_ld_json(&handle, &attrs.borrow());
+                            }
                             // Already inside chrome, so this subtree's text is
                             // counted by whichever of the two rules gets there
                             // first and never by both.
@@ -352,10 +382,83 @@ impl Dom {
         }
     }
 
+    /// Flag a microdata or RDFa vocabulary on an element.
+    ///
+    /// Doc 11.6 detects both and parses neither, which is a scope cut recorded
+    /// in doc 17. Detection is on the attributes that open a vocabulary rather
+    /// than on the ones that name a field, because `itemprop` and `property`
+    /// both turn up on pages carrying neither vocabulary and would flag most of
+    /// the web.
+    fn note_vocabulary(&mut self, attrs: &[html5ever::Attribute]) {
+        // Both flags set means there is nothing left to look for, and this runs
+        // on every element of every page.
+        if self.microdata && self.rdfa {
+            return;
+        }
+        for attr in attrs {
+            match attr.name.local.as_ref() {
+                "itemscope" | "itemtype" => self.microdata = true,
+                "typeof" | "vocab" => self.rdfa = true,
+                _ => {}
+            }
+        }
+    }
+
+    /// Collect a `<script type="application/ld+json">` body.
+    ///
+    /// The type test is exact after trimming and ASCII case folding. A `type`
+    /// that is missing, or that says `text/javascript`, is a script and not
+    /// structured data, and treating a bare `<script>` as JSON-LD would hand the
+    /// parser every inline script on the page.
+    fn note_ld_json(&mut self, handle: &Handle, attrs: &[html5ever::Attribute]) {
+        if self.ld_json.len() >= MAX_LD_JSON {
+            return;
+        }
+        let structured = attrs.iter().any(|attr| {
+            attr.name.local.as_ref() == "type"
+                && attr
+                    .value
+                    .trim()
+                    .eq_ignore_ascii_case("application/ld+json")
+        });
+        if !structured {
+            return;
+        }
+        // A script element holds exactly one text child when it holds anything,
+        // because the tokeniser runs it in a raw text state.
+        let mut body = String::new();
+        for child in handle.children.borrow().iter() {
+            if let NodeData::Text { contents } = &child.data {
+                body.push_str(&contents.borrow());
+            }
+            if body.len() > MAX_LD_JSON_BYTES {
+                return;
+            }
+        }
+        if !body.trim().is_empty() {
+            self.ld_json.push(body);
+        }
+    }
+
     /// How many nodes the arena holds. Never zero, because the root is always
     /// there, which is why this is not called `len`.
     pub fn node_count(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// The `application/ld+json` blocks, in document order.
+    pub fn ld_json(&self) -> &[String] {
+        &self.ld_json
+    }
+
+    /// The page carries microdata: some element had `itemscope` or `itemtype`.
+    pub fn microdata(&self) -> bool {
+        self.microdata
+    }
+
+    /// The page carries RDFa: some element had `typeof` or `vocab`.
+    pub fn rdfa(&self) -> bool {
+        self.rdfa
     }
 
     /// What a node is.
