@@ -149,7 +149,7 @@ pub type Result<T> = std::result::Result<T, StateError>;
 
 /// The state layer.
 ///
-/// Eleven methods, all batched, all taking time as an argument. Implement it
+/// Fourteen methods, all batched, all taking time as an argument. Implement it
 /// and then run [`conformance::check`] against it: the suite is the definition
 /// of what these doc comments mean, and a backend that has not been through it
 /// has not implemented this trait, it has implemented something that compiles.
@@ -257,9 +257,9 @@ pub trait State: Send + Sync + 'static {
 
     /// Read one host record.
     ///
-    /// The only unbatched read in the trait, and it is here because the host
-    /// table is about 50 million rows fleet wide and fits in memory even on
-    /// server1, so a backend can serve this without touching disk. Returns
+    /// One of two unbatched reads in the trait, and it is here because the
+    /// host table is about 50 million rows fleet wide and fits in memory even
+    /// on server1, so a backend can serve this without touching disk. Returns
     /// `None` for a host we have never fetched.
     ///
     /// # Errors
@@ -307,6 +307,10 @@ pub trait State: Send + Sync + 'static {
     async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()>;
 
     /// Read one segment record.
+    ///
+    /// The other unbatched read, and it is here for the same reason: doc 08.3
+    /// sizes a year of segment history at well under 100 MB, so a lookup is
+    /// never the thing that costs anything.
     ///
     /// Returns `None` for a ULID this store has never sealed, which is not an
     /// error: it is the answer doc 12.8 acts on when it finds a file on the
