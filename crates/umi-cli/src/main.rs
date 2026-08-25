@@ -13,7 +13,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use umi_cli::{Error, config, crawl, doctor, get, inspect};
+use umi_cli::{Error, config, crawl, doctor, get, inspect, verify};
 use umi_types::{CANON_VERSION, Exit};
 
 /// An internet scale web crawler that publishes what it finds.
@@ -141,8 +141,12 @@ enum Command {
     },
     /// Re verify manifests, signatures and digests.
     Verify {
-        /// A crawl directory or a published repository.
+        /// A published repository, with or without the organisation on it.
         target: String,
+        /// Download every file and digest it here, rather than comparing
+        /// against the digest the hub reports.
+        #[arg(long)]
+        full: bool,
     },
     /// Print or validate a manifest chain.
     Manifest {
@@ -390,6 +394,14 @@ fn run(command: &Command) -> Result<(), Error> {
             let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
             finish(crawl::resume(std::path::Path::new(dir), false, publishing))
         }
+        Command::Verify { target, full } => {
+            let config = load(command)?;
+            let token = match &config.token {
+                Some(secret) => Some(secret.value.read()?),
+                None => None,
+            };
+            verify::run(target, token, *full, &config.org.value)
+        }
         Command::Watch { dir, publish } => {
             let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
             finish(crawl::resume(std::path::Path::new(dir), true, publishing))
@@ -519,8 +531,8 @@ fn not_built(command: &Command) -> Error {
         Command::Crawl(_) | Command::Resume { .. } | Command::Seed { .. } => {
             "the crawl loop is milestone 1 and lands next"
         }
-        Command::Publish { .. } | Command::Verify { .. } | Command::Manifest { .. } => {
-            "publishing needs the Hugging Face client, milestone 1"
+        Command::Publish { .. } | Command::Manifest { .. } => {
+            "publishing runs inside umi crawl --publish, and the standalone form is milestone 2"
         }
         Command::Watch { .. } | Command::Block { .. } | Command::Scope { .. } => {
             "milestone 2 builds this"

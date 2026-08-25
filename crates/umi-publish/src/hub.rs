@@ -51,6 +51,12 @@
 //! and the one place a URL could carry a credential is the presigned upload
 //! target, whose query string is a signature. So errors from that request drop
 //! the URL rather than formatting it.
+//!
+//! An empty token means no header at all rather than an empty one, because
+//! everything this project publishes is public and doc 16's gate 1.5 asks for
+//! a stranger on a clean machine to be able to check it. A stranger has no
+//! token, and `Authorization: Bearer ` is not the same request as no
+//! `Authorization` header.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -905,10 +911,11 @@ impl Hub {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let sent = build()
-                .header(reqwest::header::AUTHORIZATION, self.bearer())
-                .send()
-                .await;
+            let request = match self.token.is_empty() {
+                true => build(),
+                false => build().header(reqwest::header::AUTHORIZATION, self.bearer()),
+            };
+            let sent = request.send().await;
             let failure = match sent {
                 Ok(response) => {
                     let status = response.status().as_u16();

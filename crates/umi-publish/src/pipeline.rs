@@ -153,6 +153,21 @@ impl Publisher {
         &self.hub
     }
 
+    /// Put this publisher's key in doc 12.5's directory if it is not there.
+    ///
+    /// Returns whether this call added it, which is true once per key and
+    /// false every time after. Worth calling before the first manifest rather
+    /// than after the last one: a manifest signed by a key that is not
+    /// published is a manifest nobody outside this machine can check, and doc
+    /// 16's gate 1.5 is the test that says so.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the hub says. See [`crate::directory::publish_key`].
+    pub async fn announce(&self, meta_repo: &str, now_ms: u64) -> Result<bool> {
+        crate::directory::publish_key(&self.hub, meta_repo, &self.key.verifying(), now_ms).await
+    }
+
     /// Publish every segment the state ledger has no remote copy for.
     ///
     /// Oldest first, which is [`SegmentQuery::Unpublished`]'s order and also

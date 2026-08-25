@@ -624,6 +624,18 @@ fn run(
         // the last one, because the reason it matters is disk, and disk is
         // what the crawl about to start is going to want.
         if let Some(publisher) = &publisher {
+            // Doc 12.5's key directory, before anything is signed with it. A
+            // manifest signed by a key that is not published is a manifest
+            // nobody outside this machine can check, which is the thing doc
+            // 16's gate 1.5 exists to prevent, and finding that out at the end
+            // of the crawl would be finding it out too late.
+            let added = publisher
+                .announce(&meta_repo(&options.publish), clock.now_ms())
+                .await?;
+            if added {
+                log.line("the publishing key was added to the key directory")?;
+            }
+
             let collected = publisher.collect(&*state, clock.now_ms()).await?;
             if collected > 0 {
                 log.line(&format!("{collected} segments left behind were collected"))?;
@@ -731,6 +743,18 @@ fn run(
         ))?;
     }
     Ok(summary)
+}
+
+/// Doc 12.4's registry, under whichever organisation is publishing.
+///
+/// Takes the option rather than the [`Publishing`] because the caller holds
+/// one and the answer for `None` never gets used: without `--publish` there is
+/// no publisher to announce a key to.
+fn meta_repo(publishing: &Option<Publishing>) -> String {
+    let org = publishing
+        .as_ref()
+        .map_or(umi_publish::repo::ORG, |p| p.org.as_str());
+    format!("{org}/umi-meta")
 }
 
 /// Assemble doc 12.2's pipeline for this crawl directory.

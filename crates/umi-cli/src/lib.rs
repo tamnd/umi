@@ -16,6 +16,7 @@ pub mod doctor;
 mod error;
 pub mod get;
 pub mod inspect;
+pub mod verify;
 
 #[cfg(test)]
 mod tests;

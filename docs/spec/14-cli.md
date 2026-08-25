@@ -180,6 +180,21 @@ umi sql "select status, count(*) from pages group by 1" --data ./rust-docs
 
 `umi sql` is DuckDB, either embedded through doc 08's `umi-state-duck` or shelled out to a `duckdb` binary on the path, the same fallback ccrawl-cli uses. It attaches local Parquet as `pages`, `receipts` and `links`, and it can attach a published repository over HTTP so that a question about the corpus does not require downloading the corpus. This is the command that makes doc 15's dashboard mostly unnecessary.
 
+### `umi verify`
+
+```
+umi verify open-index/umi-focus-blog.rust-lang.org
+umi verify umi-focus-blog.rust-lang.org --full
+```
+
+`umi verify` checks a published repository from the outside. It needs a network and a repository name and nothing else: no crawl directory, no state store, no token unless the repository is private, and no file left over from the machine that did the crawl. That is the whole point of it. Verification that only works where the crawl ran is verification of the local disk, and doc 16's gate 1.5 is the test that says so out loud, so this command is written as though it had never seen the crawl. A name with no slash in it gets the configured organisation in front of it, and a name that was spelled out in full is used exactly as typed.
+
+It reads every day manifest in the repository, checks that each one parses and is in canonical form, checks the detached signature against the publishing keys published in `umi-meta`, checks that each day's `prev` is the digest of the day before it, and then checks that every file the manifest names is on the hub at the size and the sha256 the manifest gives. A day with no signature is a failure and not a skip.
+
+The file check is free by default and that is worth explaining. Hugging Face stores a large file through lfs, and lfs names an object by the sha256 of its content, so the digest in the listing is a digest of the bytes rather than of a git blob header, and comparing it to the manifest checks the whole file without downloading a byte of it. It is a real check that trusts the hub to have computed the digest honestly. `--full` downloads each file and digests it locally, which trusts nothing and costs the bandwidth. The default is the cheap one because a verifier that downloaded a week of the corpus every time is a verifier nobody runs, and the output says which of the two ran so that nobody has to guess.
+
+Everything that fails to check out is exit 6, which doc 14.9 never retries automatically. A repository that does not verify does not start verifying because you asked twice.
+
 ## 14.7 Configuration
 
 Precedence, highest first: command line flags, `UMI_*` environment variables, `./umi.toml` in the working directory, `~/.config/umi/config.toml`, built in defaults.
