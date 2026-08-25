@@ -12,19 +12,22 @@
 //! admit          12500 candidates a second         part 1
 //! lease          1000 urls a call, index walk      part 2
 //! complete       one call per tick, batched        part 3
-//! stats          several table scans, off the hot  part 4
-//!                path, and the crawl loop's idle
+//! stats          maintained counters, one row      part 4
+//!                read, and the crawl loop's idle
 //!                branch calls it
 //! put_segment    durable, about 1000 a day         part 5
 //! segments       partial index, not a table scan   part 5
 //! ```
 //!
-//! Part 4 is the one worth explaining. `stats` is a handful of `COUNT(*)`
-//! queries over the ledger, and the crawl loop calls it on every idle tick and
-//! every five seconds for doc 14.3's progress line. That is deliberate and it
-//! is also the kind of decision that is only defensible with a number next to
-//! it, because if `stats` costs 200 ms at ten million urls then the progress
-//! line is quietly eating a core.
+//! Part 4 is the one worth explaining. The crawl loop calls `stats` on every
+//! idle tick, to tell pending urls waiting their turn apart from an empty
+//! frontier, and doc 14.3's progress line calls it every five seconds. Both
+//! are correct calls to make, so the cost has to stay flat as the ledger
+//! grows. It used to be five `COUNT(*)` queries, which was 97 ms over 200000
+//! urls on server3 and would have been 78 seconds at a hundred million, and
+//! that is what schema version 3's counters replaced. The number this part
+//! prints is now a single row read and the reason to keep printing it is to
+//! notice the day it stops being one.
 //!
 //! Part 5 is doc 12.7's fourth GC condition. The interesting number is not the
 //! rate, since a coordinator seals about a thousand segments a day and could
@@ -244,7 +247,7 @@ async fn completing(state: &SqliteState, repeat: usize) {
 
 /// Part 4. What doc 14.3's progress line and the crawl loop's idle branch pay.
 async fn counting(state: &SqliteState, urls: usize, repeat: usize) {
-    println!("part 4: stats, several table scans over {urls} urls");
+    println!("part 4: stats, the maintained counters over {urls} urls");
 
     let mut best = f64::MAX;
     for _ in 0..repeat {

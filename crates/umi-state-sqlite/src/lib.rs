@@ -266,6 +266,44 @@ impl SqliteState {
         self.config.path.as_deref()
     }
 
+    /// Recompute the counters behind [`State::stats`] by scanning, and say
+    /// where they disagree with what the store is carrying.
+    ///
+    /// `stats` reads a maintained row, which is what makes it free and what
+    /// makes it worth checking. The triggers that maintain it are inside every
+    /// writing transaction, so the counts and the rows are committed together
+    /// and a crash cannot separate them. What can separate them is somebody
+    /// editing the file with the `sqlite3` shell, restoring half a backup, or a
+    /// bug in a trigger, and none of those announce themselves. So there is a
+    /// scan available on demand, and it is the same scan the migration used to
+    /// fill the row in.
+    ///
+    /// The returned list is empty when everything agrees. Each entry is the
+    /// name of a counter, what the row says and what the scan says, in that
+    /// order, because a number that is wrong is only useful next to the number
+    /// it should have been.
+    ///
+    /// # Errors
+    ///
+    /// Whatever reading the store reports.
+    pub fn recount(&self) -> Result<Vec<(&'static str, u64, u64)>> {
+        /// The names, in the column order both queries share.
+        const NAMES: [&str; 9] = [
+            "seen", "pending", "fetched", "failed", "gone", "excluded", "held", "hosts", "leases",
+        ];
+
+        let guard = self.lock();
+        let held = counters(&guard.conn, sql::SELECT_COUNTS)?;
+        let scanned = counters(&guard.conn, sql::RECOUNT)?;
+        Ok(NAMES
+            .iter()
+            .zip(held)
+            .zip(scanned)
+            .filter(|((_, held), scanned)| held != scanned)
+            .map(|((name, held), scanned)| (*name, held, scanned))
+            .collect())
+    }
+
     fn lock(&self) -> MutexGuard<'_, Inner> {
         // Recovering the guard rather than propagating the poison keeps one
         // panicking caller from turning every later call into a different
@@ -309,6 +347,15 @@ fn configure(conn: &Connection, config: &SqliteConfig) -> Result<()> {
         }
     }
 
+    // `recursive_triggers` is on for one specific reason and it is not
+    // recursion. `put_host` and `put_segment` are `INSERT OR REPLACE`, and
+    // SQLite only fires the delete trigger for the row REPLACE removes when
+    // this is on. With it off, an upsert over an existing host fires the
+    // insert trigger and nothing else, and schema version 3's host counter
+    // climbs by one every time a host record is written. Nothing here is
+    // recursive: the triggers all write to `counts`, and `counts` has no
+    // triggers on it, so there is nothing for them to set off.
+    //
     // Negative expresses KiB, which is the only way to size the cache in bytes
     // rather than in pages.
     let cache_kib = -i64::try_from(config.cache_bytes / 1024).unwrap_or(i64::MAX);
@@ -317,7 +364,8 @@ fn configure(conn: &Connection, config: &SqliteConfig) -> Result<()> {
          PRAGMA mmap_size = {};
          PRAGMA wal_autocheckpoint = {};
          PRAGMA temp_store = MEMORY;
-         PRAGMA foreign_keys = OFF;",
+         PRAGMA foreign_keys = OFF;
+         PRAGMA recursive_triggers = ON;",
         config.mmap_bytes, config.wal_autocheckpoint_pages
     ))
     .state()?;
@@ -1144,41 +1192,34 @@ fn intern_etag(tx: &rusqlite::Transaction<'_>, etag: &str) -> Result<u32> {
 }
 
 fn stats(conn: &Connection, config: &SqliteConfig) -> Result<StateStats> {
-    let one = |sql: &str| -> Result<u64> {
-        let value: i64 = conn.query_row(sql, [], |row| row.get(0)).state()?;
-        Ok(u64::try_from(value).unwrap_or(0))
-    };
-
-    let mut by_state = [0u64; 5];
-    {
-        let mut stmt = conn.prepare_cached(sql::COUNT_BY_STATE).state()?;
-        let mut rows = stmt.query([]).state()?;
-        while let Some(row) = rows.next().state()? {
-            let state: i64 = row.get(0).state()?;
-            let count: i64 = row.get(1).state()?;
-            if let Ok(index) = usize::try_from(state)
-                && index < by_state.len()
-            {
-                by_state[index] = u64::try_from(count).unwrap_or(0);
-            }
-        }
-    }
-
+    let counts = counters(conn, sql::SELECT_COUNTS)?;
     Ok(StateStats {
-        urls_seen: one("SELECT COUNT(*) FROM seen")?,
-        urls_pending: by_state[UrlState::Pending as usize],
-        urls_fetched: by_state[UrlState::Fetched as usize],
-        urls_failed: by_state[UrlState::Failed as usize],
-        urls_gone: by_state[UrlState::Gone as usize],
-        urls_excluded: by_state[UrlState::Excluded as usize],
-        urls_held: one("SELECT COUNT(*) FROM pen")?,
-        hosts: one("SELECT COUNT(*) FROM hosts")?,
-        leases_in_flight: one("SELECT COUNT(*) FROM ledger WHERE lease_id IS NOT NULL")?,
+        urls_seen: counts[0],
+        urls_pending: counts[1],
+        urls_fetched: counts[2],
+        urls_failed: counts[3],
+        urls_gone: counts[4],
+        urls_excluded: counts[5],
+        urls_held: counts[6],
+        hosts: counts[7],
+        leases_in_flight: counts[8],
         // Nothing is resident because nothing is shardable. See `warm`.
         resident_plds: 0,
         shard_misses: 0,
         bytes_on_disk: bytes_on_disk(conn, config)?,
     })
+}
+
+/// The nine numbers, in the one order both queries produce them in.
+fn counters(conn: &Connection, query: &str) -> Result<[u64; 9]> {
+    conn.query_row(query, [], |row| {
+        let mut counts = [0u64; 9];
+        for (index, count) in counts.iter_mut().enumerate() {
+            *count = u64::try_from(row.get::<_, i64>(index)?).unwrap_or(0);
+        }
+        Ok(counts)
+    })
+    .state()
 }
 
 fn bytes_on_disk(conn: &Connection, config: &SqliteConfig) -> Result<u64> {

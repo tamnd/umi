@@ -595,3 +595,138 @@ async fn etags_are_interned_once_however_often_they_repeat() {
         .expect("the pool");
     assert_eq!(pooled, 1, "the same etag was interned {pooled} times");
 }
+
+#[tokio::test]
+async fn the_counters_survive_everything_that_writes() {
+    // `stats` reads a maintained row instead of scanning, which is only worth
+    // doing if the row is right. So this drives every write path the backend
+    // has, in an order that makes rows move between states rather than only
+    // arrive, and then recomputes by scanning and compares.
+    let (_dir, state) = on_disk();
+
+    for n in 0..40 {
+        admit_one(&state, &format!("https://example.com/{n}")).await;
+    }
+    // Admitting the same urls again is the already seen path, which must not
+    // count anything twice.
+    for n in 0..40 {
+        admit_one(&state, &format!("https://example.com/{n}")).await;
+    }
+
+    // A blocked host, so rows land as excluded rather than pending.
+    let mut candidate = Candidate::new("https://blocked.example/one", T0).expect("a crawlable url");
+    candidate.discovery = Discovery::Unverified(FetcherId::from_bytes([9u8; 32]));
+    state.admit(&[candidate]).await.expect("admit held");
+
+    // A host record, twice, because `put_host` is an upsert and the second
+    // call must not add a second host.
+    let key = RowKey::for_url("https://example.com/one", None).expect("a crawlable url");
+    let host = HostRow::new(key.host, key.pld);
+    state
+        .put_host(std::slice::from_ref(&host))
+        .await
+        .expect("put_host");
+    state.put_host(&[host]).await.expect("put_host again");
+
+    // Lease some, complete them four different ways, and release the rest so
+    // the lease counter goes both up and down.
+    let leases = state
+        .lease(&LeaseRequest::new(fetcher(), T0, 20))
+        .await
+        .expect("lease");
+    assert!(leases.len() >= 8, "not enough work to move the counters");
+
+    let mut outcomes = Vec::new();
+    let mut released = Vec::new();
+    for (n, lease) in leases.into_iter().enumerate() {
+        let result = match n % 5 {
+            0 => FetchResult::Fetched {
+                status: 200,
+                content_hash: [1u8; 8],
+                revalidate: Revalidator::default(),
+            },
+            1 => FetchResult::Failed {
+                status: Some(503),
+                kind: umi_state::FailureKind::ServerError,
+            },
+            2 => FetchResult::Gone { status: 410 },
+            3 => FetchResult::Excluded {
+                reason: umi_state::ExcludeReason::Robots,
+            },
+            _ => {
+                released.push(lease.id);
+                continue;
+            }
+        };
+        outcomes.push(FetchOutcome {
+            lease: lease.id,
+            key: lease.key,
+            finished_ms: T0 + 1000,
+            tier_used: Tier::Plain,
+            result,
+        });
+    }
+    state.complete(&outcomes).await.expect("complete");
+    state
+        .release(&released, umi_state::NackReason::Expired)
+        .await
+        .expect("release");
+
+    // A second lease and completion over rows that are already fetched or
+    // failed, which is the update trigger's other case: a state change out of
+    // something other than pending.
+    let again = state
+        .lease(&LeaseRequest::new(fetcher(), T0 + 600_000, 5))
+        .await
+        .expect("lease again");
+    let outcomes: Vec<FetchOutcome> = again
+        .into_iter()
+        .map(|lease| FetchOutcome {
+            lease: lease.id,
+            key: lease.key,
+            finished_ms: T0 + 700_000,
+            tier_used: Tier::Plain,
+            result: FetchResult::Fetched {
+                status: 200,
+                content_hash: [2u8; 8],
+                revalidate: Revalidator::default(),
+            },
+        })
+        .collect();
+    state.complete(&outcomes).await.expect("complete again");
+
+    let disagreements = state.recount().expect("recount");
+    assert!(
+        disagreements.is_empty(),
+        "the counters drifted from the rows: {disagreements:?}"
+    );
+
+    // And the numbers reaching the caller are the counted ones, not zero,
+    // which is what an empty comparison would also allow.
+    let stats = state.stats().await.expect("stats");
+    assert_eq!(stats.urls_seen, 41);
+    assert_eq!(stats.urls_held, 1);
+    assert_eq!(stats.hosts, 1);
+    assert_eq!(stats.leases_in_flight, 0);
+    assert!(stats.urls_fetched > 0 && stats.urls_gone > 0 && stats.urls_excluded > 0);
+}
+
+#[tokio::test]
+async fn a_hand_edited_file_is_caught_by_the_recount() {
+    // The counters cannot drift through this crate's own writes, because the
+    // triggers are inside the same transaction as the rows. They can drift if
+    // somebody opens the file with the sqlite3 shell, so there has to be a way
+    // to find out, and this is the test that the way works.
+    let (_dir, state) = on_disk();
+    admit_one(&state, "https://example.com/one").await;
+    assert!(state.recount().expect("recount").is_empty());
+
+    state
+        .lock()
+        .conn
+        .execute_batch("UPDATE counts SET pending = pending + 7")
+        .expect("a hand edit");
+
+    let disagreements = state.recount().expect("recount");
+    assert_eq!(disagreements, vec![("pending", 8, 1)]);
+}
