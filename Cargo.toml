@@ -29,6 +29,7 @@ umi-frontier = { path = "crates/umi-frontier", version = "0.0.1" }
 umi-state-sqlite = { path = "crates/umi-state-sqlite", version = "0.0.1" }
 umi-publish = { path = "crates/umi-publish", version = "0.0.1" }
 umi-seed = { path = "crates/umi-seed", version = "0.0.1" }
+umi-dedup = { path = "crates/umi-dedup", version = "0.0.1" }
 
 anyhow = "1"
 # The state trait is used through `Box<dyn State>`, because the backend is
@@ -40,6 +41,12 @@ async-trait = "0.1"
 # chunk trees, block checksums and manifest digests are all blake3, so
 # there is one hash in the tree rather than four.
 blake3 = "1"
+# Doc 11.8 names xxh3 for the shingle hash, and it is the right call: the
+# sketch hashes tens of thousands of five word strings per page and blake3 at
+# that size is dominated by its own setup. This is not a security boundary,
+# because a fetcher that wants to lie about a page lies about the text and the
+# sketch follows honestly.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 thiserror = "2"
 

@@ -12,4 +12,10 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[[bench]]
+name = "sketch"
+harness = false
+
 [dependencies]
+blake3.workspace = true
+xxhash-rust.workspace = true
