@@ -207,6 +207,6 @@ mod tests {
         // 'Z' is 31, which needs 5 bits, and the first character has room for
         // 2. Every ULID we mint starts at '0' through '7'.
         assert_eq!(Ulid::parse("Z0000000000000000000000000"), None);
-        assert_eq!(Ulid::parse("70000000000000000000000000").is_some(), true);
+        assert!(Ulid::parse("70000000000000000000000000").is_some());
     }
 }

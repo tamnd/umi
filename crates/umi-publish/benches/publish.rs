@@ -133,7 +133,10 @@ fn digests(parquet: &Path, repeat: usize) {
     use sha2::Digest as _;
 
     println!("part 2: the two digests, doc 12.2 step 3 budgets 2 s a segment");
-    println!("  {:<12} {:>12} {:>14} {:>16}", "hash", "ms", "MB/s", "s per 128 MB");
+    println!(
+        "  {:<12} {:>12} {:>14} {:>16}",
+        "hash", "ms", "MB/s", "s per 128 MB"
+    );
 
     let bytes = std::fs::read(parquet).expect("read");
     let cases: [(&str, fn(&[u8])); 2] = [
