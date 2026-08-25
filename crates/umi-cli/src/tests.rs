@@ -224,6 +224,38 @@ fn the_token_comes_out_of_the_layers_as_a_secret() {
 }
 
 #[test]
+fn a_token_in_the_environment_is_not_a_literal_in_a_config_file() {
+    // Doc 14.7 names UMI_TOKEN as a place a token comes from and warns about
+    // literals in config files. Warning about the first because it looks like
+    // the second tells somebody who did the right thing to do the right thing.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths(dir.path());
+    let config = Config::load(
+        &paths,
+        &env(&[("UMI_TOKEN", "hf_realtoken")]),
+        &Flags::default(),
+    )
+    .unwrap();
+    let token = config.token.unwrap();
+    assert_eq!(token.value, Secret::Env("UMI_TOKEN".to_owned()));
+    assert!(token.value.warning().is_none());
+    assert_eq!(token.origin, Origin::Env("UMI_TOKEN".to_owned()));
+
+    // And the indirection still works when it is spelled out, so that a
+    // variable can point at another one.
+    let config = Config::load(
+        &paths,
+        &env(&[("UMI_TOKEN", "env:HF_TOKEN")]),
+        &Flags::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        config.token.unwrap().value,
+        Secret::Env("HF_TOKEN".to_owned())
+    );
+}
+
+#[test]
 fn every_error_has_the_exit_code_doc_14_9_gives_it() {
     let cases: [(Error, Exit); 13] = [
         (Error::NoColumn("body".to_owned()), Exit::Usage),

@@ -84,6 +84,24 @@ impl Secret {
         }
     }
 
+    /// Parse a secret that came from somewhere, which decides what a bare
+    /// string means.
+    ///
+    /// In a config file a bare string is the case doc 14.7 warns about. In
+    /// `UMI_TOKEN` it is not: an environment variable is one of the two
+    /// indirections the warning exists to recommend, and telling somebody who
+    /// exported the variable the spec names to please use an environment
+    /// variable instead is advice they have already taken. So a bare value out
+    /// of the environment becomes a read of that same variable, which also
+    /// keeps the secret out of memory until it is used.
+    #[must_use]
+    pub fn from_origin(raw: &str, origin: &Origin) -> Self {
+        match (Self::parse(raw), origin) {
+            (Self::Literal(_), Origin::Env(name)) => Self::Env(name.clone()),
+            (parsed, _) => parsed,
+        }
+    }
+
     /// Read the secret. Errors carry the indirection that failed rather than
     /// the secret, which is the whole reason this is a type and not a String.
     ///
@@ -323,10 +341,20 @@ impl Config {
             org: layers.text(None, "UMI_ORG", |f| f.publish.org.clone(), "open-index")?,
             token: layers
                 .optional_text("UMI_TOKEN", |f| f.publish.token.clone())
-                .map(|found| Sourced::new(Secret::parse(&found.value), found.origin)),
+                .map(|found| {
+                    Sourced::new(
+                        Secret::from_origin(&found.value, &found.origin),
+                        found.origin,
+                    )
+                }),
             key: layers
                 .optional_text("UMI_PUBLISH_KEY", |f| f.publish.key.clone())
-                .map(|found| Sourced::new(Secret::parse(&found.value), found.origin)),
+                .map(|found| {
+                    Sourced::new(
+                        Secret::from_origin(&found.value, &found.origin),
+                        found.origin,
+                    )
+                }),
             coordinator: layers.text(
                 flags.coordinator.clone(),
                 "UMI_COORDINATOR",
