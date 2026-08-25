@@ -7,11 +7,12 @@
 //! It is in memory and not in the state layer because of what the numbers say.
 //! At 250 pages a second a server touches a few thousand distinct hosts an
 //! hour, and a robots.txt is a couple of kilobytes, so the whole working set is
-//! tens of megabytes. The state layer keeps a [`RobotsRef`] per host anyway,
-//! which is the digest and the expiry rather than the rules, so a coordinator
-//! that restarts knows what it had and refetches the ones that matter. Parsing
-//! rules on the way out of SQLite on every single fetch would put a database
-//! round trip inside the hot loop for an answer that does not change for a day.
+//! tens of megabytes. The state layer keeps a [`umi_state::RobotsRef`] per host
+//! anyway, which is the digest and the expiry rather than the rules, so a
+//! coordinator that restarts knows what it had and refetches the ones that
+//! matter. Parsing rules on the way out of SQLite on every single fetch would
+//! put a database round trip inside the hot loop for an answer that does not
+//! change for a day.
 //!
 //! One fetch per host at a time. Two hundred URLs on one host arriving together
 //! is the normal case, not the rare one, and a cache that let all two hundred
