@@ -45,6 +45,7 @@ use crate::clock::Clock;
 use crate::fetch::Fetch;
 use crate::page::{Crawled, PageRow};
 use crate::robots::RobotsCache;
+use crate::scope::{LinkPolicy, Scope};
 
 /// Where finished rows go.
 ///
@@ -98,9 +99,29 @@ pub struct CrawlConfig {
     /// How long a lease is good for.
     pub lease_for: Duration,
     /// Doc 11's depth ceiling for links found on a page.
+    ///
+    /// The hard ceiling, which a scope can lower and cannot raise.
     pub max_depth: u8,
-    /// The `crawl_profile` stamped on every row.
-    pub crawl_profile: u32,
+    /// Doc 13's scope: what this crawl is allowed to fetch, and what its rows
+    /// are stamped with.
+    ///
+    /// The default is [`Scope::general`], which is id 0 and admits everything,
+    /// so the general crawl and a focused one run the same code.
+    pub scope: Arc<Scope>,
+}
+
+impl CrawlConfig {
+    /// How deep links from a page at `depth` may go.
+    ///
+    /// The lower of the process ceiling and the scope's, because a profile
+    /// asking for depth 200 on a crawler built for 16 should get 16 rather
+    /// than an error at the point where the frontier runs out of room.
+    #[must_use]
+    pub fn depth_limit(&self) -> u8 {
+        self.scope
+            .max_depth
+            .map_or(self.max_depth, |d| d.min(self.max_depth))
+    }
 }
 
 impl Default for CrawlConfig {
@@ -119,7 +140,7 @@ impl Default for CrawlConfig {
             max_tier: Tier::Plain,
             lease_for: Duration::from_secs(60),
             max_depth: umi_frontier::MAX_DEPTH,
-            crawl_profile: 0,
+            scope: Arc::new(Scope::general()),
         }
     }
 }
@@ -261,6 +282,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 row,
                 outcome,
                 links,
+                links_seen,
                 disallowed,
             } = done;
 
@@ -273,7 +295,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                     umi_types::OutcomeCode::NotModified => report.not_modified += 1,
                     _ => report.failed += 1,
                 }
-                report.links_seen += links.len();
+                report.links_seen += links_seen;
                 candidates.extend(links);
                 rows.push(row);
             }
@@ -324,6 +346,23 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         };
 
         let fetched_at_ms = now();
+
+        // Doc 13.2's content filter, first half. This is the first moment the
+        // type and the size exist, and a page rejected here is never extracted.
+        // A crawl scoped to English HTML still has to spend the fetch to find
+        // out that a page is a German PDF, so what this saves is the extraction
+        // and the row rather than the request. The completion still goes back,
+        // so the URL is not handed out again.
+        let filter = &self.config.scope.content;
+        if let Outcome::Ok(page) = &outcome
+            && !filter.accepts_response(
+                page.content_type.as_deref(),
+                u32::try_from(page.body.len()).unwrap_or(u32::MAX),
+            )
+        {
+            return Fetched::excluded(&lease, fetched_at_ms, umi_state::ExcludeReason::ContentType);
+        }
+
         let host = host_of(&lease.url).unwrap_or_default();
         let extracted = match &outcome {
             Outcome::Ok(page) if page.media == umi_fetch::Media::Html => {
@@ -333,6 +372,15 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             }
             _ => None,
         };
+
+        // The second half, which needed the parse. A page filtered out by
+        // language keeps no row and no links, the same as one filtered out by
+        // type, because the crawl asked not to have it.
+        if let Some(e) = extracted.as_ref()
+            && !filter.accepts_lang(e.meta.declared_lang.as_deref())
+        {
+            return Fetched::excluded(&lease, fetched_at_ms, umi_state::ExcludeReason::ContentType);
+        }
 
         let row = PageRow::build(&Crawled {
             url: &lease.url,
@@ -347,26 +395,37 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             content_usage: entry.robots.content_usage().first().map(String::as_str),
             fetcher_id: self.config.fetcher,
             verification: Verification::Local,
-            crawl_profile: self.config.crawl_profile,
+            crawl_profile: self.config.scope.id,
         });
 
         // Doc 11.4: a page that says nofollow keeps its own row and gives up
         // its links. Depth is the page's plus one, and the ceiling is applied
         // here rather than at admit time so that a page at the limit does not
         // cost a batch of candidates that all get rejected.
-        let links = extracted
+        let limit = self.config.depth_limit();
+        let followable: Vec<&str> = extracted
             .as_ref()
             .filter(|e| !e.robots.nofollow)
-            .filter(|_| lease.depth < self.config.max_depth)
+            .filter(|_| lease.depth < limit)
             .map(|e| {
                 e.links
                     .links
                     .iter()
                     .filter(|l| !l.rel.has(umi_extract::Rel::NOFOLLOW))
-                    .map(|l| (l.url.clone(), lease.depth.saturating_add(1)))
+                    .map(|l| l.url.as_str())
                     .collect()
             })
             .unwrap_or_default();
+
+        // Counted before the scope runs, so a report can say how many links a
+        // page offered as well as how many went in. Without the split the two
+        // numbers are the same number and a focused crawl looks like it is
+        // reading pages with no links on them.
+        let links_seen = followable.len();
+        let links = followable
+            .into_iter()
+            .filter_map(|url| self.follow(url, lease.depth, limit))
+            .collect();
 
         let outcome = FetchOutcome {
             lease: lease.id,
@@ -379,7 +438,37 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             row: Some(row),
             outcome,
             links,
+            links_seen,
             disallowed: false,
+        }
+    }
+
+    /// Doc 13.2's link policy: whether to enqueue one link, and at what depth.
+    ///
+    /// `None` drops it. The link is still in doc 10.5's `links` column either
+    /// way, because that column is what the page said and a scope does not
+    /// change that.
+    ///
+    /// The general crawl never parses anything here. An empty include list with
+    /// an empty exclude list admits every URL, and at 140 links a page and 250
+    /// pages a second that is 35000 parses a second bought for nothing.
+    fn follow(&self, url: &str, depth: u8, limit: u8) -> Option<(String, u8)> {
+        let next = depth.saturating_add(1);
+        let scope = &self.config.scope;
+        if !scope.filters_links() {
+            return Some((url.to_owned(), next));
+        }
+        if scope.allows(url) {
+            return Some((url.to_owned(), next));
+        }
+        match scope.link_policy {
+            LinkPolicy::InScopeOnly | LinkPolicy::RecordOutOfScope => None,
+            // Admitted at the ceiling, so the depth check above drops whatever
+            // it links to. One hop is expressed in the depth the frontier
+            // already carries rather than in a second field that every backend
+            // would then have to store and every query would have to know
+            // about.
+            LinkPolicy::OneHop => Some((url.to_owned(), limit)),
         }
     }
 
@@ -418,6 +507,7 @@ struct Fetched {
     row: Option<PageRow>,
     outcome: FetchOutcome,
     links: Vec<(String, u8)>,
+    links_seen: usize,
     disallowed: bool,
 }
 
@@ -458,6 +548,7 @@ impl Fetched {
                 result,
             },
             links: Vec::new(),
+            links_seen: 0,
             disallowed: false,
         }
     }

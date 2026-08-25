@@ -22,6 +22,7 @@ use crate::clock::FixedClock;
 use crate::fetch::Fetch;
 use crate::page::PageRow;
 use crate::run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
+use crate::scope::Scope;
 
 const T0: u64 = 1_760_000_000_000;
 
@@ -142,7 +143,7 @@ fn config() -> CrawlConfig {
         max_tier: Tier::Plain,
         lease_for: Duration::from_secs(60),
         max_depth: 4,
-        crawl_profile: 0,
+        scope: Arc::new(Scope::general()),
     }
 }
 
@@ -162,11 +163,23 @@ async fn seeded(urls: &[&str]) -> Arc<dyn State> {
 }
 
 fn crawler(fetch: Canned, state: Arc<dyn State>) -> Crawler<Arc<Canned>, Arc<FixedClock>> {
+    with_scope(fetch, state, Scope::general())
+}
+
+/// The same crawler under a doc 13 scope.
+fn with_scope(
+    fetch: Canned,
+    state: Arc<dyn State>,
+    scope: Scope,
+) -> Crawler<Arc<Canned>, Arc<FixedClock>> {
     Crawler::new(
         Arc::new(fetch),
         state,
         Arc::new(FixedClock::at(T0)),
-        config(),
+        CrawlConfig {
+            scope: Arc::new(scope),
+            ..config()
+        },
     )
 }
 
@@ -576,4 +589,178 @@ async fn the_robots_cache_expires_after_a_day() {
         .filter(|u| u.ends_with("/robots.txt"))
         .count();
     assert_eq!(after_second, 2, "an expired robots.txt was reused");
+}
+
+#[tokio::test]
+async fn a_scope_keeps_the_crawl_on_its_own_site() {
+    let state = seeded(&["https://example.com/a"]).await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .robots("https://elsewhere.test", "User-agent: *\nAllow: /\n")
+        .html(
+            "https://example.com/a",
+            &page("A", &["/b", "https://elsewhere.test/x"]),
+        )
+        .html("https://example.com/b", &page("B", &[]))
+        .html("https://elsewhere.test/x", &page("X", &[]));
+
+    let scope = Scope::for_target("example.com").expect("target");
+    let crawler = with_scope(fetch, Arc::clone(&state), scope);
+    let clock = Arc::clone(crawler.clock());
+    let sink = Collected::default();
+    let report = drain(&crawler, &clock, &sink).await;
+
+    // Both links were seen, because the row records what the page said. One
+    // was admitted, because only one is in scope.
+    assert_eq!(report.links_seen, 2);
+    assert_eq!(report.links_admitted, 1);
+    assert_eq!(report.rows, 2);
+    assert!(
+        !crawler.fetcher().asked_for("https://elsewhere.test/x"),
+        "the out of scope page was never fetched"
+    );
+    assert!(
+        !crawler
+            .fetcher()
+            .asked_for("https://elsewhere.test/robots.txt"),
+        "and neither was its robots.txt, which is a request we did not have to make"
+    );
+}
+
+#[tokio::test]
+async fn one_hop_fetches_the_page_it_cites_and_stops_there() {
+    let state = seeded(&["https://example.com/a"]).await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .robots("https://elsewhere.test", "User-agent: *\nAllow: /\n")
+        .html(
+            "https://example.com/a",
+            &page("A", &["https://elsewhere.test/x"]),
+        )
+        .html(
+            "https://elsewhere.test/x",
+            &page("X", &["https://further.test/y"]),
+        );
+
+    let scope = Scope {
+        link_policy: crate::scope::LinkPolicy::OneHop,
+        ..Scope::for_target("example.com").expect("target")
+    };
+    let crawler = with_scope(fetch, Arc::clone(&state), scope);
+    let clock = Arc::clone(crawler.clock());
+    let sink = Collected::default();
+    let report = drain(&crawler, &clock, &sink).await;
+
+    assert_eq!(report.rows, 2, "the cited page is fetched");
+    assert!(crawler.fetcher().asked_for("https://elsewhere.test/x"));
+    assert!(
+        !crawler.fetcher().asked_for("https://further.test/y"),
+        "and the second hop is not taken"
+    );
+}
+
+#[tokio::test]
+async fn a_scope_max_depth_lowers_the_ceiling_and_cannot_raise_it() {
+    let scope = Scope {
+        max_depth: Some(1),
+        ..Scope::general()
+    };
+    let config = CrawlConfig {
+        scope: Arc::new(scope),
+        ..config()
+    };
+    assert_eq!(config.depth_limit(), 1);
+
+    let greedy = CrawlConfig {
+        scope: Arc::new(Scope {
+            max_depth: Some(200),
+            ..Scope::general()
+        }),
+        ..config
+    };
+    assert_eq!(greedy.depth_limit(), 4, "the process ceiling wins");
+}
+
+#[tokio::test]
+async fn a_filtered_content_type_costs_the_fetch_and_produces_no_row() {
+    let state = seeded(&["https://example.com/a", "https://example.com/paper.pdf"]).await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/a", &page("A", &[]))
+        .outcome("https://example.com/paper.pdf", {
+            let bytes = Bytes::from_static(b"%PDF-1.7 not really a pdf");
+            Outcome::Ok(Box::new(Page {
+                final_url: "https://example.com/paper.pdf".to_owned(),
+                status: 200,
+                version: Version::Http2,
+                redirects: Vec::new(),
+                headers_kept: Vec::new(),
+                headers_digest: [0u8; 32],
+                content_type: Some("application/pdf".to_owned()),
+                media: Media::Pdf,
+                body_digest: *blake3::hash(&bytes).as_bytes(),
+                body: bytes,
+                revalidate: Revalidator::default(),
+                elapsed: Duration::from_millis(40),
+            }))
+        });
+
+    let scope = Scope {
+        content: crate::scope::ContentFilter {
+            content_types: vec!["text/html".to_owned()],
+            ..crate::scope::ContentFilter::default()
+        },
+        ..Scope::for_target("example.com").expect("target")
+    };
+    let crawler = with_scope(fetch, Arc::clone(&state), scope);
+    let clock = Arc::clone(crawler.clock());
+    let sink = Collected::default();
+    let report = drain(&crawler, &clock, &sink).await;
+
+    assert_eq!(report.leased, 2, "both were leased and both were fetched");
+    assert!(crawler.fetcher().asked_for("https://example.com/paper.pdf"));
+    assert_eq!(report.rows, 1, "only the html got a row");
+    assert_eq!(sink.rows()[0].url, "https://example.com/a");
+}
+
+#[tokio::test]
+async fn a_filtered_language_produces_no_row_either() {
+    let state = seeded(&["https://example.com/de"]).await;
+    let body = "<html lang='de'><head><title>Seite</title></head><body><h1>Seite</h1>\
+                <p>Ein Absatz mit genug Text, damit die Extraktion etwas findet.</p></body></html>";
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/de", body);
+
+    let scope = Scope {
+        content: crate::scope::ContentFilter {
+            languages: vec!["en".to_owned()],
+            ..crate::scope::ContentFilter::default()
+        },
+        ..Scope::for_target("example.com").expect("target")
+    };
+    let crawler = with_scope(fetch, Arc::clone(&state), scope);
+    let sink = Collected::default();
+    let report = crawler.tick(&sink).await.expect("tick");
+
+    assert_eq!(report.leased, 1);
+    assert_eq!(report.rows, 0);
+    assert!(sink.rows().is_empty());
+}
+
+#[tokio::test]
+async fn rows_are_stamped_with_the_scope_that_admitted_them() {
+    let state = seeded(&["https://example.com/a"]).await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/a", &page("A", &[]));
+
+    let scope = Scope::for_target("example.com").expect("target");
+    let id = scope.id;
+    assert_ne!(id, 0);
+    let crawler = with_scope(fetch, Arc::clone(&state), scope);
+    let sink = Collected::default();
+    crawler.tick(&sink).await.expect("tick");
+
+    assert_eq!(sink.rows()[0].crawl_profile, id);
 }
