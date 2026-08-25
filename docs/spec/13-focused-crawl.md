@@ -148,6 +148,19 @@ This is why doc 08 makes SQLite the default rather than nami. Portability, inspe
 
 In focused mode the delete after publish rule in doc 12.7 does not apply, because nothing was published and the operator's disk is the operator's problem. Segments are converted to Parquet and kept locally. `--publish` opts into the doc 12 pipeline, which then does delete local copies after verifying remote ones, and that difference is stated explicitly in the CLI help because it surprises people.
 
+With `--publish` the directory is slightly different, because two of the entries above are answers to questions that publishing answers elsewhere:
+
+```
+rust-docs/
+  profile.toml            the scope, verbatim
+  state.sqlite            doc 08's default backend
+  parquet/                staging, emptied as each file verifies on the hub
+  published.jsonl         one line per segment: repo, path, digest, rows
+  crawl.log
+```
+
+`data/` becomes `parquet/` because a file there is on its way somewhere rather than something you keep, and `manifest.json` is not written at all. The manifests that count are doc 12.5's signed day documents in the published repositories, and a second unsigned one sitting in the crawl directory would be a second answer to the same question with no signature on it. One crawl can also span several weekly repositories, which a single manifest cannot describe. `published.jsonl` is the operator's record of where their crawl ended up, appended as each segment verifies, and it is JSON lines rather than a document so that a crash leaves every line before the last one intact.
+
 ## 13.6 Seeding
 
 A crawl needs a first URL and the general crawl needs several billion of them. Six sources, in rough order of how many URLs each one is worth.

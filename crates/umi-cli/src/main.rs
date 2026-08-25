@@ -32,11 +32,21 @@ enum Command {
     Resume {
         /// The crawl directory, as laid out in doc 13.5.
         dir: String,
+        /// Publish to Hugging Face, and delete local copies once they verify.
+        ///
+        /// A flag here rather than something remembered from the first run,
+        /// because publishing needs a token and a signing key and neither
+        /// belongs in a profile that gets checked in.
+        #[arg(long)]
+        publish: bool,
     },
     /// Continue a crawl and keep it fresh instead of stopping when idle.
     Watch {
         /// The crawl directory.
         dir: String,
+        /// Publish to Hugging Face, and delete local copies once they verify.
+        #[arg(long)]
+        publish: bool,
     },
     /// Contribute fetch capacity to a coordinator.
     Fetch(FetchArgs),
@@ -237,8 +247,8 @@ impl CrawlArgs {
     /// Doc 14.7's precedence has already run by the time this is called, so
     /// `config` holds the answer for anything the flags left out and this is
     /// only the translation into doc 13's vocabulary.
-    fn plan(&self, config: &config::Config) -> crawl::Options {
-        crawl::Options {
+    fn plan(&self, config: &config::Config) -> Result<crawl::Options, Error> {
+        Ok(crawl::Options {
             target: self.target.clone(),
             include: self.include.clone(),
             exclude: self.exclude.clone(),
@@ -253,8 +263,8 @@ impl CrawlArgs {
             seed: self.seed.clone(),
             seeder: self.seeder.clone(),
             out: self.out.clone(),
-            publish: self.publish,
-        }
+            publish: crawl::Publishing::resolve(config, self.publish)?,
+        })
     }
 }
 
@@ -374,10 +384,16 @@ fn run(command: &Command) -> Result<(), Error> {
         }
         Command::Crawl(args) => {
             let config = load(command)?;
-            finish(crawl::crawl(&args.plan(&config)))
+            finish(crawl::crawl(&args.plan(&config)?))
         }
-        Command::Resume { dir } => finish(crawl::resume(std::path::Path::new(dir), false)),
-        Command::Watch { dir } => finish(crawl::resume(std::path::Path::new(dir), true)),
+        Command::Resume { dir, publish } => {
+            let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
+            finish(crawl::resume(std::path::Path::new(dir), false, publishing))
+        }
+        Command::Watch { dir, publish } => {
+            let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
+            finish(crawl::resume(std::path::Path::new(dir), true, publishing))
+        }
         other => Err(not_built(other)),
     }
 }
@@ -407,10 +423,10 @@ fn load(command: &Command) -> Result<config::Config, Error> {
         &config::env_from_process(),
         &command.flags(),
     )?;
-    if let Some(token) = &config.token
-        && let Some(warning) = token.value.warning()
-    {
-        eprintln!("umi: {} says {warning}", token.origin);
+    for secret in [&config.token, &config.key].into_iter().flatten() {
+        if let Some(warning) = secret.value.warning() {
+            eprintln!("umi: {} says {warning}", secret.origin);
+        }
     }
     Ok(config)
 }
@@ -444,33 +460,34 @@ fn print_config(config: &config::Config) -> Result<(), Error> {
         &config.backend.origin,
     );
     line("publish.org", config.org.value.clone(), &config.org.origin);
-    match &config.token {
-        // Never the value. The whole reason `Secret` is a type is that a
-        // command whose job is printing configuration must not print this one.
-        // The indirection is printed with whether it currently resolves, which
-        // is the question somebody running `umi config` is actually asking.
-        Some(token) => {
-            let resolves = match token.value.read() {
-                Ok(_) => "resolves",
-                Err(_) => "does not resolve",
-            };
-            line(
-                "publish.token",
-                match &token.value {
-                    config::Secret::Env(name) => format!("env:{name}, {resolves}"),
-                    config::Secret::File(path) => {
-                        format!("file:{}, {resolves}", path.display())
-                    }
-                    config::Secret::Literal(_) => "a literal, not shown".to_owned(),
-                },
-                &token.origin,
-            );
+    // Never the value. The whole reason `Secret` is a type is that a command
+    // whose job is printing configuration must not print these two. The
+    // indirection is printed with whether it currently resolves, which is the
+    // question somebody running `umi config` is actually asking.
+    for (name, secret) in [
+        ("publish.token", &config.token),
+        ("publish.key", &config.key),
+    ] {
+        match secret {
+            Some(found) => {
+                let resolves = match found.value.read() {
+                    Ok(_) => "resolves",
+                    Err(_) => "does not resolve",
+                };
+                line(
+                    name,
+                    match &found.value {
+                        config::Secret::Env(var) => format!("env:{var}, {resolves}"),
+                        config::Secret::File(path) => {
+                            format!("file:{}, {resolves}", path.display())
+                        }
+                        config::Secret::Literal(_) => "a literal, not shown".to_owned(),
+                    },
+                    &found.origin,
+                );
+            }
+            None => line(name, "unset".to_owned(), &config::Origin::Default),
         }
-        None => line(
-            "publish.token",
-            "unset".to_owned(),
-            &config::Origin::Default,
-        ),
     }
     line(
         "fetch.coordinator",

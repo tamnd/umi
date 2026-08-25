@@ -64,6 +64,12 @@ pub enum Error {
     #[error("{0}")]
     Scope(String),
 
+    /// A flag asked for something that configuration does not say how to do.
+    /// The message names the setting and how to set it, because "missing
+    /// configuration" on its own sends people to the source.
+    #[error("{0}")]
+    Missing(String),
+
     /// The state backend refused. Doc 14.9 calls this a general failure and
     /// not a usage error, because by the time a crawl is running the operator
     /// has already been told whether their arguments made sense.
@@ -73,6 +79,13 @@ pub enum Error {
     /// The crawl loop stopped on something that was not a fetch.
     #[error("crawl: {0}")]
     Crawl(String),
+
+    /// Doc 12's pipeline refused. Kept whole rather than flattened to a string
+    /// like the two above, because the exit code depends on which half of it
+    /// failed: a hub that will not answer is worth retrying and a copy that
+    /// does not check out is not.
+    #[error("publish: {0}")]
+    Publish(#[from] umi_publish::Error),
 
     /// A budget in doc 13.2 was reached. Doc 14.9's exit 4, which a script
     /// reads as "stopped early, there is more" rather than as a failure.
@@ -96,7 +109,11 @@ impl Error {
             // A bad flag, a bad config file or a column that does not exist is
             // the operator having typed something wrong, which is exit 2 and
             // not a failure of the run.
-            Self::Config(_) | Self::NoColumn(_) | Self::BadUrl(_) | Self::Scope(_) => Exit::Usage,
+            Self::Config(_)
+            | Self::NoColumn(_)
+            | Self::BadUrl(_)
+            | Self::Scope(_)
+            | Self::Missing(_) => Exit::Usage,
             Self::Budget => Exit::BudgetExhausted,
             Self::Empty => Exit::NothingToDo,
             Self::Fetch(_) => Exit::Network,
@@ -104,6 +121,7 @@ impl Error {
             // corruption or a bug, and both deserve a human rather than a
             // retry loop.
             Self::Unreadable(_) | Self::Segment(_) | Self::Parquet(_) => Exit::Verification,
+            Self::Publish(cause) => publishing(cause),
             Self::NotReady => Exit::Resource,
             Self::Io(_)
             | Self::Arrow(_)
@@ -112,5 +130,29 @@ impl Error {
             | Self::Crawl(_)
             | Self::NotBuilt(_) => Exit::Failure,
         }
+    }
+}
+
+/// Which exit code a publishing failure is.
+///
+/// The split doc 14.9 cares about is whether a script should try again. A hub
+/// that timed out or returned a 503 is exit 5 and a retry is the right move. A
+/// signature that did not verify, a manifest that did not parse, or an upload
+/// that landed and then digested differently is exit 6, and doc 14.9 says exit
+/// 6 is never retried automatically, because retrying a verification failure
+/// either loops forever or eventually succeeds by accident.
+fn publishing(cause: &umi_publish::Error) -> Exit {
+    use umi_publish::Error as Publish;
+    match cause {
+        Publish::Hub { .. } | Publish::Transport { .. } => Exit::Network,
+        Publish::NotPublished(_)
+        | Publish::BadSignature
+        | Publish::Manifest(_)
+        | Publish::Segment(_)
+        | Publish::Parquet(_) => Exit::Verification,
+        // A missing token, an unusable key, a full disk. All of them are this
+        // machine's configuration rather than the corpus, and none of them get
+        // better by being run again.
+        _ => Exit::Failure,
     }
 }

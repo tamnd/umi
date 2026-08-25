@@ -224,11 +224,23 @@ impl Location {
 /// the day folder a manifest names never depends on how long the fill took.
 #[must_use]
 pub fn locate(family: Family, first_ms: u64, slice: u16, segment: Ulid) -> Location {
+    locate_in(ORG, family, first_ms, slice, segment)
+}
+
+/// [`locate`], for a deployment that is not `open-index`.
+///
+/// Doc 12.4 fixes the organisation for the corpus this project publishes, and
+/// [`ORG`] is that answer. The organisation is still an argument here because
+/// doc 14.7 lets an operator set `publish.org`, and a configuration setting
+/// that quietly did nothing would be worse than not having one. Anyone running
+/// their own hub gets the same layout under their own name.
+#[must_use]
+pub fn locate_in(org: &str, family: Family, first_ms: u64, slice: u16, segment: Ulid) -> Location {
     let date = Date::from_ms(first_ms);
     let repo = if family.is_sliced() {
-        format!("{ORG}/{}-{}-{slice:02}", family.stem(), date.iso_week())
+        format!("{org}/{}-{}-{slice:02}", family.stem(), date.iso_week())
     } else {
-        format!("{ORG}/{}", family.stem())
+        format!("{org}/{}", family.stem())
     };
     let day = date.folder();
     Location {

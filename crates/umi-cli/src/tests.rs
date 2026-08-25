@@ -225,15 +225,44 @@ fn the_token_comes_out_of_the_layers_as_a_secret() {
 
 #[test]
 fn every_error_has_the_exit_code_doc_14_9_gives_it() {
-    let cases: [(Error, Exit); 8] = [
+    let cases: [(Error, Exit); 13] = [
         (Error::NoColumn("body".to_owned()), Exit::Usage),
         (Error::BadUrl("not a url".to_owned()), Exit::Usage),
+        (Error::Missing("publish.token".to_owned()), Exit::Usage),
         (Error::Empty, Exit::NothingToDo),
         (Error::Fetch("connection reset".to_owned()), Exit::Network),
         (Error::Unreadable(3), Exit::Verification),
         (Error::NotReady, Exit::Resource),
         (Error::NotBuilt("milestone 2"), Exit::Failure),
         (Error::Io(std::io::Error::other("disk")), Exit::Failure),
+        // The four publishing cases, which are the reason `Error::Publish`
+        // keeps the cause instead of flattening it to a string. A hub that
+        // timed out is worth retrying and a digest that did not match is not.
+        (
+            Error::Publish(umi_publish::Error::Transport {
+                what: "uploading",
+                cause: "timed out".to_owned(),
+            }),
+            Exit::Network,
+        ),
+        (
+            Error::Publish(umi_publish::Error::Hub {
+                status: 503,
+                what: "uploading",
+                body: "busy".to_owned(),
+            }),
+            Exit::Network,
+        ),
+        (
+            Error::Publish(umi_publish::Error::NotPublished(
+                umi_publish::Blocked::DigestMismatch,
+            )),
+            Exit::Verification,
+        ),
+        (
+            Error::Publish(umi_publish::Error::Secret("expected env:NAME")),
+            Exit::Failure,
+        ),
     ];
     for (error, expected) in cases {
         assert_eq!(error.exit(), expected, "{error}");

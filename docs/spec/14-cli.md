@@ -55,6 +55,8 @@ umi fetchers                  connected fetchers, reputation, rates, doc 06
 
 Twenty five commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
 
+`--publish` is a flag on all three of `crawl`, `resume` and `watch`, and it means the same thing on each one. A crawl started with it and resumed without it keeps its next segments locally, which is deliberate: the flag is the operator saying what this run should do, not a property the directory remembers, because the two things it needs are secrets and secrets do not belong in a directory that gets moved around.
+
 ## 14.3 `umi crawl`
 
 The flagship.
@@ -196,6 +198,7 @@ backend = "sqlite"
 [publish]
 org   = "open-index"
 token = "env:HF_TOKEN"
+key   = "env:UMI_PUBLISH_KEY"
 
 [fetch]
 coordinator = "https://umi.dev"

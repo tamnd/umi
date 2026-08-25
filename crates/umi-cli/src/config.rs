@@ -167,6 +167,7 @@ struct StateFile {
 struct PublishFile {
     org: Option<String>,
     token: Option<String>,
+    key: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -213,6 +214,10 @@ pub struct Config {
     pub org: Sourced<String>,
     /// The publishing token, still indirect.
     pub token: Option<Sourced<Secret>>,
+    /// Doc 12.5's publishing key, which signs manifests. Indirect too, and
+    /// separate from the token because they are different secrets with
+    /// different rotation schedules and one of them cannot do the other's job.
+    pub key: Option<Sourced<Secret>>,
     /// The coordinator `umi fetch` leases from.
     pub coordinator: Sourced<String>,
     /// Pages a second a fetcher offers.
@@ -318,6 +323,9 @@ impl Config {
             org: layers.text(None, "UMI_ORG", |f| f.publish.org.clone(), "open-index")?,
             token: layers
                 .optional_text("UMI_TOKEN", |f| f.publish.token.clone())
+                .map(|found| Sourced::new(Secret::parse(&found.value), found.origin)),
+            key: layers
+                .optional_text("UMI_PUBLISH_KEY", |f| f.publish.key.clone())
                 .map(|found| Sourced::new(Secret::parse(&found.value), found.origin)),
             coordinator: layers.text(
                 flags.coordinator.clone(),

@@ -48,6 +48,10 @@ http.workspace = true
 parquet.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+# `published.jsonl`. Hand writing six fields would work until the first
+# repository name with a quote in it, and the crate is already in the tree
+# under umi-publish.
+serde_json.workspace = true
 thiserror.workspace = true
 # `umi get` and `doctor` want one thread and `umi crawl` wants all of them:
 # gate 1.1's 250 pages a second is CPU bound in the extract and the sketch, and
@@ -59,5 +63,7 @@ toml.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 tempfile.workspace = true
+# `#[tokio::test]`. The crate itself builds its runtime by hand and does not
+# need the macros, so they are here rather than in the dependency above.
+tokio = { workspace = true, features = ["macros"] }

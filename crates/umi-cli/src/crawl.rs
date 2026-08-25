@@ -31,14 +31,31 @@
 //! known. It exists as a directory rather than a temporary file so that a
 //! crash leaves the segment where somebody can look at it.
 //!
+//! # With `--publish`
+//!
+//! Two entries change and one appears. `data/` becomes `parquet/`, a staging
+//! directory whose files are deleted as soon as the copy on the hub verifies,
+//! and `manifest.json` is not written at all, because with `--publish` the
+//! manifests that matter are doc 12.5's signed day documents in the published
+//! repositories and a second unsigned one in the crawl directory would be a
+//! second answer to the same question. What appears is `published.jsonl`, one
+//! line per segment saying which repository it went to and under what digest,
+//! which is the operator's record of where their crawl ended up.
+//!
 //! # Deleting things
 //!
-//! Only one path in here deletes anything, and it deletes a `.umi` whose rows
-//! are already in a Parquet file that has been read back. Doc 12.7's delete
-//! after publish rule is not implemented here at all, because doc 13.5 is
-//! explicit that it does not apply to a focused crawl: nothing was published,
-//! and the operator's disk is the operator's business.
+//! Without `--publish`, only one path in here deletes anything, and it deletes
+//! a `.umi` whose rows are already in a Parquet file that has been read back.
+//! Doc 12.7's delete after publish rule does not apply, because doc 13.5 is
+//! explicit that it does not: nothing was published, and the operator's disk is
+//! the operator's business.
+//!
+//! With `--publish` it does apply, and it is not implemented here either. The
+//! deleting is `umi_publish::Publisher`'s, under doc 12.7's four conditions,
+//! and this file's only part in it is handing the publisher a state ledger to
+//! record the fourth condition in.
 
+use core::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,9 +66,10 @@ use umi_crawl::{
 use umi_fetch::{FetchConfig, Fetcher};
 use umi_file::{StreamKind, WriterConfig};
 use umi_publish::manifest::{FileEntry, Manifest, Verification};
-use umi_state::{Candidate, State};
+use umi_publish::{Hub, PublishConfig, Published, Publisher, Role, SigningKey};
+use umi_state::{Candidate, SegmentRow, State, Stream};
 use umi_state_sqlite::SqliteState;
-use umi_types::{FetcherId, Tier};
+use umi_types::{Digest, FetcherId, Tier};
 
 use crate::Error;
 
@@ -66,6 +84,12 @@ const SEGMENTS: &str = "segments";
 const DATA: &str = "data";
 const MANIFEST: &str = "manifest.json";
 const LOG: &str = "crawl.log";
+
+/// Where `--publish` stages Parquet on its way to the hub, and the record it
+/// leaves behind. Neither is in doc 13.5, because doc 13.5 describes a crawl
+/// that keeps its output.
+const STAGING: &str = "parquet";
+const PUBLISHED: &str = "published.jsonl";
 
 /// How long to wait before asking an idle frontier again.
 ///
@@ -123,8 +147,83 @@ pub struct Options {
     pub seeder: Vec<String>,
     /// Where the directory goes. Defaults to `./<scope name>`.
     pub out: Option<String>,
-    /// Doc 12's pipeline, which is not built yet.
-    pub publish: bool,
+    /// Doc 12's pipeline, or nothing when `--publish` was not given.
+    pub publish: Option<Publishing>,
+}
+
+/// What `--publish` needs, after doc 14.7's five layers have run.
+///
+/// The two secrets are resolved by the time they get here rather than kept as
+/// indirections, because the crawl loop should not be the thing that discovers
+/// halfway through that `$HF_TOKEN` is unset. They are also the reason this is
+/// a separate struct with a hand written [`fmt::Debug`]: [`Options`] derives
+/// `Debug` and is the sort of thing that ends up in a log line.
+#[derive(Clone)]
+pub struct Publishing {
+    /// The Hugging Face organisation, `open-index` unless configured.
+    pub org: String,
+    /// The write token.
+    pub token: String,
+    /// Doc 12.5's publishing key, 64 hex characters.
+    pub key: String,
+    /// Doc 12.4's `NN`, the slice inside the week's repository family.
+    pub slice: u16,
+}
+
+impl Publishing {
+    /// Resolve the two secrets `--publish` needs, or nothing without the flag.
+    ///
+    /// Both are read here, before a single page is fetched, rather than when
+    /// the first segment seals. A crawl that ran for twenty minutes and then
+    /// found out that `$HF_TOKEN` was not set would have twenty minutes of
+    /// segments sitting on the disk that `--publish` is what keeps empty.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Missing`] when the flag was given and the configuration does
+    /// not say where the token or the key comes from, and [`Error::Config`]
+    /// when it says and the answer is not there.
+    pub fn resolve(config: &crate::config::Config, wanted: bool) -> Result<Option<Self>, Error> {
+        if !wanted {
+            return Ok(None);
+        }
+        let missing = |what: &str, var: &str| {
+            Error::Missing(format!(
+                "--publish needs publish.{what}: set it in umi.toml as env:NAME or file:/path, \
+                 or point ${var} at one of those"
+            ))
+        };
+        let token = config
+            .token
+            .as_ref()
+            .ok_or_else(|| missing("token", "UMI_TOKEN"))?;
+        let key = config
+            .key
+            .as_ref()
+            .ok_or_else(|| missing("key", "UMI_PUBLISH_KEY"))?;
+        Ok(Some(Self {
+            org: config.org.value.clone(),
+            token: token.value.read()?,
+            key: key.value.read()?,
+            // Doc 12.4 allocates slices on demand as a repository approaches
+            // the 300 GB ceiling, and that allocation needs the byte counts in
+            // `umi-meta`, which nothing reads yet. Zero until it does, which is
+            // correct for every crawl small enough to fit in one slice and is
+            // the first thing to fix when one is not.
+            slice: 0,
+        }))
+    }
+}
+
+impl fmt::Debug for Publishing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Publishing")
+            .field("org", &self.org)
+            .field("token", &"<redacted>")
+            .field("key", &"<redacted>")
+            .field("slice", &self.slice)
+            .finish()
+    }
 }
 
 /// What a crawl did, which is what the caller prints and what a test asserts.
@@ -138,8 +237,10 @@ pub struct Summary {
     pub bytes_fetched: u64,
     /// Answers that were a failure of some kind.
     pub failed: u64,
-    /// Parquet files in `data/`.
+    /// Parquet files produced, whether they were kept or published.
     pub files: usize,
+    /// How many of those went to the hub. Zero without `--publish`.
+    pub published: usize,
     /// Bytes those files take.
     pub bytes_stored: u64,
     /// Why the loop stopped.
@@ -164,11 +265,6 @@ pub enum Stop {
 /// [`Error::Io`] for the directory and the log, and whatever the state backend,
 /// the fetcher or the converter reports.
 pub fn crawl(options: &Options) -> Result<Summary, Error> {
-    if options.publish {
-        return Err(Error::NotBuilt(
-            "--publish needs the Hugging Face client, milestone 1",
-        ));
-    }
     let scope = scope_for(options)?;
     let dir = PathBuf::from(
         options
@@ -197,7 +293,7 @@ pub fn crawl(options: &Options) -> Result<Summary, Error> {
 ///
 /// As [`crawl`], plus [`Error::Io`] if the directory has no `profile.toml`,
 /// which is what tells a crawl directory apart from any other directory.
-pub fn resume(dir: &Path, watch: bool) -> Result<Summary, Error> {
+pub fn resume(dir: &Path, watch: bool, publish: Option<Publishing>) -> Result<Summary, Error> {
     let layout = Layout::create(dir)?;
     let text = std::fs::read_to_string(&layout.profile).map_err(|cause| {
         Error::Io(std::io::Error::new(
@@ -210,11 +306,15 @@ pub fn resume(dir: &Path, watch: bool) -> Result<Summary, Error> {
     // No seeding and no target. Doc 13.5's promise is that the directory is
     // the unit, so everything a resume needs is in it, and a resume that
     // reseeded would put the seeds back in the frontier on every restart.
+    // Publishing comes from the flags and the configuration rather than from
+    // the profile, because the profile is checked into somebody's repository
+    // and the two things `--publish` needs are secrets.
     let options = Options {
         target: scope.name.clone(),
         watch,
         seed: None,
         seeder: Vec::new(),
+        publish,
         ..Options::default()
     };
     let mut config = settings(&options)?;
@@ -239,7 +339,9 @@ struct Layout {
     state: PathBuf,
     segments: PathBuf,
     data: PathBuf,
+    staging: PathBuf,
     manifest: PathBuf,
+    published: PathBuf,
     log: PathBuf,
 }
 
@@ -253,7 +355,9 @@ impl Layout {
             state: dir.join(STATE),
             segments: dir.join(SEGMENTS),
             data: dir.join(DATA),
+            staging: dir.join(STAGING),
             manifest: dir.join(MANIFEST),
+            published: dir.join(PUBLISHED),
             log: dir.join(LOG),
             dir,
         })
@@ -508,8 +612,23 @@ fn run(
     let mut log = Log::open(&layout.log)?;
     let mut summary = Summary::default();
     let mut manifest = Manifest::new(&scope.name, &day(started_ms), StreamKind::Pages, None);
+    let publisher = match &options.publish {
+        Some(publishing) => Some(publisher(publishing, layout)?),
+        None => None,
+    };
 
     runtime.block_on(async {
+        // Doc 12.7's step 8 for whatever a previous run got as far as step 6
+        // and then lost the process. Before the first fetch rather than after
+        // the last one, because the reason it matters is disk, and disk is
+        // what the crawl about to start is going to want.
+        if let Some(publisher) = &publisher {
+            let collected = publisher.collect(&*state, clock.now_ms()).await?;
+            if collected > 0 {
+                log.line(&format!("{collected} segments left behind were collected"))?;
+            }
+        }
+
         let seeded = seed(&*state, &scope, options, started_ms, settings.delay_ms).await?;
         log.line(&format!(
             "seeded {seeded} urls into {}",
@@ -524,8 +643,17 @@ fn run(
                 .await
                 .map_err(|e| Error::Crawl(e.to_string()))?;
             add(&mut summary, &report);
-            harvest(&sink, layout, &mut manifest, &mut summary)?;
-            write_manifest(&layout.manifest, &manifest)?;
+            harvest(
+                &sink,
+                layout,
+                &*state,
+                publisher.as_ref(),
+                &mut manifest,
+                &mut summary,
+                &mut log,
+                clock.now_ms(),
+            )
+            .await?;
 
             if report.leased > 0 {
                 let now_ms = clock.now_ms();
@@ -580,13 +708,50 @@ fn run(
     // Parquet like every other row rather than in a `.umi` the operator has to
     // know about.
     sink.finish().map_err(|e| Error::Crawl(e.to_string()))?;
-    harvest(&sink, layout, &mut manifest, &mut summary)?;
-    write_manifest(&layout.manifest, &manifest)?;
+    runtime.block_on(harvest(
+        &sink,
+        layout,
+        &*state,
+        publisher.as_ref(),
+        &mut manifest,
+        &mut summary,
+        &mut log,
+        clock.now_ms(),
+    ))?;
     log.line(&format!(
         "stopped: {} rows, {} files, {} bytes fetched",
         summary.rows, summary.files, summary.bytes_fetched
     ))?;
+    if options.publish.is_some() {
+        log.line(&format!(
+            "{} files published, {} still local",
+            summary.published,
+            summary.files - summary.published
+        ))?;
+    }
     Ok(summary)
+}
+
+/// Assemble doc 12.2's pipeline for this crawl directory.
+///
+/// The coordinator in the manifest is this directory's key, the same one the
+/// segments are named from, so a published file can be traced back to the crawl
+/// that produced it without anything else having to be recorded.
+fn publisher(publishing: &Publishing, layout: &Layout) -> Result<Publisher, Error> {
+    let hub = Hub::new(publishing.token.clone())?;
+    let key = SigningKey::from_hex(Role::Publishing, &publishing.key)?;
+    let publisher = Publisher::new(
+        hub,
+        key,
+        PublishConfig {
+            staging: layout.staging.clone(),
+            org: publishing.org.clone(),
+            slice: publishing.slice,
+            coordinator: hex::encode(coordinator_key(&layout.dir)),
+            ..PublishConfig::default()
+        },
+    )?;
+    Ok(publisher)
 }
 
 fn add(summary: &mut Summary, report: &TickReport) {
@@ -615,19 +780,146 @@ fn spent(summary: &Summary, settings: &Settings, started_ms: u64, now_ms: u64) -
     None
 }
 
-/// Convert every segment that sealed since the last call, and delete it.
+/// Deal with every segment that sealed since the last call.
+///
+/// Two ways to do that, and which one runs is the whole of what `--publish`
+/// means. Without it, each segment is converted here and the `.umi` deleted,
+/// which is the focused crawl doc 13.5 describes. With it, each segment is
+/// recorded in the state ledger and `umi-publish` does the converting, the
+/// uploading and eventually the deleting, under doc 12.2's eight steps and doc
+/// 12.7's four conditions.
+///
+/// The publisher is drained only when something sealed, rather than on every
+/// tick. A drain is a query against the segments table and at gate 1.1's rate
+/// that would be a query every few milliseconds to find nothing new almost
+/// every time. A segment that fails to publish is retried by the next seal's
+/// drain, and failing that by the one after `sink.finish`, and failing that it
+/// is still on disk with its ledger row unpublished for `umi resume` to pick
+/// up. Nothing is lost by waiting.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the alternative is a struct that exists to be one call's argument list"
+)]
+async fn harvest(
+    sink: &SegmentSink,
+    layout: &Layout,
+    state: &dyn State,
+    publisher: Option<&Publisher>,
+    manifest: &mut Manifest,
+    summary: &mut Summary,
+    log: &mut Log,
+    now_ms: u64,
+) -> Result<(), Error> {
+    let sealed = sink.sealed();
+    let Some(publisher) = publisher else {
+        keep(&sealed, layout, manifest, summary)?;
+        return write_manifest(&layout.manifest, manifest);
+    };
+    if sealed.is_empty() {
+        return Ok(());
+    }
+
+    record(&sealed, state, now_ms).await?;
+    let (done, failed) = publisher.drain(state, now_ms).await?;
+    for published in &done {
+        summary.files += 1;
+        summary.published += 1;
+        summary.bytes_stored += published.bytes;
+        receipt(&layout.published, published)?;
+        if let Some(blocked) = &published.blocked {
+            // Published, and the local copy is still on disk because one of
+            // doc 12.7's conditions did not hold. Not an error: the next
+            // `collect` tries again. It is worth a log line, because a crawl
+            // whose disk is filling up while it publishes successfully is
+            // otherwise a mystery.
+            log.line(&format!(
+                "{} is on the hub but the local copy stays: {blocked}",
+                published.segment
+            ))?;
+        }
+    }
+    for (segment, error) in &failed {
+        log.line(&format!("{segment} did not publish, will retry: {error}"))?;
+    }
+    Ok(())
+}
+
+/// Record a sealed segment in the ledger, which is what makes it publishable.
+///
+/// The digest is over the sealed `.umi` and is the only reason this reads the
+/// file at all. It is what doc 12.8's reconciliation compares a recovered local
+/// file against, and computing it now costs about 50 ms per 128 MB segment
+/// against the 30 seconds doc 12.2 budgets for the conversion that follows.
+async fn record(sealed: &[umi_crawl::Sealed], state: &dyn State, now_ms: u64) -> Result<(), Error> {
+    let mut rows = Vec::with_capacity(sealed.len());
+    for segment in sealed {
+        let bytes = std::fs::metadata(&segment.path).map_err(Error::Io)?.len();
+        rows.push(SegmentRow {
+            id: segment.id,
+            stream: Stream::Pages,
+            local_path: segment.path.to_string_lossy().into_owned(),
+            sealed_at_ms: now_ms,
+            rows: segment.stats.rows,
+            bytes,
+            local_digest: Digest::from_bytes(digest_of(&segment.path)?),
+            remote: None,
+            manifest_day: None,
+            deleted_at_ms: None,
+        });
+    }
+    state
+        .put_segment(&rows)
+        .await
+        .map_err(|e| Error::State(e.to_string()))
+}
+
+/// blake3 of a file, read in chunks rather than into memory.
+fn digest_of(path: &Path) -> Result<[u8; 32], Error> {
+    let mut file = std::fs::File::open(path).map_err(Error::Io)?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).map_err(Error::Io)?;
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// One line of `published.jsonl`, appended and flushed.
+///
+/// Appended rather than rewritten, and one object per line rather than one
+/// array, so that a crawl killed halfway leaves a file that still parses up to
+/// the last complete line.
+fn receipt(path: &Path, published: &Published) -> Result<(), Error> {
+    use std::io::Write as _;
+    let line = serde_json::json!({
+        "segment": published.segment.to_text(),
+        "repo": published.repo,
+        "path": published.path,
+        "day": published.day,
+        "blake3": published.digest.to_string(),
+        "rows": published.rows,
+        "bytes": published.bytes,
+        "local_deleted": published.blocked.is_none(),
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(Error::Io)?;
+    writeln!(file, "{line}").map_err(Error::Io)?;
+    file.flush().map_err(Error::Io)
+}
+
+/// Convert every sealed segment into `data/`, and delete the `.umi`.
 ///
 /// Doc 12.2's checksum verification happens inside `convert`, so a segment
 /// whose chunks do not decode stops the crawl here rather than turning into a
 /// Parquet file nobody notices is wrong. That is also why the delete is after
 /// the convert and not part of it.
-fn harvest(
-    sink: &SegmentSink,
+fn keep(
+    sealed: &[umi_crawl::Sealed],
     layout: &Layout,
     manifest: &mut Manifest,
     summary: &mut Summary,
 ) -> Result<(), Error> {
-    for sealed in sink.sealed() {
+    for sealed in sealed {
         let name = format!("{}.parquet", sealed.id.to_text());
         let out = layout.data.join(&name);
         let segment = umi_file::Segment::open(&sealed.path)?;
@@ -942,7 +1234,7 @@ impl Default for Options {
             seed: None,
             seeder: Vec::new(),
             out: None,
-            publish: false,
+            publish: None,
         }
     }
 }
