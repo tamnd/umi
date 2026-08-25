@@ -10,6 +10,7 @@
 //! 1  verify every chunk checksum          ~1 s              part 1, folded in
 //! 2  convert shoals to Parquet            ~30 s at 0.4 core part 1
 //! 3  digest the Parquet, blake3 + sha256  ~2 s              part 2
+//! 5  verify the remote copy               ~3 s              part 5, local half
 //! 6  append and sign the manifest         ~2 s              part 3
 //! ```
 //!
@@ -78,7 +79,63 @@ fn main() {
     let converted = conversion(&umi, &parquet, rows, repeat);
     digests(&parquet, repeat);
     manifests(repeat);
+    read_back(&parquet, converted, repeat);
     footprint(umi_bytes, converted, rows);
+}
+
+/// Part 5. Doc 12.2 step 5, the local half of verifying the remote copy.
+///
+/// Doc 12.7 asks for three 1 MiB ranges rather than a full re download and
+/// costs that at about 3 seconds against 15, but both of those numbers are
+/// network. What the publisher spends locally is a read of the staged file and
+/// a blake3 over it, once for the splice and once again for the comparison
+/// digest, and that is CPU on a box doc 01 gives 2 vCPU. If it turned out to be
+/// seconds it would be worth restructuring; the point of measuring is to know
+/// which.
+fn read_back(parquet: &Path, bytes: u64, repeat: usize) {
+    use umi_publish::gc::sample_ranges;
+
+    println!("part 5: verifying the remote copy, doc 12.2 step 5 budgets 3 s");
+    println!(
+        "  {:<24} {:>12} {:>14} {:>16}",
+        "", "ms", "s per 128 MB", "of the 3 s"
+    );
+
+    let seed = *blake3::hash(&std::fs::read(parquet).expect("read")).as_bytes();
+    let mut sampled = f64::MAX;
+    let mut whole = f64::MAX;
+    for _ in 0..repeat {
+        // The sampled path: read the staged copy, splice what came back over
+        // it, digest the result. The fetch itself is not here, so this is the
+        // CPU the publisher pays regardless of how fast the link is.
+        let start = Instant::now();
+        let mut spliced = std::fs::read(parquet).expect("read");
+        for (at, len) in sample_ranges(bytes, 3, 1024 * 1024, &seed) {
+            let at = at as usize;
+            let end = (at + len as usize).min(spliced.len());
+            let fetched = spliced[at..end].to_vec();
+            spliced[at..end].copy_from_slice(&fetched);
+        }
+        let _ = blake3::hash(&spliced);
+        sampled = sampled.min(start.elapsed().as_secs_f64());
+
+        // The one in a hundred full path, for comparison. Same digest, no
+        // read of the local file, because the bytes came off the wire.
+        let start = Instant::now();
+        let _ = blake3::hash(&spliced);
+        whole = whole.min(start.elapsed().as_secs_f64());
+    }
+
+    let scale = SEGMENT_BYTES / bytes as f64;
+    for (name, seconds) in [("sampled, spliced", sampled), ("full, digest only", whole)] {
+        println!(
+            "  {name:<24} {:>12.2} {:>14.2} {:>15.1}%",
+            seconds * 1000.0,
+            seconds * scale,
+            seconds * scale / 3.0 * 100.0
+        );
+    }
+    println!();
 }
 
 /// Part 1. Doc 12.2 step 2, the 30 second conversion budget.
