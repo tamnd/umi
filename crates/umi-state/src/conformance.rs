@@ -32,11 +32,12 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
-use umi_types::{CANON_VERSION, FetcherId, PldId, RowKey, Tier};
+use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 
 use crate::{
     Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow, LeaseRequest,
-    NackReason, Priority, Revalidator, State, retry_after_ms,
+    NackReason, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow, State, Stream,
+    retry_after_ms,
 };
 
 /// A fixed instant to run every case from, so nothing in here depends on when
@@ -184,6 +185,14 @@ where
     run!(an_unknown_host_reads_back_as_none);
     run!(put_host_replaces_rather_than_merges);
     run!(a_blocked_host_is_never_leased);
+    run!(a_segment_record_round_trips);
+    run!(an_unknown_segment_reads_back_as_none);
+    run!(put_segment_replaces_rather_than_merges);
+    run!(a_sealed_segment_is_unpublished_until_it_has_a_remote_copy);
+    run!(a_segment_is_collectable_only_once_the_ledger_is_complete);
+    run!(a_deleted_segment_is_not_offered_for_collection_again);
+    run!(segments_come_back_in_seal_order);
+    run!(a_seal_window_is_half_open);
     run!(warming_a_domain_the_store_has_never_seen_is_not_an_error);
     run!(evicting_a_domain_that_is_not_resident_is_not_an_error);
     run!(resident_is_sorted_and_free_of_duplicates);
@@ -219,6 +228,44 @@ fn candidate<'a>(url: &'a str, priority: Priority) -> Candidate<'a> {
         priority,
         discovered_ms: T0,
         discovery: Discovery::Trusted,
+    }
+}
+
+/// A distinct segment id, sealed `n` milliseconds after [`T0`].
+///
+/// The timestamp is in the ULID, so ids made this way sort in seal order, and
+/// the entropy is the index rather than anything random because doc 11.1's
+/// determinism rule applies to the test suite too: a case that fails once in
+/// a thousand runs is worse than no case.
+fn segment_id(n: u8) -> Ulid {
+    Ulid::new(T0 + u64::from(n), [n; 10])
+}
+
+fn sealed(n: u8) -> SegmentRow {
+    SegmentRow {
+        id: segment_id(n),
+        stream: Stream::Pages,
+        local_path: format!("./crawl/segments/{n}.umi"),
+        sealed_at_ms: T0 + u64::from(n),
+        rows: 118_671,
+        bytes: 128 << 20,
+        local_digest: Digest::from_bytes([n; 32]),
+        remote: None,
+        manifest_day: None,
+        deleted_at_ms: None,
+    }
+}
+
+/// The same row as it looks after doc 12.2 steps 4 through 6 have run.
+fn published(n: u8) -> SegmentRow {
+    SegmentRow {
+        remote: Some(RemoteCopy {
+            repo: "open-index/umi-pages-2026w34-01".to_owned(),
+            path: format!("data/20260825/{n}.parquet"),
+            digest: Digest::from_bytes([n.wrapping_add(1); 32]),
+        }),
+        manifest_day: Some(20_260_825),
+        ..sealed(n)
     }
 }
 
@@ -774,6 +821,203 @@ async fn a_blocked_host_is_never_leased(state: &dyn State) -> Outcome {
         leases.is_empty(),
         "a blocked host was leased: {:?}",
         leases.first().map(|lease| &lease.url)
+    );
+    Ok(())
+}
+
+async fn a_segment_record_round_trips(state: &dyn State) -> Outcome {
+    let row = published(1);
+    state
+        .put_segment(std::slice::from_ref(&row))
+        .await
+        .map_err(|e| format!("put_segment failed: {e}"))?;
+
+    let read = state
+        .segment(row.id)
+        .await
+        .map_err(|e| format!("segment failed: {e}"))?
+        .ok_or_else(|| "a segment that was just written read back as none".to_owned())?;
+    ensure_eq!(read, row, "the segment record did not survive the round trip");
+    Ok(())
+}
+
+async fn an_unknown_segment_reads_back_as_none(state: &dyn State) -> Outcome {
+    // Doc 12.8 acts on this answer rather than treating it as an error: a file
+    // on the hub that no segment record claims is an orphan from a crash
+    // between upload and manifest push, and deciding that needs the store to
+    // say "never heard of it" plainly.
+    let read = state
+        .segment(segment_id(99))
+        .await
+        .map_err(|e| format!("segment failed: {e}"))?;
+    ensure!(read.is_none(), "a segment nothing wrote read back as some");
+    Ok(())
+}
+
+async fn put_segment_replaces_rather_than_merges(state: &dyn State) -> Outcome {
+    let sealed = sealed(1);
+    state
+        .put_segment(std::slice::from_ref(&sealed))
+        .await
+        .map_err(|e| format!("put_segment failed: {e}"))?;
+    let published = published(1);
+    state
+        .put_segment(std::slice::from_ref(&published))
+        .await
+        .map_err(|e| format!("the second put_segment failed: {e}"))?;
+
+    let read = state
+        .segment(sealed.id)
+        .await
+        .map_err(|e| format!("segment failed: {e}"))?
+        .ok_or_else(|| "the segment vanished".to_owned())?;
+    ensure_eq!(read, published, "the second write did not replace the first");
+    Ok(())
+}
+
+async fn a_sealed_segment_is_unpublished_until_it_has_a_remote_copy(
+    state: &dyn State,
+) -> Outcome {
+    state
+        .put_segment(&[sealed(1), sealed(2)])
+        .await
+        .map_err(|e| format!("put_segment failed: {e}"))?;
+
+    let backlog = state
+        .segments(SegmentQuery::Unpublished)
+        .await
+        .map_err(|e| format!("segments failed: {e}"))?;
+    ensure_eq!(backlog.len(), 2, "both sealed segments are unpublished");
+
+    state
+        .put_segment(&[published(1)])
+        .await
+        .map_err(|e| format!("the second put_segment failed: {e}"))?;
+    let backlog = state
+        .segments(SegmentQuery::Unpublished)
+        .await
+        .map_err(|e| format!("segments failed: {e}"))?;
+    ensure_eq!(backlog.len(), 1, "one is on the hub now");
+    ensure_eq!(
+        backlog[0].id,
+        segment_id(2),
+        "the wrong segment is still in the backlog"
+    );
+    Ok(())
+}
+
+async fn a_segment_is_collectable_only_once_the_ledger_is_complete(
+    state: &dyn State,
+) -> Outcome {
+    // Doc 12.7's fourth condition, which is the one this table exists for. A
+    // segment on the hub whose manifest has not been pushed yet is not
+    // collectable, because the chain that proves it is there is not committed.
+    let half = SegmentRow {
+        manifest_day: None,
+        ..published(1)
+    };
+    state
+        .put_segment(&[sealed(2), half])
+        .await
+        .map_err(|e| format!("put_segment failed: {e}"))?;
+
+    let ready = state
+        .segments(SegmentQuery::Collectable)
+        .await
+        .map_err(|e| format!("segments failed: {e}"))?;
+    ensure!(
+        ready.is_empty(),
+        "a segment with no manifest entry must not be collectable, found {}",
+        ready.len()
+    );
+
+    state
+        .put_segment(&[published(1)])
+        .await
+        .map_err(|e| format!("the second put_segment failed: {e}"))?;
+    let ready = state
+        .segments(SegmentQuery::Collectable)
+        .await
+        .map_err(|e| format!("segments failed: {e}"))?;
+    ensure_eq!(ready.len(), 1, "the manifest landed, so it is collectable");
+    ensure_eq!(ready[0].id, segment_id(1), "the wrong segment came back");
+    Ok(())
+}
+
+async fn a_deleted_segment_is_not_offered_for_collection_again(state: &dyn State) -> Outcome {
+    let row = published(1);
+    state
+        .put_segment(std::slice::from_ref(&row))
+        .await
+        .map_err(|e| format!("put_segment failed: {e}"))?;
+    let gone = SegmentRow {
+        deleted_at_ms: Some(T0 + DAY),
+        ..row
+    };
+    state
+        .put_segment(std::slice::from_ref(&gone))
+        .await
+        .map_err(|e| format!("the second put_segment failed: {e}"))?;
+
+    let ready = state
+        .segments(SegmentQuery::Collectable)
+        .await
+        .map_err(|e| format!("segments failed: {e}"))?;
+    ensure!(
+        ready.is_empty(),
+        "the local file is already gone, so there is nothing to collect"
+    );
+    // The record itself survives, because that is how an operator answers
+    // "where did that segment go" after the local copy is deleted.
+    let read = state
+        .segment(gone.id)
+        .await
+        .map_err(|e| format!("segment failed: {e}"))?;
+    ensure!(read.is_some(), "the record must outlive the file");
+    Ok(())
+}
+
+async fn segments_come_back_in_seal_order(state: &dyn State) -> Outcome {
+    // Written out of order on purpose. A publisher working a backlog has to
+    // take the oldest first, and a store that returned insertion order would
+    // pass every other case in here.
+    state
+        .put_segment(&[sealed(3), sealed(1), sealed(2)])
+        .await
+        .map_err(|e| format!("put_segment failed: {e}"))?;
+
+    let backlog = state
+        .segments(SegmentQuery::Unpublished)
+        .await
+        .map_err(|e| format!("segments failed: {e}"))?;
+    let order: Vec<Ulid> = backlog.iter().map(|row| row.id).collect();
+    ensure_eq!(
+        order,
+        vec![segment_id(1), segment_id(2), segment_id(3)],
+        "the backlog is not in seal order"
+    );
+    Ok(())
+}
+
+async fn a_seal_window_is_half_open(state: &dyn State) -> Outcome {
+    state
+        .put_segment(&[sealed(1), sealed(2), sealed(3)])
+        .await
+        .map_err(|e| format!("put_segment failed: {e}"))?;
+
+    let window = state
+        .segments(SegmentQuery::SealedBetween {
+            from_ms: T0 + 1,
+            to_ms: T0 + 3,
+        })
+        .await
+        .map_err(|e| format!("segments failed: {e}"))?;
+    let order: Vec<Ulid> = window.iter().map(|row| row.id).collect();
+    ensure_eq!(
+        order,
+        vec![segment_id(1), segment_id(2)],
+        "the window must include its start and exclude its end, so that doc 12.8 \
+         can walk consecutive days without seeing a segment twice"
     );
     Ok(())
 }

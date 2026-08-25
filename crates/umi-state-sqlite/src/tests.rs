@@ -13,10 +13,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use umi_state::{
-    Candidate, Discovery, FetchOutcome, FetchResult, HostRow, LeaseRequest, Revalidator, State,
-    conformance,
+    Candidate, Discovery, FetchOutcome, FetchResult, HostRow, LeaseRequest, Revalidator, SegmentRow,
+    State, Stream, conformance,
 };
-use umi_types::{FetcherId, RowKey, Tier};
+use umi_types::{Digest, FetcherId, RowKey, Tier, Ulid};
 
 use super::{APPLICATION_ID, SCHEMA_VERSION, SqliteConfig, SqliteState, schema, sql};
 
@@ -150,6 +150,91 @@ async fn the_schema_version_is_stamped_and_a_newer_one_is_refused() {
     assert!(
         message.contains("newer umi"),
         "the error does not tell the operator what happened: {message}"
+    );
+}
+
+#[tokio::test]
+async fn a_store_from_an_older_umi_gains_the_new_tables_and_keeps_its_rows() {
+    // The migration path is the thing this design has to get right, and a path
+    // that has never run is not one anybody should trust. So this builds a
+    // version 1 file the way version 1 built it, puts a url in it, and opens it
+    // with this build.
+    let dir = TempDir::new().expect("a temp directory");
+    let path = dir.path().join("state.umistate");
+
+    {
+        let conn = Connection::open(&path).expect("the file");
+        conn.execute_batch(schema::MIGRATIONS[0])
+            .expect("the version 1 schema");
+        // A url in the seen set, written the way version 1 wrote it. Opening
+        // the store to admit it would migrate the file first and there would
+        // be nothing left to test.
+        let key = RowKey::for_url("https://example.com/before-the-migration", None)
+            .expect("a crawlable url");
+        conn.execute(
+            "INSERT INTO seen (url_key) VALUES (?1)",
+            [&key.url.as_bytes()[..]],
+        )
+        .expect("a version 1 row");
+        conn.execute_batch("PRAGMA user_version = 1")
+            .expect("stamp version 1");
+    }
+
+    let state = SqliteState::open(&path).expect("a version 1 store opens");
+    let stats = state.stats().await.expect("stats");
+    assert_eq!(stats.urls_seen, 1, "the migration lost the url that was there");
+
+    let version: u32 = state
+        .lock()
+        .conn
+        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+        .map(|v| u32::try_from(v).unwrap_or(0))
+        .expect("user_version");
+    assert_eq!(version, SCHEMA_VERSION, "the file was not brought forward");
+
+    // And the table the migration exists for is usable, not just present.
+    let row = SegmentRow {
+        id: Ulid::new(1_700_000_000_000, [7; 10]),
+        stream: Stream::Pages,
+        local_path: "./crawl/segments/one.umi".to_owned(),
+        sealed_at_ms: 1_700_000_000_000,
+        rows: 118_671,
+        bytes: 128 << 20,
+        local_digest: Digest::from_bytes([3; 32]),
+        remote: None,
+        manifest_day: None,
+        deleted_at_ms: None,
+    };
+    state
+        .put_segment(std::slice::from_ref(&row))
+        .await
+        .expect("put_segment");
+    let read = state.segment(row.id).await.expect("segment");
+    assert_eq!(read.as_ref(), Some(&row), "the segment did not round trip");
+}
+
+#[tokio::test]
+async fn the_three_remote_columns_are_written_together_or_not_at_all() {
+    // Doc 08.3 asks for this so a crash can leave a segment unpublished but
+    // never half published in a way that satisfies doc 12.7's fourth
+    // condition. `RemoteCopy` being one `Option` is what makes it true of this
+    // crate; the CHECK is what makes it true of the file, including for the
+    // `sqlite3` shell and for anything else that opens it.
+    let dir = TempDir::new().expect("a temp directory");
+    let state = SqliteState::open(dir.path().join("state.umistate")).expect("a store");
+    let err = state
+        .lock()
+        .conn
+        .execute_batch(
+            "INSERT INTO segments (
+                 id, stream, local_path, sealed_at_ms, rows, bytes, local_digest,
+                 remote_repo, remote_path, remote_digest, manifest_day, deleted_at_ms
+             ) VALUES (x'00', 1, 'p', 0, 0, 0, x'00', 'open-index/x', NULL, NULL, NULL, NULL)",
+        )
+        .expect_err("a half published row must be refused");
+    assert!(
+        err.to_string().to_lowercase().contains("constraint"),
+        "the file let a half published segment in: {err}"
     );
 }
 

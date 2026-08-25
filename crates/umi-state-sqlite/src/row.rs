@@ -20,8 +20,10 @@
 
 use rusqlite::Row;
 use rusqlite::types::Type;
-use umi_state::{HostRow, LedgerRow, Priority, RobotsRef, TierPolicy, UrlState};
-use umi_types::{Digest, HostId, PldId, Tier, UrlKey, UrlKeyFull};
+use umi_state::{
+    HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Stream, TierPolicy, UrlState,
+};
+use umi_types::{Digest, HostId, PldId, Tier, Ulid, UrlKey, UrlKeyFull};
 
 /// A column held something this build cannot read back.
 #[derive(Debug)]
@@ -202,5 +204,46 @@ pub fn host_record(row: &Row<'_>) -> rusqlite::Result<HostRow> {
         consecutive_failures: small(row, "consecutive_failures")?,
         blocked: row.get::<_, i64>("blocked")? != 0,
         refusing: row.get::<_, i64>("refusing")? != 0,
+    })
+}
+
+fn stream(row: &Row<'_>, column: &str) -> rusqlite::Result<Stream> {
+    let raw: i64 = row.get(column)?;
+    u8::try_from(raw)
+        .ok()
+        .and_then(Stream::from_u8)
+        .ok_or_else(|| bad(column, format!("{raw} is not a stream"), Type::Integer))
+}
+
+/// Read a whole segment record.
+pub fn segment(row: &Row<'_>) -> rusqlite::Result<SegmentRow> {
+    // The schema has a CHECK that keeps the three remote columns null together
+    // or set together, so testing one is testing all three. That is the same
+    // shape as the robots columns above and it is deliberate: a nullable group
+    // in this file always means one optional value, never three independent
+    // ones.
+    let repo: Option<String> = row.get("remote_repo")?;
+    let remote = match repo {
+        Some(repo) => Some(RemoteCopy {
+            repo,
+            path: row.get("remote_path")?,
+            digest: Digest::from_bytes(bytes(row, "remote_digest")?),
+        }),
+        None => None,
+    };
+
+    Ok(SegmentRow {
+        id: Ulid::from_bytes(bytes(row, "id")?),
+        stream: stream(row, "stream")?,
+        local_path: row.get("local_path")?,
+        sealed_at_ms: from_ms(row.get("sealed_at_ms")?),
+        rows: count(row, "rows")?,
+        bytes: count(row, "bytes")?,
+        local_digest: Digest::from_bytes(bytes(row, "local_digest")?),
+        remote,
+        manifest_day: row
+            .get::<_, Option<i64>>("manifest_day")?
+            .map(|day| u32::try_from(day).unwrap_or(0)),
+        deleted_at_ms: row.get::<_, Option<i64>>("deleted_at_ms")?.map(from_ms),
     })
 }

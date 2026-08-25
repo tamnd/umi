@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -156,3 +156,65 @@ CREATE TABLE etags (
 );
 "
 );
+
+/// Version 2: doc 08.3's segments table.
+///
+/// It was not in the first draft of doc 08 and it arrived because doc 12.7's
+/// fourth GC condition does not work without it: a local file is only deleted
+/// once the state ledger carries the remote repository, path and digest, and
+/// there was nowhere for those to live. Adding it as a migration rather than
+/// folding it into V1 is deliberate even though nothing has published yet,
+/// because the migration path is the thing this design has to get right and a
+/// path that has never run once is not one anybody should trust.
+const V2: &str = r"
+-- Sealed segments. Tiny by construction: a coordinator seals about a thousand
+-- a day and a row is under 200 bytes, so a year is well under 100 MB and there
+-- is no prune step. The row outliving the file is the point, since it is how
+-- an operator answers 'where did that segment go' once the local copy is gone.
+--
+-- The three remote_ columns are written together or not at all. Doc 08.3 asks
+-- for that so a crash can leave a segment unpublished but never half
+-- published, and the CHECK is what makes it true of the file rather than true
+-- of the code that usually writes it.
+CREATE TABLE segments (
+    id            BLOB PRIMARY KEY,
+    stream        INTEGER NOT NULL,
+    local_path    TEXT    NOT NULL,
+    sealed_at_ms  INTEGER NOT NULL,
+    rows          INTEGER NOT NULL,
+    bytes         INTEGER NOT NULL,
+    local_digest  BLOB    NOT NULL,
+    remote_repo   TEXT,
+    remote_path   TEXT,
+    remote_digest BLOB,
+    manifest_day  INTEGER,
+    deleted_at_ms INTEGER,
+    CHECK ((remote_repo IS NULL) = (remote_path IS NULL)),
+    CHECK ((remote_repo IS NULL) = (remote_digest IS NULL))
+) WITHOUT ROWID;
+
+-- The publisher's backlog and the reconciliation window, in seal order. The
+-- id is in the index so the ordering is total: two segments sealed in the same
+-- millisecond happen on every restart, when every open writer is sealed at
+-- once, and a scan that returns them in an arbitrary order would make the
+-- publisher non deterministic for no reason.
+CREATE INDEX segments_sealed ON segments (sealed_at_ms, id);
+
+-- The publisher's backlog. Partial for the same reason as the one below, and
+-- it is here because the benchmark said so: without it, finding the 3 rows a
+-- keeping-up coordinator has outstanding took 555 ms against a year of
+-- history, because SQLite walked all 365000 entries of segments_sealed and
+-- tested the null on each. The publisher polls this, so that was 555 ms per
+-- poll growing by a millisecond a day forever.
+CREATE INDEX segments_unpublished
+    ON segments (sealed_at_ms, id)
+    WHERE remote_repo IS NULL;
+
+-- What the GC pass walks. Partial, because the set it wants is small and
+-- shrinking while the table only grows, so a full index would be almost
+-- entirely rows that can never match again.
+CREATE INDEX segments_collectable
+    ON segments (sealed_at_ms, id)
+    WHERE remote_repo IS NOT NULL AND manifest_day IS NOT NULL
+      AND deleted_at_ms IS NULL;
+";

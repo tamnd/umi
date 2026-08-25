@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, UrlKeyFull};
+use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
 
 // A fetcher needs this to build a conditional request and needs nothing else
 // from the state layer, so it lives in umi-types and is re-exported here. Doc
@@ -738,4 +738,155 @@ pub struct StateStats {
     pub shard_misses: u64,
     /// What the store occupies locally, as best the backend can tell.
     pub bytes_on_disk: u64,
+}
+
+/// Which of doc 10's three streams a segment holds.
+///
+/// This is `StreamKind` from umi-file, written out again rather than imported.
+/// The state layer does not depend on the file format and should not: doc 03
+/// puts them side by side, the frontier has no business knowing how a shoal is
+/// encoded, and a state backend that linked the writer would drag zstd into
+/// every dashboard tool that opens the sqlite file. The discriminants match on
+/// purpose, so the two can be converted with a three arm match at the one call
+/// site that has both crates in scope, and a test in umi-crawl asserts they
+/// still line up.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[repr(u8)]
+pub enum Stream {
+    /// Crawled pages.
+    Pages = 1,
+    /// Doc 04 delivery receipts.
+    Receipts = 2,
+    /// Fetched robots.txt, raw and parsed.
+    Robots = 3,
+}
+
+impl Stream {
+    /// The value a backend stores.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Read one back, for a backend loading a row.
+    ///
+    /// Returns `None` for anything else, which a backend turns into
+    /// [`StateError::Corrupt`](crate::StateError::Corrupt) rather than
+    /// guessing. A row whose stream we cannot name is a row we cannot decide
+    /// the GC rule on.
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::Pages),
+            2 => Some(Self::Receipts),
+            3 => Some(Self::Robots),
+            _ => None,
+        }
+    }
+}
+
+/// Where a segment ended up on Hugging Face.
+///
+/// The three fields doc 08.3 lists as `remote_repo`, `remote_path` and
+/// `remote_digest` are one value here rather than three nullable columns, and
+/// that is the point. Doc 08.3 requires them to move from null to set in a
+/// single write, so that a crash can leave a segment unpublished but can never
+/// leave it half published in a way that satisfies doc 12.7's fourth
+/// condition. Three separate `Option`s would make "repo set, digest still
+/// null" a state the type system permits and a reviewer has to remember is
+/// forbidden. One `Option` makes it unrepresentable.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RemoteCopy {
+    /// The dataset repository, as `owner/name`.
+    pub repo: String,
+    /// The path inside it, which is doc 12.4's
+    /// `data/<YYYYMMDD>/<ULID>.parquet`.
+    pub path: String,
+    /// blake3 of what was read back from the hub, not of what was sent.
+    ///
+    /// Doc 12.2 step 5 says the remote copy is verified independently, and an
+    /// upload's own echo of the digest it was given is not independent. This
+    /// field existing at all is the record that a read happened.
+    pub digest: Digest,
+}
+
+/// One sealed segment, from doc 08.3.
+///
+/// A row is written when the segment is sealed and updated once when it is
+/// published. It is never deleted, because the row outliving the file is
+/// exactly what lets an operator answer "where did that segment go" after the
+/// local copy is gone. A coordinator seals about a thousand a day at 128 MB
+/// each, so a year of history is well under 100 MB and there is no reason to
+/// prune.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SegmentRow {
+    /// The segment's ULID, which is also its file name and its key.
+    pub id: Ulid,
+    /// Which stream it holds.
+    pub stream: Stream,
+    /// Where the `.umi` file was written. Still meaningful after the file is
+    /// deleted, because it is how a reconciliation pass says what is missing.
+    pub local_path: String,
+    /// When the segment was sealed, in milliseconds since the Unix epoch.
+    pub sealed_at_ms: u64,
+    /// How many rows it holds.
+    pub rows: u64,
+    /// How many bytes the sealed file is.
+    pub bytes: u64,
+    /// blake3 of the sealed `.umi` file.
+    pub local_digest: Digest,
+    /// Where it is on the hub, once it is anywhere.
+    pub remote: Option<RemoteCopy>,
+    /// The `YYYYMMDD` of the manifest that lists it, once one does.
+    pub manifest_day: Option<u32>,
+    /// When the local file was deleted under doc 12.7, if it has been.
+    pub deleted_at_ms: Option<u64>,
+}
+
+impl SegmentRow {
+    /// Whether doc 12.7's fourth condition holds for this segment.
+    ///
+    /// Only the fourth. The other three are checked against the hub and the
+    /// manifest by umi-publish's `gc::clear`, and this deliberately does not
+    /// try to be the whole rule: a method on a state row that returned "safe
+    /// to delete" would be a second place the rule lives, and doc 12.7 is
+    /// emphatic that there is one.
+    #[must_use]
+    pub const fn ledger_complete(&self) -> bool {
+        self.remote.is_some() && self.manifest_day.is_some()
+    }
+
+    /// Whether the local file should still be on disk.
+    #[must_use]
+    pub const fn local(&self) -> bool {
+        self.deleted_at_ms.is_none()
+    }
+}
+
+/// Which segments a caller wants back.
+///
+/// Three variants because there are three callers, and each one is a scan a
+/// backend can answer from an index rather than by loading the table and
+/// filtering. The publisher asks for [`Unpublished`](SegmentQuery::Unpublished)
+/// when it starts, the GC pass asks for
+/// [`Collectable`](SegmentQuery::Collectable), and doc 12.8's reconciliation
+/// asks for a window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SegmentQuery {
+    /// Sealed and not on the hub. What the publisher picks up after a restart,
+    /// including whatever was in flight when it stopped.
+    Unpublished,
+    /// On the hub, in a manifest, and the local file is still there. The set
+    /// doc 12.7's rule is evaluated over. A segment is in this set the moment
+    /// it is publishable and leaves it when the file is deleted, so an empty
+    /// answer means there is nothing to collect and not that collection is
+    /// stuck.
+    Collectable,
+    /// Everything sealed in a half open millisecond range, for doc 12.8.
+    SealedBetween {
+        /// Inclusive.
+        from_ms: u64,
+        /// Exclusive.
+        to_ms: u64,
+    },
 }

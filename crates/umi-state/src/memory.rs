@@ -21,12 +21,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, UrlKey, UrlKeyFull};
+use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Ulid, UrlKey, UrlKeyFull};
 
 use crate::{
     AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult, HostRow,
-    Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Result, Revalidator, State,
-    StateStats, UrlState, next_due_after, retry_after_ms,
+    Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Result, Revalidator,
+    SegmentQuery, SegmentRow, State, StateStats, UrlState, next_due_after, retry_after_ms,
 };
 
 /// A [`State`] that lives entirely in memory.
@@ -46,6 +46,10 @@ struct Inner {
     /// that iterating it gives the scan shape a real backend gets for free.
     ledger: BTreeMap<RowKey, Entry>,
     hosts: HashMap<HostId, HostRow>,
+    /// Sealed segments, keyed by ULID. A `BTreeMap` so that iteration is in
+    /// seal order already and the sort in `segments` is doing nothing on the
+    /// common path.
+    segments: BTreeMap<Ulid, SegmentRow>,
     pen: BTreeMap<(FetcherId, UrlKey), Held>,
     /// Live leases, so `release` can find a row from an id alone.
     leases: HashMap<LeaseId, RowKey>,
@@ -520,6 +524,39 @@ impl State for MemoryState {
             inner.hosts.insert(row.host, row.clone());
         }
         Ok(())
+    }
+
+    async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()> {
+        let mut inner = self.lock();
+        for row in rows {
+            inner.segments.insert(row.id, row.clone());
+        }
+        Ok(())
+    }
+
+    async fn segment(&self, id: Ulid) -> Result<Option<SegmentRow>> {
+        Ok(self.lock().segments.get(&id).cloned())
+    }
+
+    async fn segments(&self, query: SegmentQuery) -> Result<Vec<SegmentRow>> {
+        let inner = self.lock();
+        let mut found: Vec<SegmentRow> = inner
+            .segments
+            .values()
+            .filter(|row| match query {
+                SegmentQuery::Unpublished => row.remote.is_none(),
+                SegmentQuery::Collectable => row.ledger_complete() && row.local(),
+                SegmentQuery::SealedBetween { from_ms, to_ms } => {
+                    row.sealed_at_ms >= from_ms && row.sealed_at_ms < to_ms
+                }
+            })
+            .cloned()
+            .collect();
+        // A ULID already sorts by time, so this is only doing work when two
+        // segments were sealed in the same millisecond, which happens when a
+        // restart seals every open writer at once.
+        found.sort_by_key(|row| (row.sealed_at_ms, row.id));
+        Ok(found)
     }
 
     async fn warm(&self, plds: &[PldId]) -> Result<()> {

@@ -25,3 +25,11 @@ tokio = { workspace = true, features = ["rt"] }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 tempfile = { workspace = true }
+
+# No criterion, for the same reason as umi-file and umi-publish. The numbers
+# this has to defend are doc 08.5's rates and doc 01's bytes a url, which are
+# wall clock over a batch of a thousand and not the microsecond differences
+# criterion exists to resolve.
+[[bench]]
+name = "state"
+harness = false
