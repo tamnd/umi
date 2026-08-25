@@ -91,6 +91,10 @@ sha2 = "0.11"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Doc 14.7's two config files. Deserialise only: umi reads configuration and
+# never writes it, because a tool that rewrites the file a person edited loses
+# their comments.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 hex = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tracing = "0.1"

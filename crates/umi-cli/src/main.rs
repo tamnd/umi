@@ -1,16 +1,19 @@
-//! The `umi` command line.
+//! The `umi` binary: argument parsing, dispatch and the exit code.
 //!
-//! The surface is specified in `docs/spec/14-cli.md`. The parser here is the
-//! real one and it is deliberately ahead of the implementation, because the
-//! shape of the command line is a design decision and reviewing it is cheaper
-//! now than after there are scripts depending on it.
+//! The parser here is the real one for every command in doc 14, including the
+//! ones that are not built yet. That is deliberate: the shape of the command
+//! line is a design decision and reviewing it is cheaper now than after there
+//! are scripts depending on it. Commands that are not built yet exit 1 and name
+//! the milestone that builds them, which is in `docs/spec/16-roadmap.md`. They
+//! never do something adjacent and call it done.
 //!
-//! Commands that are not built yet exit 1 with a pointer at the milestone that
-//! builds them, which is `docs/spec/16-roadmap.md`.
+//! Everything a command actually does lives in the `umi-cli` library next to
+//! this file.
 
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use umi_cli::{Error, config, doctor, get, inspect};
 use umi_types::{CANON_VERSION, Exit};
 
 /// An internet scale web crawler that publishes what it finds.
@@ -38,7 +41,16 @@ enum Command {
     /// Contribute fetch capacity to a coordinator.
     Fetch(FetchArgs),
     /// Check that this machine can do the thing it is about to do.
-    Doctor,
+    Doctor {
+        /// Skip every check that touches the network.
+        #[arg(long)]
+        offline: bool,
+        /// The directory a crawl would write into, for the disk check.
+        #[arg(long)]
+        out: Option<String>,
+    },
+    /// Print the effective configuration and where every value came from.
+    Config,
     /// Add URLs to a frontier from an external source.
     Seed {
         /// Where the URLs come from: cc, sitemap, feed, corpus, or `-` for stdin.
@@ -72,12 +84,24 @@ enum Command {
         /// Print the extracted markdown.
         #[arg(long)]
         markdown: bool,
+        /// Print the extracted plain text.
+        #[arg(long)]
+        text: bool,
         /// Print the extracted links.
         #[arg(long)]
         links: bool,
-        /// Print the receipt.
+        /// Print the extracted metadata.
+        #[arg(long)]
+        meta: bool,
+        /// Print the response headers doc 11.5 keeps.
+        #[arg(long)]
+        headers: bool,
+        /// Print the digests and versions a receipt would carry.
         #[arg(long)]
         receipt: bool,
+        /// Print the response body exactly as it arrived.
+        #[arg(long)]
+        raw: bool,
     },
     /// Run DuckDB over local Parquet or a published checkpoint.
     Sql {
@@ -173,15 +197,15 @@ struct CrawlArgs {
 
     /// Requests per second per host. Clamped by the politeness rules in doc 07
     /// and never raised past them.
-    #[arg(long, default_value_t = 1.0)]
-    rps: f32,
+    #[arg(long)]
+    rps: Option<f32>,
     /// Simultaneous in flight fetches.
-    #[arg(long, default_value_t = 4)]
-    concurrency: u16,
+    #[arg(long)]
+    concurrency: Option<u16>,
 
     /// Highest tier allowed.
-    #[arg(long, default_value_t = 3)]
-    tier: u8,
+    #[arg(long)]
+    tier: Option<u8>,
     /// Never open a browser. Equivalent to `--tier 2`.
     #[arg(long)]
     no_render: bool,
@@ -200,8 +224,8 @@ struct CrawlArgs {
     #[arg(long)]
     out: Option<String>,
     /// State backend.
-    #[arg(long, default_value = "sqlite", value_parser = ["sqlite", "nami", "postgres"])]
-    state: String,
+    #[arg(long, value_parser = ["sqlite", "nami", "postgres"])]
+    state: Option<String>,
     /// Publish to Hugging Face, and delete local copies once they verify.
     #[arg(long)]
     publish: bool,
@@ -211,11 +235,11 @@ struct CrawlArgs {
 #[derive(clap::Args)]
 struct FetchArgs {
     /// The coordinator to lease work from.
-    #[arg(long, default_value = "https://umi.dev")]
-    coordinator: String,
+    #[arg(long)]
+    coordinator: Option<String>,
     /// Pages per second you are willing to sustain.
-    #[arg(long, default_value_t = 2.0)]
-    rate: f32,
+    #[arg(long)]
+    rate: Option<f32>,
     /// Simultaneous in flight fetches.
     #[arg(long, default_value_t = 8)]
     concurrency: u16,
@@ -233,32 +257,209 @@ struct FetchArgs {
     refuse: Vec<String>,
 }
 
+impl Command {
+    /// The flags that feed doc 14.7's precedence, pulled out of whichever
+    /// subcommand is running.
+    fn flags(&self) -> config::Flags {
+        match self {
+            Self::Crawl(args) => config::Flags {
+                rps: args.rps,
+                concurrency: args.concurrency,
+                // `--no-render` is doc 14.3's spelling of `--tier 2`, and the
+                // explicit flag wins when both are given because a person who
+                // typed a number meant it.
+                tier_max: args.tier.or(if args.no_render { Some(2) } else { None }),
+                out: args.out.clone(),
+                backend: args.state.clone(),
+                ..config::Flags::default()
+            },
+            Self::Fetch(args) => config::Flags {
+                coordinator: args.coordinator.clone(),
+                rate: args.rate,
+                ..config::Flags::default()
+            },
+            _ => config::Flags::default(),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    match run(&cli.command) {
+        Ok(()) => ExitCode::from(Exit::Success),
+        Err(error) => {
+            let exit = error.exit();
+            eprintln!("umi: {error}");
+            ExitCode::from(exit)
+        }
+    }
+}
 
-    let (milestone, doc) = match &cli.command {
-        Command::Crawl(_) | Command::Resume { .. } => (1, "16-roadmap.md, milestone 1"),
-        Command::Ls { .. } | Command::Cat { .. } | Command::Get { .. } => {
-            (1, "16-roadmap.md, milestone 1")
+fn run(command: &Command) -> Result<(), Error> {
+    match command {
+        Command::Doctor { offline, out } => {
+            let config = load(command)?;
+            let checks = doctor::doctor(&doctor::Options {
+                offline: *offline,
+                out: out.clone().unwrap_or(config.out.value).into(),
+            })?;
+            match doctor::worst(&checks) {
+                doctor::Verdict::Bad => Err(Error::NotReady),
+                _ => Ok(()),
+            }
         }
-        Command::Doctor | Command::Publish { .. } | Command::Verify { .. } => {
-            (1, "16-roadmap.md, milestone 1")
+        Command::Config => print_config(&load(command)?),
+        Command::Ls { target } => inspect::ls(target),
+        Command::Cat {
+            path,
+            limit,
+            columns,
+        } => inspect::cat(path, *limit, columns.as_deref()),
+        Command::Get {
+            url,
+            tier,
+            markdown,
+            text,
+            links,
+            meta,
+            headers,
+            receipt,
+            raw,
+        } => {
+            // The flag and not `config.tier_max`. That setting is how high a
+            // crawl is allowed to climb, and `umi get` is the command you run
+            // to ask what one specific tier does to one specific page, so
+            // inheriting a fleet wide ceiling here would answer a different
+            // question than the one being asked.
+            get::get(
+                url,
+                *tier,
+                &get::Show {
+                    markdown: *markdown,
+                    text: *text,
+                    links: *links,
+                    meta: *meta,
+                    headers: *headers,
+                    receipt: *receipt,
+                    raw: *raw,
+                },
+            )
         }
-        Command::Manifest { .. } | Command::Seed { .. } => (1, "16-roadmap.md, milestone 1"),
+        other => Err(not_built(other)),
+    }
+}
+
+fn load(command: &Command) -> Result<config::Config, Error> {
+    let cwd = std::env::current_dir().map_err(Error::Io)?;
+    let config = config::Config::load(
+        &config::Paths::discover(&cwd),
+        &config::env_from_process(),
+        &command.flags(),
+    )?;
+    if let Some(token) = &config.token
+        && let Some(warning) = token.value.warning()
+    {
+        eprintln!("umi: {} says {warning}", token.origin);
+    }
+    Ok(config)
+}
+
+/// `umi config`, which doc 14.7 describes as the thing you want at 2am when a
+/// setting is not taking effect. Every line carries its source for that reason.
+fn print_config(config: &config::Config) -> Result<(), Error> {
+    println!("{:<20} {:<28} from", "setting", "value");
+    let line = |name: &str, value: String, origin: &config::Origin| {
+        println!("{name:<20} {value:<28} {origin}");
+    };
+    line(
+        "crawl.rps",
+        config.rps.value.to_string(),
+        &config.rps.origin,
+    );
+    line(
+        "crawl.concurrency",
+        config.concurrency.value.to_string(),
+        &config.concurrency.origin,
+    );
+    line(
+        "crawl.tier_max",
+        config.tier_max.value.to_string(),
+        &config.tier_max.origin,
+    );
+    line("crawl.out", config.out.value.clone(), &config.out.origin);
+    line(
+        "state.backend",
+        config.backend.value.clone(),
+        &config.backend.origin,
+    );
+    line("publish.org", config.org.value.clone(), &config.org.origin);
+    match &config.token {
+        // Never the value. The whole reason `Secret` is a type is that a
+        // command whose job is printing configuration must not print this one.
+        // The indirection is printed with whether it currently resolves, which
+        // is the question somebody running `umi config` is actually asking.
+        Some(token) => {
+            let resolves = match token.value.read() {
+                Ok(_) => "resolves",
+                Err(_) => "does not resolve",
+            };
+            line(
+                "publish.token",
+                match &token.value {
+                    config::Secret::Env(name) => format!("env:{name}, {resolves}"),
+                    config::Secret::File(path) => {
+                        format!("file:{}, {resolves}", path.display())
+                    }
+                    config::Secret::Literal(_) => "a literal, not shown".to_owned(),
+                },
+                &token.origin,
+            );
+        }
+        None => line(
+            "publish.token",
+            "unset".to_owned(),
+            &config::Origin::Default,
+        ),
+    }
+    line(
+        "fetch.coordinator",
+        config.coordinator.value.clone(),
+        &config.coordinator.origin,
+    );
+    line(
+        "fetch.rate",
+        config.rate.value.to_string(),
+        &config.rate.origin,
+    );
+    println!();
+    if config.files.is_empty() {
+        println!("no config file was read");
+    } else {
+        for path in &config.files {
+            println!("read {}", path.display());
+        }
+    }
+    println!("canonicalisation {CANON_VERSION}");
+    Ok(())
+}
+
+/// The message a specified but unbuilt command gives. It names the milestone,
+/// because "not implemented" without a date is indistinguishable from
+/// abandoned.
+fn not_built(command: &Command) -> Error {
+    Error::NotBuilt(match command {
+        Command::Crawl(_) | Command::Resume { .. } | Command::Seed { .. } => {
+            "the crawl loop is milestone 1 and lands next"
+        }
+        Command::Publish { .. } | Command::Verify { .. } | Command::Manifest { .. } => {
+            "publishing needs the Hugging Face client, milestone 1"
+        }
         Command::Watch { .. } | Command::Block { .. } | Command::Scope { .. } => {
-            (2, "16-roadmap.md, milestone 2")
+            "milestone 2 builds this"
         }
         Command::State { .. } | Command::Checkpoint { .. } | Command::Sql { .. } => {
-            (3, "16-roadmap.md, milestone 3")
+            "milestone 3 builds this"
         }
-        Command::Fetch(_) | Command::Status { .. } | Command::Peers | Command::Fetchers => {
-            (4, "16-roadmap.md, milestone 4")
-        }
-    };
-
-    eprintln!("umi {} ({CANON_VERSION})", env!("CARGO_PKG_VERSION"));
-    eprintln!("this command is specified but not built yet: see docs/spec/{doc}");
-    eprintln!("milestone {milestone} is where it lands");
-
-    ExitCode::from(Exit::Failure)
+        _ => "milestone 4 builds this, when there is a fleet to talk to",
+    })
 }

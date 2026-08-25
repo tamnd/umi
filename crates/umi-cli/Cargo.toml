@@ -12,10 +12,42 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[lib]
+name = "umi_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "umi"
 path = "src/main.rs"
 
+[[bench]]
+name = "cli"
+harness = false
+
 [dependencies]
 umi-types.workspace = true
+umi-file.workspace = true
+umi-fetch.workspace = true
+umi-extract.workspace = true
+
+arrow.workspace = true
 clap.workspace = true
+hex.workspace = true
+http.workspace = true
+parquet.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+# Only the current thread runtime. The command line fetches one URL at a time
+# and doctor makes two requests, so the work stealing pool would be two
+# threads doing nothing.
+tokio = { workspace = true, features = ["rt"] }
+toml.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+# The `cat` tests and the bench convert a real segment rather than reading a
+# fixture, so a change to doc 12's writer properties breaks them here first.
+umi-publish.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
