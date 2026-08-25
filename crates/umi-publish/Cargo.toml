@@ -14,14 +14,21 @@ workspace = true
 
 [dependencies]
 arrow = { workspace = true }
+# Doc 12.6's commit endpoint takes inline file content base64 encoded, and the
+# preupload sample is base64 too.
+base64 = { workspace = true }
 blake3 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 parquet = { workspace = true }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+# For the retry sleep in doc 12.6's ladder and nothing else. The publisher does
+# not own a runtime, it runs on the caller's.
+tokio = { workspace = true }
 umi-file = { workspace = true }
 umi-types = { workspace = true }
 

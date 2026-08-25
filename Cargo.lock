@@ -2899,15 +2899,18 @@ name = "umi-publish"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "base64 0.22.1",
  "blake3",
  "ed25519-dalek",
  "hex",
  "parquet",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
  "tempfile",
  "thiserror",
+ "tokio",
  "umi-file",
  "umi-types",
 ]

@@ -22,9 +22,9 @@
 //!    ├─ 1  verify every chunk checksum          convert, folded into step 2
 //!    ├─ 2  convert shoals to Parquet row groups convert
 //!    ├─ 3  digest the Parquet, blake3 + sha256  convert
-//!    ├─ 4  upload to Hugging Face               not in this crate yet
-//!    ├─ 5  verify the remote copy independently gc::Evidence
-//!    ├─ 6  append and sign the manifest, push   manifest
+//!    ├─ 4  upload to Hugging Face               hub
+//!    ├─ 5  verify the remote copy independently hub::read_range, gc::Evidence
+//!    ├─ 6  append and sign the manifest, push   manifest, hub
 //!    ├─ 7  write remote locations into state    not in this crate yet
 //!    └─ 8  GC deletes the local files           gc
 //! ```
@@ -38,13 +38,20 @@
 //! own fetch range rather than from when the publisher ran, and the sampled
 //! verification in [`gc::sample_ranges`] takes a seed.
 //!
-//! No network either, yet. The HTTP client, the batched commits from doc 12.6
-//! and the reconciliation pass from doc 12.8 land next, on top of these pieces.
+//! The network is in [`hub`] and stays there. Everything else in this crate
+//! takes bytes and returns bytes, which is what lets the conversion, the
+//! manifest chain and the GC rule be tested without a socket, and it is also
+//! doc 12.7's shape: the four conditions are checked by a caller that has both
+//! a local fact and a remote one, and neither half gets to decide on its own.
+//!
+//! Doc 12.8's reconciliation pass is not here yet. [`hub::Hub::list`] is the
+//! half of it that needs the network.
 
 #![forbid(unsafe_code)]
 
 pub mod convert;
 pub mod gc;
+pub mod hub;
 pub mod keys;
 pub mod manifest;
 pub mod repo;
@@ -54,6 +61,7 @@ mod tests;
 
 pub use convert::{Converted, convert};
 pub use gc::{Blocked, Cleared, Evidence};
+pub use hub::{Commit, Hub, HubConfig, Remote, Retry, Upload, Who};
 pub use keys::{Role, SigningKey, VerifyingKey};
 pub use manifest::{FileEntry, Manifest, Verification};
 pub use repo::{Family, Location, locate};
@@ -94,6 +102,28 @@ pub enum Error {
     /// was not a key. The message never contains the value.
     #[error("key source: {0}")]
     Secret(&'static str),
+
+    /// The hub answered, and the answer was no. The body is capped and never
+    /// carries a credential, because the only url with one in it is the
+    /// presigned upload target and nothing formats that.
+    #[error("hugging face said {status} while {what}: {body}")]
+    Hub {
+        /// The HTTP status.
+        status: u16,
+        /// Which step of doc 12.6 was in progress.
+        what: &'static str,
+        /// What the hub said, trimmed.
+        body: String,
+    },
+
+    /// The request did not get an answer at all, after doc 12.6's retries.
+    #[error("hugging face was unreachable while {what}: {cause}")]
+    Transport {
+        /// Which step of doc 12.6 was in progress.
+        what: &'static str,
+        /// What the client said, with the url removed.
+        cause: String,
+    },
 }
 
 /// The result type this crate returns.
