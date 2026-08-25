@@ -176,6 +176,21 @@ umi get https://example.com --tier 3 --markdown
 umi sql "select status, count(*) from pages group by 1" --data ./rust-docs
 ```
 
+`umi ls` takes a directory or a repository and the columns are the same either way, because the question is the same. Against a repository it reads doc 12.5's day manifests for the row counts and the time ranges, which is the only place those numbers exist over the network, and it reads the repository listing for what the hub actually holds. The last column is where those two answers meet:
+
+```
+$ umi ls open-index/umi-focus-blog.rust-lang.org
+file                                              day         rows          bytes       span      hub
+...260825/01M0WVX2QCSQS1EJYVA57SYJBY.parquet 20260825           61         228216        61s       ok
+1 file, 61 rows, 228216 bytes over 1 day in open-index/umi-focus-blog.rust-lang.org
+```
+
+`ok` is the file being on the hub at the size the manifest published. `missing` is a manifest naming a file the hub does not have, `size` is the hub having it at some other length, and `unnamed` is a file under `data/` that no manifest claims, which is what doc 12.8's reconciliation exists to clean up. A file only the hub knows about still gets a row, with a dash where the row count would be, because the hub can say how many bytes a file is and has no way to say how many rows are in it.
+
+Two things `ls` deliberately does not do. It does not check a signature, a chain or a digest, so a repository it prints happily is not a repository that has been verified, and the summary line says so by pointing at `umi verify` whenever the manifests and the hub disagree. And it does not fail on a disagreement: it prints the rows and exits zero, because a listing that refused to describe a broken repository would be useless on exactly the repository somebody needs to look at. An empty repository is exit 3 and a manifest that will not parse is exit 6, the same as `umi verify` gives it.
+
+A target that exists on this disk is a path. After that a name with a slash in it is a repository, and a bare name is one too if it starts with `umi-`, which is how doc 12.4 spells every repository this project publishes. Everything else stays a path, so a mistyped directory reports a mistyped directory instead of going to the network to look for it.
+
 `umi get` is the debugging workhorse. It runs one URL through the full ladder with verbose tier reporting and prints whatever you ask for: `--markdown`, `--text`, `--links`, `--meta`, `--headers`, `--receipt`, `--raw`. It is also the fastest way to answer "why did this page extract badly", and it prints the extractor version so the answer is reproducible.
 
 `umi sql` is DuckDB, either embedded through doc 08's `umi-state-duck` or shelled out to a `duckdb` binary on the path, the same fallback ccrawl-cli uses. It attaches local Parquet as `pages`, `receipts` and `links`, and it can attach a published repository over HTTP so that a question about the corpus does not require downloading the corpus. This is the command that makes doc 15's dashboard mostly unnecessary.

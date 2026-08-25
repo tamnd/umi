@@ -364,7 +364,14 @@ fn run(command: &Command) -> Result<(), Error> {
             }
         }
         Command::Config => print_config(&load(command)?),
-        Command::Ls { target } => inspect::ls(target),
+        Command::Ls { target } => {
+            let config = load(command)?;
+            inspect::ls(&inspect::Ls {
+                target,
+                token: token(&config)?,
+                org: &config.org.value,
+            })
+        }
         Command::Cat {
             path,
             limit,
@@ -410,11 +417,7 @@ fn run(command: &Command) -> Result<(), Error> {
         }
         Command::Verify { target, full } => {
             let config = load(command)?;
-            let token = match &config.token {
-                Some(secret) => Some(secret.value.read()?),
-                None => None,
-            };
-            verify::run(target, token, *full, &config.org.value)
+            verify::run(target, token(&config)?, *full, &config.org.value)
         }
         Command::Watch { dir, publish } => {
             let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
@@ -455,6 +458,19 @@ fn load(command: &Command) -> Result<config::Config, Error> {
         }
     }
     Ok(config)
+}
+
+/// The Hugging Face token, read out of wherever doc 14.7 says it lives, or
+/// nothing when none is configured.
+///
+/// Nothing is the normal answer for the two commands that call this. Everything
+/// this project publishes is public, so `umi ls` and `umi verify` both work
+/// against it with no credential at all, and that is the point of them.
+fn token(config: &config::Config) -> Result<Option<String>, Error> {
+    match &config.token {
+        Some(secret) => Ok(Some(secret.value.read()?)),
+        None => Ok(None),
+    }
 }
 
 /// `umi config`, which doc 14.7 describes as the thing you want at 2am when a
