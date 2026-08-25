@@ -421,11 +421,11 @@ impl Publisher {
     /// Doc 12.7's first condition: the object is there and it is the right
     /// size.
     async fn remote(&self, location: &Location) -> Result<gc::Remote> {
-        let listing = self.hub.list(&location.repo, &location.path).await?;
-        let found = listing
-            .into_iter()
-            .find(|entry| entry.path == location.path)
-            .ok_or(Error::Manifest("the upload is not in the listing"))?;
+        let found = self
+            .hub
+            .info(&location.repo, &location.path)
+            .await?
+            .ok_or(Error::Manifest("the upload is not on the hub"))?;
         Ok(gc::Remote { bytes: found.size })
     }
 

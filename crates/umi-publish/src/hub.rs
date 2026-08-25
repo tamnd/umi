@@ -247,6 +247,49 @@ pub struct Remote {
     pub sha256: Option<String>,
 }
 
+/// One entry as the hub writes it, shared by the two endpoints that describe
+/// files: the tree listing and `paths-info`. They return the same shape, and
+/// the shape has a trap in it, so it is decoded in one place.
+#[derive(Deserialize)]
+struct Entry {
+    #[serde(rename = "type")]
+    kind: String,
+    path: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    lfs: Option<Lfs>,
+}
+
+#[derive(Deserialize)]
+struct Lfs {
+    #[serde(default)]
+    oid: String,
+    #[serde(default)]
+    size: u64,
+}
+
+impl Entry {
+    /// The entry as a [`Remote`], or `None` if it is a directory.
+    fn file(self) -> Option<Remote> {
+        if self.kind != "file" {
+            return None;
+        }
+        // The trap. The `size` at the top level of an lfs entry is the pointer
+        // file's, which is 130 bytes and is never what anyone asking this
+        // question wants.
+        let (size, sha256) = match self.lfs {
+            Some(lfs) if !lfs.oid.is_empty() => (lfs.size, Some(lfs.oid)),
+            _ => (self.size, None),
+        };
+        Some(Remote {
+            path: self.path,
+            size,
+            sha256,
+        })
+    }
+}
+
 /// Who the token belongs to and what it can do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Who {
@@ -468,7 +511,13 @@ impl Hub {
         Ok(Some(response.body))
     }
 
-    /// Everything under a path, for doc 12.8's reconciliation.
+    /// Everything under a directory, for doc 12.8's reconciliation.
+    ///
+    /// The prefix has to name a directory or the empty string. The hub's tree
+    /// endpoint answers a path that names a file with a 404, which arrives
+    /// here as an empty listing, so asking this about one file gets the wrong
+    /// answer rather than an error. [`Hub::info`] is the method for that
+    /// question.
     ///
     /// # Errors
     ///
@@ -476,24 +525,6 @@ impl Hub {
     /// empty listing and not an error, because "no files" is the right answer
     /// to "what is in the repository we have not created yet".
     pub async fn list(&self, repo: &str, prefix: &str) -> Result<Vec<Remote>> {
-        #[derive(Deserialize)]
-        struct Entry {
-            #[serde(rename = "type")]
-            kind: String,
-            path: String,
-            #[serde(default)]
-            size: u64,
-            #[serde(default)]
-            lfs: Option<Lfs>,
-        }
-        #[derive(Deserialize)]
-        struct Lfs {
-            #[serde(default)]
-            oid: String,
-            #[serde(default)]
-            size: u64,
-        }
-
         let url = format!(
             "{}/api/datasets/{repo}/tree/{MAIN}/{prefix}?recursive=1",
             self.base
@@ -505,24 +536,38 @@ impl Hub {
             return Ok(Vec::new());
         }
         let entries = response.into_json::<Vec<Entry>>("listing the repository")?;
+        Ok(entries.into_iter().filter_map(Entry::file).collect())
+    }
+
+    /// One file, or `None` if the hub does not have it.
+    ///
+    /// Doc 12.7's first condition is about a single object and this is the
+    /// question it asks. It goes to the hub's `paths-info` endpoint rather
+    /// than the tree endpoint [`Hub::list`] uses, because the tree endpoint
+    /// takes a directory and answers a file path with a 404 whether the file
+    /// is there or not, and a garbage collector that reads "not there" as "not
+    /// published yet" is one that never deletes anything.
+    ///
+    /// # Errors
+    ///
+    /// When the hub will not answer. A missing file is `Ok(None)`, as is a
+    /// repository that does not exist yet.
+    pub async fn info(&self, repo: &str, path: &str) -> Result<Option<Remote>> {
+        let url = format!("{}/api/datasets/{repo}/paths-info/{MAIN}", self.base);
+        let body = serde_json::json!({ "paths": [path], "expand": false });
+        let response = self
+            .send_allowing("asking about a file", &[404], || {
+                json_body(self.client.post(&url), &body)
+            })
+            .await?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        let entries = response.into_json::<Vec<Entry>>("asking about a file")?;
         Ok(entries
             .into_iter()
-            .filter(|entry| entry.kind == "file")
-            .map(|entry| {
-                // The `size` at the top level of an lfs entry is the pointer
-                // file's, which is 130 bytes and is never what anyone asking
-                // this question wants.
-                let (size, sha256) = match entry.lfs {
-                    Some(lfs) if !lfs.oid.is_empty() => (lfs.size, Some(lfs.oid)),
-                    _ => (entry.size, None),
-                };
-                Remote {
-                    path: entry.path,
-                    size,
-                    sha256,
-                }
-            })
-            .collect())
+            .filter_map(Entry::file)
+            .find(|entry| entry.path == path))
     }
 
     /// Ask the hub how each file should go up, and which it already has.

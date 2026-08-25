@@ -379,6 +379,60 @@ async fn a_listing_reports_the_content_size_and_not_the_pointers() {
 }
 
 #[tokio::test]
+async fn asking_about_one_file_asks_the_endpoint_that_answers_about_files() {
+    // The first live publish failed here. The tree endpoint takes a directory
+    // and answers a file path with a 404 whether the file is there or not, so
+    // doc 12.7's first condition read "not published" for a file that was
+    // sitting on the hub. `paths-info` is the endpoint that answers the
+    // question that was being asked.
+    let path = "data/20260817/a.parquet";
+    let hub = Scripted::new(move |request| {
+        assert!(
+            request.path.contains("/paths-info/"),
+            "got {}",
+            request.path
+        );
+        assert_eq!(request.json()["paths"][0], path);
+        Say::ok(serde_json::json!([
+            { "type": "file", "path": path, "size": 130,
+              "lfs": { "oid": "9c11", "size": 134_217_728u64 } },
+        ]))
+    })
+    .await;
+
+    let found = hub
+        .hub()
+        .info("open-index/umi-pages-2026w34-00", path)
+        .await
+        .expect("info")
+        .expect("it is there");
+    assert_eq!(found.size, 134_217_728, "the content size, not the pointer");
+    assert_eq!(found.sha256.as_deref(), Some("9c11"));
+
+    let missing = Scripted::new(|_| Say::ok(serde_json::json!([]))).await;
+    assert!(
+        missing
+            .hub()
+            .info("open-index/umi-pages-2026w34-00", path)
+            .await
+            .expect("info")
+            .is_none(),
+        "an empty answer is a missing file and not a failure"
+    );
+
+    let absent = Scripted::new(|_| Say::status(404)).await;
+    assert!(
+        absent
+            .hub()
+            .info("open-index/not-yet", path)
+            .await
+            .expect("info")
+            .is_none(),
+        "and so is a repository nobody has created"
+    );
+}
+
+#[tokio::test]
 async fn a_repository_that_is_already_there_is_not_a_failure() {
     let hub = Scripted::new(|_| Say::status(409)).await;
     assert!(

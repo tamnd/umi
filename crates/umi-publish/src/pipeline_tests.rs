@@ -67,6 +67,29 @@ impl Files {
             .insert((repo.to_owned(), path.to_owned()), bytes);
     }
 
+    /// The stored files of one repository whose paths pass a test, in the
+    /// shape the hub describes a file in. Both endpoints that answer that
+    /// question use it, and they differ only in the test.
+    fn entries<F>(&self, repo: &str, wanted: F) -> Vec<serde_json::Value>
+    where
+        F: Fn(&str) -> bool,
+    {
+        self.stored
+            .lock()
+            .expect("not poisoned")
+            .iter()
+            .filter(|((in_repo, in_path), _)| in_repo == repo && wanted(in_path))
+            .map(|((_, in_path), bytes)| {
+                serde_json::json!({
+                    "type": "file",
+                    "path": in_path,
+                    "size": 130,
+                    "lfs": { "oid": "an-oid", "size": bytes.len() },
+                })
+            })
+            .collect()
+    }
+
     fn paths(&self) -> Vec<String> {
         self.stored
             .lock()
@@ -157,24 +180,30 @@ impl Files {
             return Say::ok(serde_json::json!({ "commitOid": "c0ffee" }));
         }
         if let Some(rest) = path.strip_prefix("/api/datasets/")
+            && let Some(repo) = rest.strip_suffix("/paths-info/main")
+        {
+            let wanted = request.json()["paths"][0]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            return Say::ok(serde_json::json!(self.entries(repo, |in_path| {
+                in_path == wanted
+            })));
+        }
+        if let Some(rest) = path.strip_prefix("/api/datasets/")
             && let Some((repo, prefix)) = rest.split_once("/tree/main/")
         {
-            let entries: Vec<_> = self
-                .stored
-                .lock()
-                .expect("not poisoned")
-                .iter()
-                .filter(|((in_repo, in_path), _)| in_repo == repo && in_path.starts_with(prefix))
-                .map(|((_, in_path), bytes)| {
-                    serde_json::json!({
-                        "type": "file",
-                        "path": in_path,
-                        "size": 130,
-                        "lfs": { "oid": "an-oid", "size": bytes.len() },
-                    })
-                })
-                .collect();
-            return Say::ok(serde_json::json!(entries));
+            // The real hub answers a path that names a file with a 404 rather
+            // than with the file, which is the trap `Hub::info` exists to
+            // avoid, so the fake one does it too.
+            let named_a_file = self.get(repo, prefix).is_some();
+            if named_a_file {
+                return Say::status(404);
+            }
+            let prefix = prefix.to_owned();
+            return Say::ok(serde_json::json!(
+                self.entries(repo, |in_path| in_path.starts_with(&prefix))
+            ));
         }
         if let Some(rest) = path.strip_prefix("/datasets/")
             && let Some((repo, in_repo)) = rest.split_once("/resolve/main/")
