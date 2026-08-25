@@ -29,6 +29,17 @@ umi-types.workspace = true
 umi-file.workspace = true
 umi-fetch.workspace = true
 umi-extract.workspace = true
+umi-crawl.workspace = true
+umi-publish.workspace = true
+umi-seed.workspace = true
+umi-state.workspace = true
+# The default backend and the only one built. Doc 08 puts SQLite's ceiling at
+# about 100 million URLs and doc 13.5 says a focused crawl that exceeds that is
+# not focused, so `--state nami` and `--state postgres` are still refused at the
+# flag rather than silently falling back to this.
+umi-state-sqlite.workspace = true
+
+blake3.workspace = true
 
 arrow.workspace = true
 clap.workspace = true
@@ -38,16 +49,15 @@ parquet.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 thiserror.workspace = true
-# Only the current thread runtime. The command line fetches one URL at a time
-# and doctor makes two requests, so the work stealing pool would be two
-# threads doing nothing.
-tokio = { workspace = true, features = ["rt"] }
+# `umi get` and `doctor` want one thread and `umi crawl` wants all of them:
+# gate 1.1's 250 pages a second is CPU bound in the extract and the sketch, and
+# a current thread runtime would serialise that behind the fetches. The crawl
+# builds the multi threaded runtime itself and the other commands keep using
+# the small one.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 toml.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-# The `cat` tests and the bench convert a real segment rather than reading a
-# fixture, so a change to doc 12's writer properties breaks them here first.
-umi-publish.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

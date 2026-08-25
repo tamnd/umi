@@ -11,6 +11,7 @@
 //! in [`Error::exit`].
 
 pub mod config;
+pub mod crawl;
 pub mod doctor;
 mod error;
 pub mod get;

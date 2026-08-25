@@ -60,6 +60,25 @@ pub enum Error {
     #[error("{0} files could not be read")]
     Unreadable(usize),
 
+    /// A scope would not build from a target, a profile or a flag.
+    #[error("{0}")]
+    Scope(String),
+
+    /// The state backend refused. Doc 14.9 calls this a general failure and
+    /// not a usage error, because by the time a crawl is running the operator
+    /// has already been told whether their arguments made sense.
+    #[error("state: {0}")]
+    State(String),
+
+    /// The crawl loop stopped on something that was not a fetch.
+    #[error("crawl: {0}")]
+    Crawl(String),
+
+    /// A budget in doc 13.2 was reached. Doc 14.9's exit 4, which a script
+    /// reads as "stopped early, there is more" rather than as a failure.
+    #[error("budget exhausted")]
+    Budget,
+
     /// A `doctor` check came back bad.
     #[error("this machine is not ready: see the report above")]
     NotReady,
@@ -77,7 +96,8 @@ impl Error {
             // A bad flag, a bad config file or a column that does not exist is
             // the operator having typed something wrong, which is exit 2 and
             // not a failure of the run.
-            Self::Config(_) | Self::NoColumn(_) | Self::BadUrl(_) => Exit::Usage,
+            Self::Config(_) | Self::NoColumn(_) | Self::BadUrl(_) | Self::Scope(_) => Exit::Usage,
+            Self::Budget => Exit::BudgetExhausted,
             Self::Empty => Exit::NothingToDo,
             Self::Fetch(_) => Exit::Network,
             // Doc 14.9: a digest or a file that will not decode is either
@@ -85,7 +105,12 @@ impl Error {
             // retry loop.
             Self::Unreadable(_) | Self::Segment(_) | Self::Parquet(_) => Exit::Verification,
             Self::NotReady => Exit::Resource,
-            Self::Io(_) | Self::Arrow(_) | Self::Fetcher(_) | Self::NotBuilt(_) => Exit::Failure,
+            Self::Io(_)
+            | Self::Arrow(_)
+            | Self::Fetcher(_)
+            | Self::State(_)
+            | Self::Crawl(_)
+            | Self::NotBuilt(_) => Exit::Failure,
         }
     }
 }
