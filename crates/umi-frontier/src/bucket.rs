@@ -150,15 +150,29 @@ impl Gate {
         }
     }
 
+    /// Stop tracking one domain.
+    ///
+    /// Forgetting a domain forgets what it has spent, so a domain evicted and
+    /// warmed again inside a second gets its burst back. That is a real hole
+    /// and it is left open on purpose: closing it means keeping a schedule for
+    /// every domain we have ever seen rather than for the ones we are working,
+    /// and eviction is doc 08.6's answer to a domain having gone idle, so a
+    /// domain that has just been evicted is by definition one nothing has
+    /// asked for.
+    pub fn forget(&mut self, pld: PldId) {
+        if let Some(at) = self.schedule.remove(&pld) {
+            self.order.remove(&(at, pld));
+        }
+    }
+
     /// Forget every domain that is not in `keep`, which must be sorted.
     ///
     /// This is how eviction reaches the scheduler: doc 08.6 makes local disk a
     /// cache, so a domain that has been sealed and uploaded is no longer
-    /// schedulable and its schedule is not worth carrying. The length check in
-    /// front is the point of the method being shaped this way, since nothing
-    /// is dropped on the overwhelming majority of ticks and a scan of every
-    /// resident domain on every tick would be the most expensive thing the
-    /// scheduler does.
+    /// schedulable and its schedule is not worth carrying. It walks every
+    /// domain being tracked, so it belongs on the eviction path and on doc
+    /// 09.8's restart rebuild, and not on the scheduler tick. The length check
+    /// in front makes the common call free.
     pub fn retain(&mut self, keep: &[PldId]) {
         if self.schedule.len() == keep.len() {
             return;

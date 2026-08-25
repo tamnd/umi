@@ -453,14 +453,42 @@ async fn an_evicted_domain_stops_being_scheduled() {
     let leases = front.tick(&Ask::new(T0, 8)).await.expect("tick");
     assert_eq!(leases.len(), 2);
     complete(front.state(), &leases, T0).await;
-    let report = front.state().evict(&[pld_of(going)]).await.expect("evict");
+
+    // Through the frontier and not through the store, because the scheduler no
+    // longer re-reads the resident set on every tick and so has to be told.
+    let report = front.evict(&[pld_of(going)]).await.expect("evict");
     assert_eq!(report.evicted, 1);
 
-    // The next tick notices and stops carrying the evicted domain's schedule.
-    front.tick(&Ask::new(T0 + 1_000, 8)).await.expect("tick");
     assert_eq!(front.domains(), 1);
     assert_eq!(front.next_ready_ms(pld_of(going)), None);
     assert!(front.next_ready_ms(pld_of(kept)).is_some());
+
+    let leases = front.tick(&Ask::new(T0 + 1_000, 8)).await.expect("tick");
+    assert!(
+        leases.iter().all(|lease| lease.key.pld != pld_of(going)),
+        "an evicted domain was leased from"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_picks_the_schedule_back_up_from_the_resident_shards() {
+    // Doc 09.8: the frontier is entirely in state, so a coordinator that comes
+    // up with a store that has URLs in it schedules them without being seeded
+    // again.
+    let first = frontier(Config::default());
+    let urls = ["https://a.example.com/1", "https://b.example.org/1"];
+    first.seed(&urls, T0).await.expect("seed");
+
+    let restarted = Frontier::new(first.into_state(), Config::default());
+    assert_eq!(restarted.domains(), 0, "a fresh gate starts empty");
+
+    let recovered = restarted.resume().await.expect("resume");
+    assert_eq!(recovered, 2);
+    let leases = restarted
+        .tick(&Ask::new(T0 + 1_000, 8))
+        .await
+        .expect("tick");
+    assert_eq!(leases.len(), 2);
 }
 
 #[tokio::test]

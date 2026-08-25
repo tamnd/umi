@@ -8,11 +8,19 @@
 //!
 //! Three parts, because they fail differently:
 //!
-//! 1. The gate on its own, as the number of resident domains grows. This is
-//!    the part with an architectural question in it: `tick` walks the resident
-//!    set once per tick to keep the schedule in step with what has been warmed
-//!    and evicted, and a walk that is fine at a thousand domains and not fine
-//!    at a million would be a design problem rather than a tuning one.
+//! 1. The gate on its own, as the number of domains being scheduled grows.
+//!    This is the part that had an architectural question in it, and the
+//!    answer changed the design. `tick` used to read the resident set and walk
+//!    it once per tick to keep the schedule in step with what had been warmed
+//!    and evicted. That measured 67 us a tick at a thousand domains, 22.2 ms
+//!    at a hundred thousand and 785 ms at a million, so past about ten
+//!    thousand domains the bookkeeping ate the 100 ms tick doc 09.3 budgets
+//!    and at a million the scheduler could not finish a tick at all. Doc 08.6
+//!    makes local disk a cache with a large resident working set, so that is
+//!    the ordinary case and not the extreme one. A tick now costs what it
+//!    schedules, the walk moved to eviction and to doc 09.8's restart rebuild,
+//!    and both of those are measured below so the cost is written down rather
+//!    than moved somewhere nobody looks.
 //! 2. Admission, which is canonicalisation, key derivation and a batched
 //!    insert. Doc 11.2's canonicalisation dominates it.
 //! 3. The whole loop against the reference store, for a leases per second
@@ -43,17 +51,23 @@ fn main() {
     loop_throughput();
 }
 
-/// Part 1. The gate as the resident set grows.
+/// Part 1. The gate as the number of scheduled domains grows.
+///
+/// Two numbers per size. `us/tick` is what a scheduler tick costs, which is a
+/// lease round over 64 domains and nothing else. `ms/rebuild` is doc 09.8's
+/// restart cost and the eviction cost, which is the walk that used to be in the
+/// tick: doc 09.8 budgets about a second per thousand resident domains for it,
+/// so there is a lot of room, but it is the number that grows with the store
+/// and it is printed so a regression in it is visible.
 fn gate() {
-    println!("gate, one tick of keep-in-step plus a lease round over 64 domains");
+    println!("gate, by domains being scheduled");
     println!(
-        "{:>10}  {:>12}  {:>14}  {:>10}",
-        "domains", "us/tick", "ticks/s", "of a 100ms tick"
+        "{:>10}  {:>12}  {:>10}  {:>14}",
+        "domains", "us/tick", "of 100ms", "ms/rebuild"
     );
 
     for count in [1_000usize, 10_000, 100_000, 1_000_000] {
-        let plds: Vec<PldId> = (0..count).map(pld).collect();
-        let mut sorted = plds.clone();
+        let mut sorted: Vec<PldId> = (0..count).map(pld).collect();
         sorted.sort_unstable();
 
         let mut gate = Gate::new(Rate::default());
@@ -61,14 +75,10 @@ fn gate() {
             gate.note(*pld);
         }
 
-        let ticks: u64 = if count >= 1_000_000 { 200 } else { 2_000 };
+        let ticks: u64 = 2_000;
         let start = Instant::now();
         let mut now = 0u64;
         for _ in 0..ticks {
-            for pld in &sorted {
-                gate.note(*pld);
-            }
-            gate.retain(&sorted);
             let ready = gate.ready(now, 64);
             for (pld, allowance) in &ready {
                 gate.charge(*pld, black_box(*allowance).min(2), now);
@@ -76,21 +86,28 @@ fn gate() {
             black_box(ready.len());
             now += 100;
         }
-        let elapsed = start.elapsed();
+        let per_tick_us = start.elapsed().as_micros() / u128::from(ticks);
 
-        let per_tick_us = elapsed.as_micros() / u128::from(ticks);
-        let per_second = 1_000_000u128.checked_div(per_tick_us).unwrap_or(u128::MAX);
-        // Doc 09.3 runs the loop once per 100 ms, so the number that matters
-        // is what share of that budget the bookkeeping takes. Tenths of a
-        // percent, in integers.
+        // The rebuild, on a gate that has already been through those ticks, so
+        // the schedule is not uniform and the `retain` has real work to do.
+        let rebuilds = if count >= 1_000_000 { 2u128 } else { 20 };
+        let start = Instant::now();
+        for _ in 0..rebuilds {
+            for pld in &sorted {
+                gate.note(*pld);
+            }
+            gate.retain(&sorted);
+            black_box(gate.len());
+        }
+        let per_rebuild_ms = start.elapsed().as_micros() / rebuilds / 1000;
+
+        // Doc 09.3 runs the loop once per 100 ms, so the number that matters is
+        // what share of that budget the scheduler takes. Tenths of a percent,
+        // in integers, because doc 11.1 keeps floats out of the crate and there
+        // is no reason for the bench to disagree with it.
         let share = per_tick_us * 1000 / 100_000;
         println!(
-            "{count:>10}  {per_tick_us:>12}  {:>14}  {:>9}.{}%",
-            if per_second > 10_000_000 {
-                ">10M".to_owned()
-            } else {
-                per_second.to_string()
-            },
+            "{count:>10}  {per_tick_us:>12}  {:>9}.{}%  {per_rebuild_ms:>14}",
             share / 10,
             share % 10
         );
@@ -198,6 +215,29 @@ fn loop_throughput() {
 
     let resident = runtime.block_on(async { front.state().resident().await.expect("resident") });
     println!("  resident domains  {}", resident.len());
+
+    // The same tick with the store taken out, so the two are separable. What
+    // is left is the scheduler's own cost, and the difference is the store's.
+    // `MemoryState` scans a whole `BTreeMap` per lease call, so expect the
+    // scheduler to be a rounding error and read the loop number above as a
+    // floor rather than as a result about the frontier.
+    let mut gate = Gate::new(Rate::default());
+    for pld in &resident {
+        gate.note(*pld);
+    }
+    let start = Instant::now();
+    let mut now = 0u64;
+    for _ in 0..ticks {
+        let ready = gate.ready(now, 64);
+        for (pld, allowance) in &ready {
+            gate.charge(*pld, black_box(*allowance).min(2), now);
+        }
+        now += 100;
+    }
+    let gate_us = start.elapsed().as_micros() / u128::from(ticks);
+    let total_us = (nanos / 1000 / u128::from(ticks)).max(1);
+    println!("  us/tick in gate   {gate_us}");
+    println!("  frontier share    {}%", gate_us * 100 / total_us);
     println!();
 }
 

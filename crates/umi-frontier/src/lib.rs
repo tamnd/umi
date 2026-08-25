@@ -27,17 +27,30 @@
 //!
 //! # The loop
 //!
-//! [`Frontier::tick`] is doc 09.3's scheduler loop. It asks the state layer
-//! which domains are local, takes the ones whose rate limit has room, and
-//! leases from each of them in turn. Leasing per domain rather than in one
-//! call is what makes the domain cap enforceable, and it is also the shape doc
-//! 09.3 asks for: a warm shard is expensive to get and worth draining, so the
-//! unit of work is a domain and not a URL.
+//! [`Frontier::tick`] is doc 09.3's scheduler loop. It takes the domains whose
+//! rate limit has room, in most overdue order, and leases from each of them in
+//! turn. Leasing per domain rather than in one call is what makes the domain
+//! cap enforceable, and it is also the shape doc 09.3 asks for: a warm shard is
+//! expensive to get and worth draining, so the unit of work is a domain and not
+//! a URL.
+//!
+//! A tick costs what it schedules and not what is resident, which is the one
+//! thing in here the benchmark changed. It used to read the resident set and
+//! walk it to keep the schedule in step, which is a fine thing to do at a
+//! thousand domains and 22 percent of a 100 ms tick at a hundred thousand, and
+//! more than a whole tick at a million. Doc 08.6 makes local disk a cache with
+//! a large resident working set, so a hundred thousand domains is the ordinary
+//! case rather than the extreme one. Domains reach the schedule from
+//! [`Frontier::discover`] and leave it through [`Frontier::evict`], both of
+//! which happen when something actually changed, and
+//! [`Frontier::resume`] rebuilds the whole thing once at startup for doc 09.8.
 //!
 //! Warming is not here. Doc 09.3 puts it in a background task on purpose,
 //! since a cold shard costs an object GET and doing that inside the loop would
 //! cap the whole crawl at twenty domains a second, so `tick` skips a domain
-//! that is not resident rather than waiting for it.
+//! that is not resident rather than waiting for it. A domain in the schedule
+//! that is not resident costs one lease call that comes back empty, which is
+//! why eviction goes through the frontier.
 
 #![forbid(unsafe_code)]
 
@@ -45,7 +58,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use umi_state::{
-    AdmitReport, BATCH, Candidate, Discovery, Lease, LeaseRequest, Priority, Result, State,
+    AdmitReport, BATCH, Candidate, Discovery, EvictReport, Lease, LeaseRequest, Priority, Result,
+    State,
 };
 use umi_types::{FetcherId, PldId, RowKey, Tier, canonicalize};
 
@@ -189,6 +203,17 @@ impl<S: State> Frontier<S> {
         &self.config
     }
 
+    /// Give the store back, leaving the schedule behind.
+    ///
+    /// The schedule is the only thing in here that is not in state, and doc
+    /// 09.8 says it is rebuildable, so dropping it is a supported thing to do.
+    /// The frontier that picks the store back up calls
+    /// [`resume`](Self::resume).
+    #[must_use]
+    pub fn into_state(self) -> S {
+        self.state
+    }
+
     /// Score a batch of discovered links and admit the ones worth having.
     ///
     /// `parent_depth` is the depth of the page the links came off, so the
@@ -299,21 +324,7 @@ impl<S: State> Frontier<S> {
     /// been issued and the caller has lost track of them, so it waits for them
     /// to expire rather than retrying immediately.
     pub async fn tick(&self, ask: &Ask) -> Result<Vec<Lease>> {
-        let resident = self.state.resident().await?;
-        let ready = {
-            let mut gate = self.gate();
-            // A backend that does not shard reports nothing here, and taking
-            // that as "no domains" would stop the crawl. The set is only used
-            // to drop domains, never to introduce them, so an empty answer
-            // leaves what `discover` put in the gate alone.
-            if !resident.is_empty() {
-                for pld in &resident {
-                    gate.note(*pld);
-                }
-                gate.retain(&resident);
-            }
-            gate.ready(ask.now_ms, self.config.max_domains)
-        };
+        let ready = self.gate().ready(ask.now_ms, self.config.max_domains);
 
         let mut out: Vec<Lease> = Vec::new();
         for (pld, allowance) in ready {
@@ -333,6 +344,72 @@ impl<S: State> Frontier<S> {
             out.extend(leases);
         }
         Ok(out)
+    }
+
+    /// Rebuild the domain schedule from the resident shards, which is doc
+    /// 09.8's restart path.
+    ///
+    /// Call it once when a coordinator comes up, before the first
+    /// [`tick`](Self::tick). Doc 09.8 puts the rebuild at about a second per
+    /// thousand resident domains, and that is a startup cost rather than a
+    /// running one. Calling it again on a live frontier is safe and is what
+    /// [`evict`](Self::evict) does.
+    ///
+    /// A backend that does not shard reports nothing through
+    /// [`State::resident`], and taking that as "no domains" would empty the
+    /// schedule, so an empty answer leaves the gate alone. The frontier learns
+    /// those domains from [`discover`](Self::discover) instead.
+    ///
+    /// Returns how many domains are being scheduled afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports. An error leaves the schedule untouched.
+    pub async fn resume(&self) -> Result<usize> {
+        let resident = self.state.resident().await?;
+        let mut gate = self.gate();
+        if !resident.is_empty() {
+            for pld in &resident {
+                gate.note(*pld);
+            }
+            gate.retain(&resident);
+        }
+        Ok(gate.len())
+    }
+
+    /// Drop these domains from local disk and stop scheduling them.
+    ///
+    /// Doc 08.6 makes local disk a cache, so a domain that has been sealed and
+    /// uploaded stops being schedulable. Going through here rather than calling
+    /// [`State::evict`] directly is what keeps the schedule honest: the
+    /// scheduler no longer reads the resident set on every tick, so eviction
+    /// has to say so.
+    ///
+    /// A domain with leases outstanding is kept, per
+    /// [`EvictReport::in_use`](umi_state::EvictReport::in_use), and stays
+    /// scheduled.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    pub async fn evict(&self, plds: &[PldId]) -> Result<EvictReport> {
+        let report = self.state.evict(plds).await?;
+        // Reconciling against the whole resident set costs a walk of it, which
+        // is exactly the walk that came out of `tick`. It is affordable here
+        // because eviction happens when a shard is sealed, not sixty times a
+        // second.
+        let resident = self.state.resident().await?;
+        let mut gate = self.gate();
+        if resident.is_empty() {
+            // Either nothing is resident or the backend does not shard. Both
+            // want the same thing: forget what was asked for and keep the rest.
+            for pld in plds {
+                gate.forget(*pld);
+            }
+        } else {
+            gate.retain(&resident);
+        }
+        Ok(report)
     }
 
     /// When this domain may next be fetched, or `None` if it is not being
