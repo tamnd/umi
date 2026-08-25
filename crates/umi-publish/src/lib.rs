@@ -67,7 +67,7 @@ mod scripted;
 #[cfg(test)]
 mod tests;
 
-pub use convert::{Converted, Tally, convert};
+pub use convert::{Converted, Tally, convert, describe};
 pub use gc::{Blocked, Cleared, Evidence};
 pub use hub::{Commit, Hub, HubConfig, Remote, Retry, Upload, Who};
 pub use keys::{Role, SigningKey, VerifyingKey};

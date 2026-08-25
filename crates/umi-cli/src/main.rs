@@ -419,6 +419,23 @@ fn run(command: &Command) -> Result<(), Error> {
             let config = load(command)?;
             verify::run(target, token(&config)?, *full, &config.org.value)
         }
+        Command::Publish { dir } => {
+            match crawl::Publishing::resolve(&load(command)?, true)? {
+                Some(publishing) => {
+                    let summary = crawl::publish(std::path::Path::new(dir), &publishing)?;
+                    println!(
+                        "{} of {} files published, {} rows, {} bytes",
+                        summary.published, summary.files, summary.rows, summary.bytes_stored
+                    );
+                    Ok(())
+                }
+                // `resolve` returns a value or an error when publishing was
+                // asked for, and this command is the asking.
+                None => Err(Error::Missing(
+                    "umi publish needs publish.token and publish.key".to_owned(),
+                )),
+            }
+        }
         Command::Watch { dir, publish } => {
             let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
             finish(crawl::resume(std::path::Path::new(dir), true, publishing))
@@ -561,8 +578,8 @@ fn not_built(command: &Command) -> Error {
         Command::Crawl(_) | Command::Resume { .. } | Command::Seed { .. } => {
             "the crawl loop is milestone 1 and lands next"
         }
-        Command::Publish { .. } | Command::Manifest { .. } => {
-            "publishing runs inside umi crawl --publish, and the standalone form is milestone 2"
+        Command::Manifest { .. } => {
+            "reading a manifest chain back is milestone 2, and umi verify checks one today"
         }
         Command::Watch { .. } | Command::Block { .. } | Command::Scope { .. } => {
             "milestone 2 builds this"

@@ -9,8 +9,8 @@
 use std::time::Duration;
 
 use super::{
-    Options, Publishing, Settings, Stall, Stop, Summary, day, default_out, delay_ms, profile_toml,
-    scope_for, seed_url, settings, sources, spent, tier,
+    Layout, Log, Options, Publishing, Settings, Stall, Stop, Summary, adopt, day, default_out,
+    delay_ms, profile_toml, scope_for, seed_url, settings, sources, spent, tier,
 };
 use crate::config::{Config, Flags, Paths};
 
@@ -376,6 +376,110 @@ async fn a_recorded_segment_is_one_the_publisher_will_pick_up() {
     // collectable. Getting this backwards would delete a segment nobody kept.
     assert!(due[0].remote.is_none());
     assert!(due[0].local());
+}
+
+#[test]
+fn publishing_something_that_is_not_a_crawl_says_so() {
+    // The same guard `umi resume` has, and it matters more here: this command
+    // uploads, and the directory it is pointed at is the whole of what it
+    // uploads. It also has to fail before the hub client is built, so that a
+    // typo in a path is a message about the path rather than about a token.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let error = super::publish(dir.path(), &secrets()).expect_err("no profile.toml");
+    assert!(
+        format!("{error}").contains("is not a crawl directory"),
+        "got {error}"
+    );
+    // And it left the directory alone rather than making it look like a crawl.
+    assert!(!dir.path().join("segments").exists());
+}
+
+#[tokio::test]
+async fn adopting_a_directory_gives_every_local_file_a_ledger_row() {
+    // What makes `umi publish <dir>` work at all. A crawl that ran without
+    // `--publish` writes no segment rows, so the publisher would find nothing
+    // to do unless this step puts the files it left behind into the ledger.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let layout = Layout::create(dir.path()).expect("layout");
+    let kept = "01K2M8Q0P7R3XN500000000000";
+    let unconverted = "01K2M8Q0P7R3XN500000000001";
+
+    // One of each: a Parquet file in `data/`, which is what doc 13.5's
+    // directory normally holds, and a sealed `.umi` in `segments/`, which is
+    // what a crawl that died between sealing and converting leaves.
+    write_segment(&layout.segments.join(format!("{unconverted}.umi")), 300);
+    let staging = write_segment(&dir.path().join("scratch.umi"), 700);
+    umi_publish::convert(
+        &umi_file::Segment::open(&staging).expect("open"),
+        &layout.data.join(format!("{kept}.parquet")),
+    )
+    .expect("convert");
+    std::fs::remove_file(&staging).expect("remove");
+    // A file that did not come from a crawl. Skipped rather than adopted under
+    // an invented identifier, because a published file has to trace back to
+    // the segment it came from.
+    std::fs::write(layout.data.join("notes.parquet"), b"not ours").expect("write");
+
+    let state = umi_state::MemoryState::default();
+    let store: &dyn umi_state::State = &state;
+    let mut log = Log::open(&layout.log).expect("log");
+    assert_eq!(adopt(&layout, store, &mut log).await.expect("adopt"), 2);
+
+    let due = store
+        .segments(umi_state::SegmentQuery::Unpublished)
+        .await
+        .expect("query");
+    assert_eq!(due.len(), 2);
+    for row in &due {
+        let id = row.id.to_text();
+        assert!(id == kept || id == unconverted, "{id}");
+        // Off the ULID rather than off the clock, so publishing an old
+        // directory records when the rows were written.
+        assert_eq!(row.sealed_at_ms, row.id.timestamp_ms());
+        assert_eq!(row.rows, if id == kept { 700 } else { 300 });
+        assert_eq!(
+            row.bytes,
+            std::fs::metadata(&row.local_path).expect("stat").len()
+        );
+        assert!(row.remote.is_none());
+    }
+
+    // Twice is not four rows. A second `umi publish` on the same directory
+    // has to be a no op rather than a set of duplicate ledger rows pointing at
+    // files that are already on the hub.
+    assert_eq!(adopt(&layout, store, &mut log).await.expect("again"), 0);
+}
+
+/// A sealed segment of sample page rows at `path`.
+fn write_segment(path: &std::path::Path, rows: usize) -> std::path::PathBuf {
+    use umi_file::{Create, SegmentWriter, StreamKind, WriterConfig, sample};
+    let create = Create {
+        stream: StreamKind::Pages,
+        segment_id: [7u8; 16],
+        coordinator: [8u8; 32],
+        created_ms: umi_file::sample::T0,
+        canon_version: 1,
+        extractor_version: 4,
+        crawl_profile: 0,
+    };
+    let mut writer =
+        SegmentWriter::create(path, create, WriterConfig::for_memory(64 << 20)).expect("create");
+    writer
+        .push(&sample::batch(StreamKind::Pages, rows))
+        .expect("push");
+    writer.seal().expect("seal");
+    path.to_path_buf()
+}
+
+/// A [`Publishing`] with secrets that are the right shape and belong to
+/// nobody, for the tests that have to build one and never reach the network.
+fn secrets() -> Publishing {
+    Publishing {
+        org: "open-index".to_owned(),
+        token: "hf_this_token_is_not_real".to_owned(),
+        key: "2a".repeat(32),
+        slice: 0,
+    }
 }
 
 /// A [`Config`] built from an environment and nothing else, so that a test

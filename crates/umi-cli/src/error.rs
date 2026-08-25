@@ -55,6 +55,12 @@ pub enum Error {
     #[error("nothing to list")]
     Empty,
 
+    /// Everything was in order and there was no work left. Doc 14.9's exit 3
+    /// as well, and separate from [`Error::Empty`] only so the message can say
+    /// what there was none of. A script reads the code either way.
+    #[error("{0}")]
+    NothingToDo(&'static str),
+
     /// Some files in a listing could not be read. Doc 14.9's exit 6, because a
     /// segment that will not open is either corruption or a bug.
     #[error("{0} files could not be read")]
@@ -115,7 +121,7 @@ impl Error {
             | Self::Scope(_)
             | Self::Missing(_) => Exit::Usage,
             Self::Budget => Exit::BudgetExhausted,
-            Self::Empty => Exit::NothingToDo,
+            Self::Empty | Self::NothingToDo(_) => Exit::NothingToDo,
             Self::Fetch(_) => Exit::Network,
             // Doc 14.9: a digest or a file that will not decode is either
             // corruption or a bug, and both deserve a human rather than a

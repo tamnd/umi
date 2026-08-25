@@ -70,7 +70,7 @@ use umi_publish::repo::Corpus;
 use umi_publish::{Hub, PublishConfig, Published, Publisher, Role, SigningKey};
 use umi_state::{Candidate, SegmentRow, State, Stream};
 use umi_state_sqlite::SqliteState;
-use umi_types::{Digest, FetcherId, Tier};
+use umi_types::{Digest, FetcherId, Tier, Ulid};
 
 use crate::Error;
 
@@ -295,14 +295,10 @@ pub fn crawl(options: &Options) -> Result<Summary, Error> {
 /// As [`crawl`], plus [`Error::Io`] if the directory has no `profile.toml`,
 /// which is what tells a crawl directory apart from any other directory.
 pub fn resume(dir: &Path, watch: bool, publish: Option<Publishing>) -> Result<Summary, Error> {
+    // Before the layout, so that pointing either of these at the wrong
+    // directory says so rather than leaving two empty directories in it.
+    let scope = profile_of(dir)?;
     let layout = Layout::create(dir)?;
-    let text = std::fs::read_to_string(&layout.profile).map_err(|cause| {
-        Error::Io(std::io::Error::new(
-            cause.kind(),
-            format!("{} is not a crawl directory: {cause}", dir.display()),
-        ))
-    })?;
-    let scope = Scope::from_toml(&text).map_err(|e| Error::Scope(e.to_string()))?;
 
     // No seeding and no target. Doc 13.5's promise is that the directory is
     // the unit, so everything a resume needs is in it, and a resume that
@@ -321,6 +317,237 @@ pub fn resume(dir: &Path, watch: bool, publish: Option<Publishing>) -> Result<Su
     let mut config = settings(&options)?;
     config.watch = watch;
     run(&layout, &scope, &config, &options)
+}
+
+/// `umi publish <dir>`: push a finished crawl directory through doc 12.2.
+///
+/// The same pipeline `umi crawl --publish` runs, pointed at a directory that is
+/// already sitting on the disk. That is the case doc 14.6 is written for and it
+/// is the common one, because `umi crawl example.com` is the first command
+/// anybody runs and it keeps its output rather than publishing it. Deciding to
+/// publish afterwards should not mean crawling the site again.
+///
+/// Two things happen before the pipeline. The publishing key goes into doc
+/// 12.5's directory, for the same reason it does at the top of a crawl: a
+/// manifest signed by a key nobody can look up is a manifest nobody can check.
+/// Then every local file gets a ledger row if it does not have one, which is
+/// what [`Publisher::drain`] reads. A directory that ran without `--publish`
+/// has no segment rows at all, so without that step there would be nothing for
+/// the publisher to find and this command would cheerfully do nothing.
+///
+/// What it does not do is crawl, seed or convert. If the directory is short of
+/// pages the answer is `umi resume`, and this stays the command that publishes
+/// what is there.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the directory has no `profile.toml`, which is what tells
+/// a crawl directory apart from any other directory, [`Error::NothingToDo`]
+/// when everything in it is already published, and whatever the hub or the
+/// state ledger reports. A run where some files published and others did not
+/// prints its summary and then returns the first failure, so the exit code
+/// reflects the worst thing that happened rather than the last.
+pub fn publish(dir: &Path, publishing: &Publishing) -> Result<Summary, Error> {
+    let scope = profile_of(dir)?;
+    let layout = Layout::create(dir)?;
+    let state: Arc<dyn State> =
+        Arc::new(SqliteState::open(&layout.state).map_err(|e| Error::State(e.to_string()))?);
+    let publisher = publisher(publishing, &scope, &layout)?;
+    let clock = SystemClock;
+    let mut log = Log::open(&layout.log)?;
+
+    // Single threaded, unlike the crawl loop. There is no fetching here and no
+    // extraction, so the work is one upload at a time against one hub, and a
+    // second runtime thread would have nothing to do but exist.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Io)?;
+
+    let mut summary = Summary::default();
+    let mut collected = 0;
+    let failure = runtime.block_on(async {
+        let now_ms = clock.now_ms();
+        if publisher
+            .announce(&meta_repo(&publishing.org), now_ms)
+            .await?
+        {
+            log.line("the publishing key was added to the key directory")?;
+        }
+
+        let adopted = adopt(&layout, &*state, &mut log).await?;
+        if adopted > 0 {
+            log.line(&format!("{adopted} local files were added to the ledger"))?;
+        }
+
+        collected = publisher.collect(&*state, now_ms).await?;
+        if collected > 0 {
+            log.line(&format!(
+                "{collected} files published by an earlier run were deleted locally"
+            ))?;
+        }
+
+        let (done, failed) = publisher.drain(&*state, now_ms).await?;
+        for published in &done {
+            summary.files += 1;
+            summary.published += 1;
+            summary.rows += published.rows;
+            summary.bytes_stored += published.bytes;
+            receipt(&layout.published, published)?;
+            if let Some(blocked) = &published.blocked {
+                log.line(&format!(
+                    "{} is on the hub but the local copy stays: {blocked}",
+                    published.segment
+                ))?;
+            }
+        }
+        for (segment, error) in &failed {
+            summary.files += 1;
+            log.line(&format!("{segment} did not publish: {error}"))?;
+        }
+        // The first one rather than a count, because the exit code doc 14.9
+        // asks for depends on which kind of failure it was and a count has no
+        // kind. The rest are in the log a line above.
+        Ok::<Option<Error>, Error>(failed.into_iter().next().map(|(_, cause)| cause.into()))
+    })?;
+
+    if summary.files == 0 && collected == 0 {
+        return Err(Error::NothingToDo(
+            "everything in this crawl directory is already published",
+        ));
+    }
+    log.line(&format!(
+        "{} of {} files published, {} rows",
+        summary.published, summary.files, summary.rows
+    ))?;
+    match failure {
+        Some(cause) => Err(cause),
+        None => Ok(summary),
+    }
+}
+
+/// Give every local file in a crawl directory a ledger row, and say how many
+/// that took.
+///
+/// The publisher works off the ledger and nothing else, which is right: doc
+/// 12.7's fourth condition is a ledger row and a pipeline that could publish a
+/// file it had no row for would have nothing to write that condition into. So
+/// this is the step that turns a directory of files into a set of rows, and it
+/// is deliberately the only place in the CLI that does.
+///
+/// Both kinds of local file are picked up. `data/*.parquet` is what a plain
+/// crawl leaves and is the usual case; `segments/*.umi` is what a crawl that
+/// died between sealing a segment and converting it leaves, and there is no
+/// reason to make the operator convert it by hand first.
+///
+/// The seal time comes out of the ULID rather than off the clock. A ULID's
+/// first 48 bits are the millisecond it was minted, which is the millisecond
+/// the segment sealed, so adopting an old directory records when the rows were
+/// really written rather than when somebody got round to publishing them. A
+/// file whose name is not a ULID is skipped and reported: it did not come from
+/// a crawl, and inventing an identifier for it would put a file in the corpus
+/// that traces back to nothing.
+async fn adopt(layout: &Layout, state: &dyn State, log: &mut Log) -> Result<usize, Error> {
+    let mut rows = Vec::new();
+    for path in local_files(layout)? {
+        let Some(id) = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .and_then(Ulid::parse)
+        else {
+            log.line(&format!(
+                "{} is not named after a segment, skipping it",
+                path.display()
+            ))?;
+            continue;
+        };
+        let known = state
+            .segment(id)
+            .await
+            .map_err(|e| Error::State(e.to_string()))?;
+        if known.is_some() {
+            continue;
+        }
+        rows.push(SegmentRow {
+            id,
+            // Every file a focused crawl writes is a page segment, because the
+            // sink in `run` is created with one stream and doc 13.5's directory
+            // has one place to put files.
+            stream: Stream::Pages,
+            local_path: path.to_string_lossy().into_owned(),
+            sealed_at_ms: id.timestamp_ms(),
+            rows: rows_in(&path)?,
+            bytes: std::fs::metadata(&path).map_err(Error::Io)?.len(),
+            local_digest: Digest::from_bytes(digest_of(&path)?),
+            remote: None,
+            manifest_day: None,
+            deleted_at_ms: None,
+        });
+    }
+    let adopted = rows.len();
+    if adopted > 0 {
+        state
+            .put_segment(&rows)
+            .await
+            .map_err(|e| Error::State(e.to_string()))?;
+    }
+    Ok(adopted)
+}
+
+/// Everything in the directory that holds rows, in name order.
+///
+/// The staging directory is not one of the two, and that matters: with
+/// `--publish` it holds a copy of a file that is being uploaded right now, and
+/// adopting that copy would give one segment two ledger rows.
+fn local_files(layout: &Layout) -> Result<Vec<PathBuf>, Error> {
+    let mut found = Vec::new();
+    for (dir, extension) in [(&layout.data, "parquet"), (&layout.segments, "umi")] {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.map_err(Error::Io)?.path();
+            if path.extension().is_some_and(|kind| kind == extension) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
+
+/// How many rows a local file holds, off its metadata rather than by decoding
+/// it.
+///
+/// Cheap on purpose. This number goes in the ledger row, and the publisher
+/// compares it against the rows it decodes on the way out, so reading it by
+/// decoding the file here would make that comparison two readings of the same
+/// bytes agreeing with each other, which proves nothing. Read cheaply, check
+/// expensively, and a file whose footer disagrees with its pages is caught.
+fn rows_in(path: &Path) -> Result<u64, Error> {
+    if path.extension().is_some_and(|kind| kind == "parquet") {
+        use parquet::file::reader::FileReader as _;
+        let file = std::fs::File::open(path).map_err(Error::Io)?;
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(file)?;
+        let rows = reader.metadata().file_metadata().num_rows();
+        return Ok(u64::try_from(rows).unwrap_or(0));
+    }
+    Ok(umi_file::Segment::open(path)?.stats().rows)
+}
+
+/// The scope a crawl directory was run with.
+///
+/// `profile.toml` is doc 13.5's first entry and it is what tells a crawl
+/// directory apart from any other directory, so the error says that rather than
+/// repeating the operating system's word for a missing file.
+fn profile_of(dir: &Path) -> Result<Scope, Error> {
+    let text = std::fs::read_to_string(dir.join(PROFILE)).map_err(|cause| {
+        Error::Io(std::io::Error::new(
+            cause.kind(),
+            format!("{} is not a crawl directory: {cause}", dir.display()),
+        ))
+    })?;
+    Scope::from_toml(&text).map_err(|e| Error::Scope(e.to_string()))
 }
 
 /// The parts of [`Options`] the loop needs after the scope has been built.
@@ -629,9 +856,11 @@ fn run(
             // nobody outside this machine can check, which is the thing doc
             // 16's gate 1.5 exists to prevent, and finding that out at the end
             // of the crawl would be finding it out too late.
-            let added = publisher
-                .announce(&meta_repo(&options.publish), clock.now_ms())
-                .await?;
+            let org = options
+                .publish
+                .as_ref()
+                .map_or(umi_publish::repo::ORG, |p| p.org.as_str());
+            let added = publisher.announce(&meta_repo(org), clock.now_ms()).await?;
             if added {
                 log.line("the publishing key was added to the key directory")?;
             }
@@ -746,14 +975,7 @@ fn run(
 }
 
 /// Doc 12.4's registry, under whichever organisation is publishing.
-///
-/// Takes the option rather than the [`Publishing`] because the caller holds
-/// one and the answer for `None` never gets used: without `--publish` there is
-/// no publisher to announce a key to.
-fn meta_repo(publishing: &Option<Publishing>) -> String {
-    let org = publishing
-        .as_ref()
-        .map_or(umi_publish::repo::ORG, |p| p.org.as_str());
+fn meta_repo(org: &str) -> String {
     format!("{org}/umi-meta")
 }
 

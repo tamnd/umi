@@ -117,6 +117,22 @@ example.com   4212 done   118 in flight   9871 queued   3.9 p/s   T1 92% T2 7% T
 
 `bottleneck` is the single most useful field and it is one word: `politeness`, `cpu`, `disk`, `network`, `render-pool`, `origin-slow`, or `none`. It comes from whichever queue is saturated. A user who sees `politeness` understands immediately that raising concurrency will not help, which is the question everyone asks first.
 
+### `umi publish`
+
+```
+umi publish ./example.com
+```
+
+`--publish` on the crawl is the decision made in advance. `umi publish <dir>` is the same decision made afterwards, against a directory that is already on the disk, and it has to exist because `umi crawl example.com` with no flags is the first command anybody runs and it keeps its output. Somebody who crawls a site, looks at what came out and then decides it is worth sharing should not have to crawl the site again to share it.
+
+It reads `profile.toml` to find out what the crawl was, which is also how it tells a crawl directory from any other directory, and it refuses a directory that does not have one. Then it puts the publishing key in doc 12.5's directory if it is not already there, gives every local file a row in the state ledger, and hands the ledger to doc 12.2's pipeline. That middle step is the whole of what this command adds: a crawl that ran without `--publish` writes no segment rows, so without it there would be nothing for the publisher to find.
+
+Both kinds of local file are picked up. `data/*.parquet` is what a finished crawl holds and is the usual case, and `segments/*.umi` is what a crawl that died between sealing a segment and converting it left behind. A file whose name is not the segment's ULID is skipped and reported rather than published, because a file in the corpus has to trace back to the segment it came from and inventing an identifier for it would break that.
+
+Everything after that is doc 12, unchanged. The same eight steps, the same read back, the same signed day manifest, and the same four conditions in doc 12.7 before a local file is deleted. A directory with nothing left to publish is exit 3. A run where some files published and others did not prints what it did and then exits on the worst failure it saw, so a script does not read a partial success as a success.
+
+It does not crawl, seed or extract. If the directory is short of pages the answer is `umi resume`, and this stays the command that publishes what is there.
+
 ## 14.4 `umi fetch`
 
 The one command in doc 04's design constraint.
