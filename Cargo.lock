@@ -2807,13 +2807,20 @@ name = "umi-crawl"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "async-trait",
  "blake3",
  "bytes",
+ "futures-util",
  "tempfile",
+ "thiserror",
+ "tokio",
  "umi-dedup",
  "umi-extract",
  "umi-fetch",
  "umi-file",
+ "umi-frontier",
+ "umi-robots",
+ "umi-state",
  "umi-types",
  "url",
 ]

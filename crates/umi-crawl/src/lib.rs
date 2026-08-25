@@ -26,11 +26,21 @@
 //! beat is 250, per core, with everything else in the pipeline still to pay
 //! for.
 
+pub mod clock;
 pub mod digest;
+pub mod fetch;
 pub mod page;
+pub mod robots;
+pub mod run;
 
+#[cfg(test)]
+mod run_tests;
 #[cfg(test)]
 mod tests;
 
+pub use clock::{Clock, FixedClock, SystemClock};
 pub use digest::extract_digest;
+pub use fetch::Fetch;
 pub use page::{Crawled, PageBuilder, PageRow, Snippet, SnippetKind};
+pub use robots::RobotsCache;
+pub use run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
