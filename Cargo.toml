@@ -46,7 +46,14 @@ blake3 = "1"
 # that size is dominated by its own setup. This is not a security boundary,
 # because a fetcher that wants to lie about a page lies about the text and the
 # sketch follows honestly.
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
+#
+# twox-hash rather than xxhash-rust, which is the other well used port. XXH3 is
+# a specified algorithm with published test vectors, so both produce the same
+# u64 for the same bytes and the choice is about the crate rather than about the
+# hash. twox-hash is MIT and xxhash-rust is BSL-1.0, which is permissive and
+# fine but is not on deny.toml's list, and widening a dependency licence policy
+# to avoid picking between two equivalent crates is the wrong trade.
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 thiserror = "2"
 

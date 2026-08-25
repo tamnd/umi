@@ -18,4 +18,4 @@ harness = false
 
 [dependencies]
 blake3.workspace = true
-xxhash-rust.workspace = true
+twox-hash.workspace = true

@@ -101,7 +101,9 @@ impl Iterator for Shingles<'_> {
             // hashes differently from the same five words inside one
             // paragraph. That is one shingle in a document that has thousands
             // and it is the same on every machine, which is what matters.
-            return Some(xxhash_rust::xxh3::xxh3_64(&self.text.as_bytes()[from..to]));
+            return Some(twox_hash::XxHash3_64::oneshot(
+                &self.text.as_bytes()[from..to],
+            ));
         }
     }
 }

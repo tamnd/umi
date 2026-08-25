@@ -31,8 +31,8 @@ fn shingles_slide_by_one_token() {
     let text = "a b c d e f";
     let hashes: Vec<u64> = shingle::shingles(text).collect();
     assert_eq!(hashes.len(), 2);
-    assert_eq!(hashes[0], xxhash_rust::xxh3::xxh3_64(b"a b c d e"));
-    assert_eq!(hashes[1], xxhash_rust::xxh3::xxh3_64(b"b c d e f"));
+    assert_eq!(hashes[0], twox_hash::XxHash3_64::oneshot(b"a b c d e"));
+    assert_eq!(hashes[1], twox_hash::XxHash3_64::oneshot(b"b c d e f"));
 }
 
 #[test]
