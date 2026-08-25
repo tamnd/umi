@@ -112,8 +112,22 @@ fn ten_thousand_real_pages_extract_to_the_recorded_bytes() {
     // The corpus digest goes in the header and is checked before anything else,
     // because ten thousand mismatched lines against the wrong corpus is a
     // confusing way to be told the wrong file was downloaded.
+    //
+    // The path is reported when it does not open, because cargo runs an
+    // integration test with the package directory as the working directory
+    // rather than the workspace root, and a relative path that looks right
+    // from a shell resolves somewhere else here. Say which file was tried.
     let corpus_digest = {
-        let bytes = fs::read(&path).expect("the corpus file reads");
+        let bytes = fs::read(&path).unwrap_or_else(|error| {
+            panic!(
+                "UMI_GOLDEN_CORPUS points at {}, which did not read: {error}. \
+                 Relative paths resolve against {}, so prefer an absolute one.",
+                path.display(),
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .display(),
+            )
+        });
         hex::encode(blake3::hash(&bytes).as_bytes())
     };
 

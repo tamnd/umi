@@ -106,8 +106,12 @@ jobs:
       # minutes rather than ninety seconds, and the three operating systems
       # here are already three independently compiled binaries. The debug
       # against release comparison is in docs/spec/11-extraction-and-dedup.md.
+      #
+      # An absolute path, because cargo gives an integration test the package
+      # directory as its working directory, and `corpus/wide.parquet` from
+      # crates/umi-extract is a real directory holding the other corpus.
       - env:
-          UMI_GOLDEN_CORPUS: corpus/wide.parquet
+          UMI_GOLDEN_CORPUS: ${{ github.workspace }}/corpus/wide.parquet
         run: cargo test -p umi-extract --test wide --release -- --ignored --nocapture
 
   # The pin says 1.98 and the README says 1.98, so a build that only works
