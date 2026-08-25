@@ -49,7 +49,7 @@ use crate::gc::{self, Blocked, Evidence, LedgerLocation, ManifestCommitted, Read
 use crate::hub::{Hub, Upload};
 use crate::keys::SigningKey;
 use crate::manifest::{FileEntry, Manifest, Verification, segment_text};
-use crate::repo::{self, Family, Location, locate_in};
+use crate::repo::{self, Corpus, Family, Location};
 use crate::{Error, Result};
 
 #[cfg(test)]
@@ -65,8 +65,9 @@ pub struct PublishConfig {
     /// temporary and a segment is not, and a reconciliation pass that walked
     /// the segment directory should not have to tell them apart by extension.
     pub staging: PathBuf,
-    /// The Hugging Face organisation, which doc 14.7 spells `publish.org`.
-    pub org: String,
+    /// Which corpus this is publishing into: the organisation doc 14.7 spells
+    /// `publish.org`, and the focused crawl name from doc 13.7 if there is one.
+    pub corpus: Corpus,
     /// Doc 12.4's `NN`, the slice inside the week's repository family.
     pub slice: u16,
     /// Doc 04's coordinator key, hex, for the manifest entry.
@@ -90,7 +91,7 @@ impl Default for PublishConfig {
     fn default() -> Self {
         Self {
             staging: PathBuf::from("parquet"),
-            org: repo::ORG.to_owned(),
+            corpus: Corpus::new(repo::ORG),
             slice: 0,
             coordinator: String::new(),
             extractor: format!("umi/{}", env!("CARGO_PKG_VERSION")),
@@ -278,8 +279,7 @@ impl Publisher {
             convert(&segment, &staged)?
         };
 
-        let location = locate_in(
-            &self.config.org,
+        let location = self.config.corpus.locate(
             Family::of(stream),
             converted.first_ms,
             self.config.slice,

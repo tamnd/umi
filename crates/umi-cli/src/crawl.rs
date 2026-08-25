@@ -66,6 +66,7 @@ use umi_crawl::{
 use umi_fetch::{FetchConfig, Fetcher};
 use umi_file::{StreamKind, WriterConfig};
 use umi_publish::manifest::{FileEntry, Manifest, Verification};
+use umi_publish::repo::Corpus;
 use umi_publish::{Hub, PublishConfig, Published, Publisher, Role, SigningKey};
 use umi_state::{Candidate, SegmentRow, State, Stream};
 use umi_state_sqlite::SqliteState;
@@ -613,7 +614,7 @@ fn run(
     let mut summary = Summary::default();
     let mut manifest = Manifest::new(&scope.name, &day(started_ms), StreamKind::Pages, None);
     let publisher = match &options.publish {
-        Some(publishing) => Some(publisher(publishing, layout)?),
+        Some(publishing) => Some(publisher(publishing, &scope, layout)?),
         None => None,
     };
 
@@ -737,7 +738,13 @@ fn run(
 /// The coordinator in the manifest is this directory's key, the same one the
 /// segments are named from, so a published file can be traced back to the crawl
 /// that produced it without anything else having to be recorded.
-fn publisher(publishing: &Publishing, layout: &Layout) -> Result<Publisher, Error> {
+///
+/// The corpus is the focused one, named after the scope, because every crawl
+/// this file runs is a focused crawl. Doc 13.7 keeps those out of
+/// `umi-pages-*`: the general corpus is meant to be an unbiased sample of the
+/// web, a crawl of one domain is not, and mixing them poisons every statistic
+/// anyone computes over the corpus afterwards.
+fn publisher(publishing: &Publishing, scope: &Scope, layout: &Layout) -> Result<Publisher, Error> {
     let hub = Hub::new(publishing.token.clone())?;
     let key = SigningKey::from_hex(Role::Publishing, &publishing.key)?;
     let publisher = Publisher::new(
@@ -745,7 +752,7 @@ fn publisher(publishing: &Publishing, layout: &Layout) -> Result<Publisher, Erro
         key,
         PublishConfig {
             staging: layout.staging.clone(),
-            org: publishing.org.clone(),
+            corpus: Corpus::focused(&publishing.org, &scope.name),
             slice: publishing.slice,
             coordinator: hex::encode(coordinator_key(&layout.dir)),
             ..PublishConfig::default()

@@ -85,6 +85,8 @@ A day folder holds about 3100 files, which is under Hugging Face's 10000 files p
 
 **`open-index/umi-robots`** is the longitudinal robots.txt corpus described in doc 07.4. Every fetch of every `robots.txt`, raw text plus parsed decision summary. About 50 million hosts at a few hundred compressed bytes each per snapshot, so this is small and it is the single most cited thing we are likely to publish, because nobody else has it.
 
+**`open-index/umi-focus-<name>`** is where doc 13.7's focused crawls go, one repository per crawl rather than one per week, named after the scope. The day folders and the manifests are the same as everywhere else, so a consumer reads one the same way they read a week of the corpus. What changes is only which repository the pages land in, and it changes because a focused crawl is not an unbiased sample of the web and the general corpus is supposed to be one. Receipts and robots from a focused crawl stay in their own families, because neither is the corpus and nobody computes a corpus statistic over them.
+
 **`open-index/umi-dedup-<YYYY>w<WW>`** carries doc 11's exact digest to cluster mapping and the near duplicate cluster assignments. Roughly 48 bytes per page, so about 4.8 TB at full scale.
 
 **`open-index/umi-meta`** is one small repository that is the entry point for everything. It holds the registry of every other repository with its week, slice, row count and byte count, the manifest chain heads, the fetcher public key directory, the ban list from doc 06, the block list from doc 07.7, the tracking parameter list from doc 11.2, every schema version ever published, and the canonicalisation version history. A consumer starts here and discovers everything else. It is also the only repository we ever rewrite.

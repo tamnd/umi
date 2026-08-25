@@ -186,9 +186,9 @@ impl Files {
                 .as_str()
                 .unwrap_or_default()
                 .to_owned();
-            return Say::ok(serde_json::json!(self.entries(repo, |in_path| {
-                in_path == wanted
-            })));
+            return Say::ok(serde_json::json!(
+                self.entries(repo, |in_path| { in_path == wanted })
+            ));
         }
         if let Some(rest) = path.strip_prefix("/api/datasets/")
             && let Some((repo, prefix)) = rest.split_once("/tree/main/")

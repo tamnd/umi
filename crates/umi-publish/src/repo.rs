@@ -236,17 +236,109 @@ pub fn locate(family: Family, first_ms: u64, slice: u16, segment: Ulid) -> Locat
 /// their own hub gets the same layout under their own name.
 #[must_use]
 pub fn locate_in(org: &str, family: Family, first_ms: u64, slice: u16, segment: Ulid) -> Location {
-    let date = Date::from_ms(first_ms);
-    let repo = if family.is_sliced() {
-        format!("{org}/{}-{}-{slice:02}", family.stem(), date.iso_week())
-    } else {
-        format!("{org}/{}", family.stem())
+    Corpus::new(org).locate(family, first_ms, slice, segment)
+}
+
+/// Which corpus a publisher is writing into.
+///
+/// Two things vary and neither of them is doc 12.4's layout. The organisation
+/// varies because doc 14.7 lets an operator set `publish.org`, and the focused
+/// crawl name varies because doc 13.7 sends a focused crawl somewhere else
+/// entirely. Everything below the repository name is the same in all cases,
+/// which is why this is one struct with one method rather than two families of
+/// function.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Corpus {
+    /// The Hugging Face organisation. [`ORG`] unless configured otherwise.
+    pub org: String,
+    /// The focused crawl's name, or `None` for the general crawl.
+    pub focus: Option<String>,
+}
+
+impl Corpus {
+    /// The general crawl under an organisation.
+    #[must_use]
+    pub fn new(org: &str) -> Self {
+        Self {
+            org: org.to_owned(),
+            focus: None,
+        }
+    }
+
+    /// A focused crawl's corpus, named after its scope.
+    ///
+    /// The name is put through [`slug`] here rather than at the call site, so
+    /// that two callers holding the same scope cannot disagree about which
+    /// repository it publishes to.
+    #[must_use]
+    pub fn focused(org: &str, name: &str) -> Self {
+        Self {
+            org: org.to_owned(),
+            focus: Some(slug(name)),
+        }
+    }
+
+    /// Where a segment of this family goes.
+    ///
+    /// Only pages move when the crawl is focused. Doc 13.7's rule is about the
+    /// corpus being an unbiased sample and a focused crawl not being one, and
+    /// that argument is about pages: receipts are doc 04's audit trail and
+    /// robots is doc 07.4's longitudinal record, neither of which anyone
+    /// computes a corpus statistic over. Keeping them where they are also keeps
+    /// one schema per repository, which is what stops a reader that opens
+    /// `data/` from finding two of them.
+    #[must_use]
+    pub fn locate(&self, family: Family, first_ms: u64, slice: u16, segment: Ulid) -> Location {
+        let date = Date::from_ms(first_ms);
+        let org = &self.org;
+        let repo = match (&self.focus, family) {
+            (Some(name), Family::Pages) => format!("{org}/umi-focus-{name}"),
+            _ if family.is_sliced() => {
+                format!("{org}/{}-{}-{slice:02}", family.stem(), date.iso_week())
+            }
+            _ => format!("{org}/{}", family.stem()),
+        };
+        let day = date.folder();
+        Location {
+            path: format!("data/{day}/{segment}.parquet"),
+            repo,
+            day,
+        }
+    }
+}
+
+/// A scope name as a repository name can hold it.
+///
+/// Hugging Face takes letters, digits, dots, dashes and underscores, up to 96
+/// characters, and a scope name is whatever the operator typed at `umi crawl`.
+/// Everything outside that set becomes a dash, runs of dashes collapse so that
+/// a URL target does not turn into a row of them, and the result is lowercased
+/// because a repository name that differs from another only in case is a
+/// repository nobody can talk about out loud.
+///
+/// The 64 character cap leaves room for the `umi-focus-` prefix inside the
+/// hub's limit. A name that hits it is truncated rather than hashed, because a
+/// truncated name is still recognisable and a collision between two focused
+/// crawls whose names agree for 64 characters is the operator's to notice.
+#[must_use]
+pub fn slug(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+            out.push(c.to_ascii_lowercase());
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let trimmed = out.trim_matches(['-', '.']);
+    let capped = match trimmed.char_indices().nth(64) {
+        Some((at, _)) => &trimmed[..at],
+        None => trimmed,
     };
-    let day = date.folder();
-    Location {
-        path: format!("data/{day}/{segment}.parquet"),
-        repo,
-        day,
+    if capped.is_empty() {
+        "crawl".to_owned()
+    } else {
+        capped.to_owned()
     }
 }
 
@@ -331,6 +423,54 @@ mod tests {
         let ulid = Ulid::new(0, [0; 10]);
         let late = ms(2026, 8, 17) + 86_400_000 - 1_000;
         assert_eq!(locate(Family::Pages, late, 0, ulid).day, "20260817");
+    }
+
+    #[test]
+    fn a_focused_crawl_never_lands_in_the_general_corpus() {
+        // Doc 13.7. The general corpus is supposed to be an unbiased sample of
+        // the web and a focused crawl is by definition not one, so mixing them
+        // poisons every statistic anyone computes over the corpus. Nothing
+        // else moves: receipts and robots are not the corpus.
+        let ulid = Ulid::new(ms(2026, 8, 17), [2; 10]);
+        let focus = super::Corpus::focused("open-index", "blog.rust-lang.org");
+        let pages = focus.locate(Family::Pages, ms(2026, 8, 17), 0, ulid);
+        assert_eq!(pages.repo, "open-index/umi-focus-blog.rust-lang.org");
+        assert_eq!(pages.day, "20260817", "the day layout is unchanged");
+        assert_eq!(
+            focus
+                .locate(Family::Receipts, ms(2026, 8, 17), 3, ulid)
+                .repo,
+            "open-index/umi-receipts-2026w34-03",
+            "doc 04's audit trail is not the corpus and does not move"
+        );
+        assert_eq!(
+            focus.locate(Family::Robots, ms(2026, 8, 17), 0, ulid).repo,
+            super::ROBOTS_REPO
+        );
+
+        let general = super::Corpus::new("open-index");
+        assert_eq!(
+            general.locate(Family::Pages, ms(2026, 8, 17), 3, ulid).repo,
+            "open-index/umi-pages-2026w34-03",
+            "and without a focus nothing changed at all"
+        );
+    }
+
+    #[test]
+    fn a_focus_name_survives_being_a_repository_name() {
+        let cases = [
+            ("blog.rust-lang.org", "blog.rust-lang.org"),
+            ("https://example.com/docs/", "https-example.com-docs"),
+            ("Rust Docs", "rust-docs"),
+            ("../../etc", "etc"),
+            ("...", "crawl"),
+            ("", "crawl"),
+        ];
+        for (name, want) in cases {
+            assert_eq!(super::slug(name), want, "{name}");
+        }
+        let long = super::slug(&"a".repeat(200));
+        assert_eq!(long.len(), 64, "inside the hub's limit with the prefix on");
     }
 
     #[test]
