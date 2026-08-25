@@ -146,6 +146,12 @@ robots_checked_ms   uint64
 crawl_profile       uint32          doc 13
 ```
 
+Four of these columns hold a byte whose meaning is fixed for the life of the format, since a segment written today is read by a build from two years from now. `outcome` is the table in doc 04.5. `tier_used` and every entry of `tier_path` are doc 05.2's ladder, 0 through 4. `verification` is 0 local, 1 quorum, 2 replayed, 3 unverified. `links.kind` is 0 body, 1 nav, 2 link, 3 redirect, 4 sitemap, 5 feed, from doc 11.4. `snippets.kind` is 0 title, 1 description, 2 h1, 3 h2, 4 h3, 5 the JSON-LD headline. In every one of them codes are appended, never renumbered, and a retired code stays reserved. A reader that meets a code it does not know keeps the row.
+
+The `snippets` list repeats what `title`, `description` and `headings` already hold, and that is on purpose. It exists so that a consumer building a search result reads one column instead of four, and so that the JSON-LD headline survives, which is frequently the editorial title where `<title>` is the same thing with the site name bolted on.
+
+`body_digest` on a 304 holds the digest of the response headers rather than a body digest, because there is no body. This is the only column in the schema whose meaning depends on another column, and it is worth the exception: without it two 304s from the same origin an hour apart are byte identical rows, and doc 05.3 needs a way to notice a revalidator that changed the cache directives without changing the content. The `outcome` column says which reading applies.
+
 `receipts` is the doc 04 `Receipt` flattened, one row per delivery, including the signature, so that anyone can re verify our published corpus against the fetcher keys without trusting us. `robots` is host, fetch time, status, raw text, and the parsed decision summary from doc 07.4.
 
 Rows arrive in fetch completion order and are written in that order. We do not sort within a shoal, with one exception: the writer holds a small reorder window of 4096 rows and groups by host inside it, because host adjacency is what makes URL prefix elision pay and the window costs 25 MB of buffer for a compression win measured in doc 16's milestone 3 gate. If the win is under 5 percent the window comes out.

@@ -1,0 +1,31 @@
+[package]
+name = "umi-crawl"
+description = "The umi crawl loop: lease, fetch, extract, sketch, row"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "rows"
+harness = false
+
+[dependencies]
+arrow.workspace = true
+blake3.workspace = true
+umi-dedup.workspace = true
+umi-extract.workspace = true
+umi-fetch.workspace = true
+umi-file.workspace = true
+umi-types.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+tempfile.workspace = true
+url.workspace = true

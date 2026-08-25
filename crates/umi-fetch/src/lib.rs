@@ -63,7 +63,7 @@ pub mod headers;
 pub mod outcome;
 pub mod sniff;
 
-pub use outcome::{Failure, Hop, Outcome, Page, Stage, Version};
+pub use outcome::{Failure, Hop, Outcome, OutcomeCode, Page, Stage, Version};
 pub use sniff::Media;
 pub use umi_types::Revalidator;
 

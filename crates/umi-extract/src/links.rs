@@ -113,23 +113,58 @@ impl Rel {
 }
 
 /// What kind of link this is, from doc 11.4.
+///
+/// The discriminants are the byte doc 10.5's `links.kind` column stores, so
+/// they are a published format. New kinds are appended and an old one is never
+/// renumbered, because a segment written today is read by a build from two
+/// years from now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(u8)]
 pub enum LinkKind {
     /// An `<a>` inside the extracted content root.
-    Body,
+    Body = 0,
     /// An `<a>` outside it, which is nearly always navigation, a sidebar or a
     /// footer.
-    Nav,
+    Nav = 1,
     /// A `<link>` element in the head.
-    Link,
+    Link = 2,
     /// A redirect we followed to get here. Not produced by this crate, because
     /// the redirect chain belongs to the fetch path, which is the only thing
     /// that saw it.
-    Redirect,
+    Redirect = 3,
     /// A sitemap, from `<link rel="sitemap">`.
-    Sitemap,
+    Sitemap = 4,
     /// An RSS or Atom feed, from `<link rel="alternate">` with a feed type.
-    Feed,
+    Feed = 5,
+}
+
+impl LinkKind {
+    /// Every kind, in code order.
+    pub const ALL: [Self; 6] = [
+        Self::Body,
+        Self::Nav,
+        Self::Link,
+        Self::Redirect,
+        Self::Sitemap,
+        Self::Feed,
+    ];
+
+    /// The byte doc 10.5's `links.kind` column holds.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Recover a kind from a stored byte, or `None` for one this build does
+    /// not know, which is what reading a newer segment looks like.
+    #[must_use]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if (byte as usize) < Self::ALL.len() {
+            Some(Self::ALL[byte as usize])
+        } else {
+            None
+        }
+    }
 }
 
 /// One link.

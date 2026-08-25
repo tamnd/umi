@@ -260,6 +260,205 @@ impl fmt::Display for Tier {
     }
 }
 
+/// How a fetch ended, as one byte.
+///
+/// The list is `docs/spec/04-fetch-protocol.md` section 4.5. It lives here for
+/// the same reason [`Tier`] does: the protocol carries it as a string, the
+/// file format stores it as the `outcome` column, and the frontier decides a
+/// retry from it, so three crates need the same table and none of them should
+/// own it.
+///
+/// The numbers are a published format, not an implementation detail. A `.umi`
+/// segment written today is read by a `umi` built in two years, so codes are
+/// only ever appended and a code that is retired stays reserved. The wire
+/// strings in [`wire`](OutcomeCode::wire) are the protocol's spelling and are
+/// what doc 04's receipt carries; the numbers never appear on the wire.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[repr(u8)]
+pub enum OutcomeCode {
+    /// A body arrived.
+    #[default]
+    Ok = 0,
+    /// A conditional request held, so there is no body and no new row.
+    NotModified = 1,
+    /// A 410. The one status that means never again.
+    Gone = 2,
+    /// A 404.
+    NotFound = 3,
+    /// A 5xx. The origin is having a bad minute and this is not about us.
+    ServerError = 4,
+    /// A 429. The origin is telling us our rate is wrong.
+    RateLimited = 5,
+    /// Bot management decided about us specifically.
+    Blocked = 6,
+    /// An interstitial rather than the page.
+    Challenge = 7,
+    /// Nothing arrived in time.
+    Timeout = 8,
+    /// The name did not resolve.
+    DnsFailure = 9,
+    /// The handshake did not complete.
+    TlsFailure = 10,
+    /// The body went past the cap.
+    TooLarge = 11,
+    /// A redirect left the registrable domain the lease was for.
+    RedirectedOffHost = 12,
+    /// Robots changed under the lease and now forbids the URL.
+    RobotsChanged = 13,
+    /// The ladder ran out of tiers to try.
+    TierExhausted = 14,
+    /// The connection did not open, which is not DNS and not TLS.
+    ///
+    /// Not in doc 04's first list. It was folded into `dns_failure` and that
+    /// was wrong: a name that does not resolve is a dead site and a connection
+    /// that is refused is usually a site that is down, and the two want
+    /// different retry schedules.
+    ConnectFailure = 15,
+    /// The response was not something HTTP allows, such as a `Location` that
+    /// does not parse or a header block that does not end.
+    ///
+    /// Also not in doc 04's first list, and it has to be separate from
+    /// `server_error` because a broken proxy is worth reporting and a busy
+    /// origin is not.
+    Malformed = 16,
+}
+
+impl OutcomeCode {
+    /// Every outcome, in code order.
+    pub const ALL: [Self; 17] = [
+        Self::Ok,
+        Self::NotModified,
+        Self::Gone,
+        Self::NotFound,
+        Self::ServerError,
+        Self::RateLimited,
+        Self::Blocked,
+        Self::Challenge,
+        Self::Timeout,
+        Self::DnsFailure,
+        Self::TlsFailure,
+        Self::TooLarge,
+        Self::RedirectedOffHost,
+        Self::RobotsChanged,
+        Self::TierExhausted,
+        Self::ConnectFailure,
+        Self::Malformed,
+    ];
+
+    /// Recover an outcome from the byte a stored row holds.
+    ///
+    /// `None` for a byte this build does not know, which is what reading a
+    /// segment from a newer writer looks like. Callers should treat that as
+    /// an unknown outcome and keep the row rather than dropping it.
+    #[must_use]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if (byte as usize) < Self::ALL.len() {
+            Some(Self::ALL[byte as usize])
+        } else {
+            None
+        }
+    }
+
+    /// The byte a stored row holds.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// The spelling doc 04.5's receipt carries.
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::NotModified => "not_modified",
+            Self::Gone => "gone",
+            Self::NotFound => "not_found",
+            Self::ServerError => "server_error",
+            Self::RateLimited => "rate_limited",
+            Self::Blocked => "blocked",
+            Self::Challenge => "challenge",
+            Self::Timeout => "timeout",
+            Self::DnsFailure => "dns_failure",
+            Self::TlsFailure => "tls_failure",
+            Self::TooLarge => "too_large",
+            Self::RedirectedOffHost => "redirected_off_host",
+            Self::RobotsChanged => "robots_changed",
+            Self::TierExhausted => "tier_exhausted",
+            Self::ConnectFailure => "connect_failure",
+            Self::Malformed => "malformed",
+        }
+    }
+
+    /// Whether this outcome came with a body worth extracting.
+    ///
+    /// Only [`Ok`](OutcomeCode::Ok). A 404 body is a 404 page, and storing
+    /// millions of those as content is how a crawl fills up with the same
+    /// eight words.
+    #[must_use]
+    pub const fn has_body(self) -> bool {
+        matches!(self, Self::Ok)
+    }
+}
+
+impl fmt::Display for OutcomeCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.wire())
+    }
+}
+
+/// How much we know about who fetched a row, from
+/// `docs/spec/06-trust-and-verification.md`.
+///
+/// Stored as the `verification` column so that a consumer of the published
+/// dataset can filter on it. Somebody training a model may want only `Local`
+/// and `Quorum`; somebody measuring the fleet wants all of it.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[repr(u8)]
+pub enum Verification {
+    /// We fetched it ourselves. Nothing to verify.
+    #[default]
+    Local = 0,
+    /// Two or more independent fetchers agreed under doc 06.4.
+    Quorum = 1,
+    /// We refetched it and got the same answer the fetcher claimed.
+    Replayed = 2,
+    /// A single fetcher's word, not sampled. Most fleet rows, by design,
+    /// because verifying every row costs as much as fetching it twice.
+    Unverified = 3,
+}
+
+impl Verification {
+    /// Every level, in code order.
+    pub const ALL: [Self; 4] = [Self::Local, Self::Quorum, Self::Replayed, Self::Unverified];
+
+    /// Recover a level from the byte a stored row holds.
+    #[must_use]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        if (byte as usize) < Self::ALL.len() {
+            Some(Self::ALL[byte as usize])
+        } else {
+            None
+        }
+    }
+
+    /// The byte a stored row holds.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl fmt::Display for Verification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Local => "local",
+            Self::Quorum => "quorum",
+            Self::Replayed => "replayed",
+            Self::Unverified => "unverified",
+        })
+    }
+}
+
 /// The conditional request headers a previous fetch earned us.
 ///
 /// This is the entire input to a T0 revalidate in `docs/spec/05-fetch-tiers.md`

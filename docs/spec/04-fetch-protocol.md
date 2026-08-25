@@ -230,7 +230,7 @@ Receipt {
 
   extract: {
     extractor:     text,             // "umi-extract/0.4.1" exact version
-    digest:        bytes32,          // blake3 of canonical CBOR extraction
+    digest:        bytes32,          // blake3 over the extraction, see below
     stability:     Stability,        // see 4.6
     link_count:    uint,
     text_bytes:    uint,
@@ -244,13 +244,41 @@ Outcome = "ok" | "not_modified" | "gone" | "not_found"
         | "blocked" | "challenge" | "timeout" | "dns_failure"
         | "tls_failure" | "too_large" | "redirected_off_host"
         | "robots_changed" | "tier_exhausted"
+        | "connect_failure" | "malformed"
 ```
 
+The receipt carries the string. Doc 10.5's `outcome` column carries a byte, and the mapping is fixed for good, because a segment written today has to be readable by a build from two years from now. Codes are appended and never renumbered, and a code that is withdrawn stays reserved rather than being reused.
+
+```
+0  ok                    6  blocked            12  redirected_off_host
+1  not_modified          7  challenge          13  robots_changed
+2  gone                  8  timeout            14  tier_exhausted
+3  not_found             9  dns_failure        15  connect_failure
+4  server_error         10  tls_failure        16  malformed
+5  rate_limited         11  too_large
+```
+
+A reader that meets a code it does not know keeps the row and treats the outcome as unknown. Dropping it would mean an old `umi` silently reporting a smaller crawl than the one on disk, which is the failure mode this whole numbering exists to avoid.
+
 `server_error` and `rate_limited` were missing from the first draft of this list, and their absence forced two very different situations into `blocked`. A 5xx is the origin having a bad minute and the correct response is to back off and retry with the priority unchanged. A 429 is the origin telling us our rate is wrong and the correct response is to widen the host delay in doc 07.3 and retry. `blocked` means the origin has decided about us specifically, and the correct response is doc 05's tier ladder. Collapsing three responses into one outcome would have made the host delay adapt to server load and the tier ladder escalate against a machine that was simply busy, so the enum splits them.
+
+`connect_failure` and `malformed` were added for the same reason once the client was written. A name that does not resolve is a site that has gone, while a connection that is refused is usually a site that is down for the afternoon, and folding the second into `dns_failure` would have retired live hosts. `malformed` means the response was not something HTTP allows, a `Location` that does not parse or a redirect chain with no end, and it has to be separate from `server_error` because a broken intermediary is worth reporting to somebody and a busy origin is not.
 
 Four things about this are load bearing.
 
 **The nonce.** Without it a fetcher could cache a receipt and replay it. With it, every receipt is bound to one lease.
+
+**The extract digest.** This said blake3 over the canonical CBOR of the extraction until the first implementation was written, and then it changed, because canonical CBOR is a serialisation format with choices left in it. RFC 8949 section 4.2 gives two map orderings, leaves float shortening to the encoder, and permits definite or indefinite length for the same value. Each of those is somewhere two honest implementations produce different bytes for the same data, and the failure is not a parse error that somebody notices, it is a community fetcher whose receipts never agree with anyone's and which loses reputation for a bug in a library it did not write.
+
+So there is no encoder. The digest is blake3 over the domain separator `umi-extract-digest/1` followed by the extracted values in a fixed order, each one preceded by a tag byte saying which field it is and prefixed with its length as a little endian uint64. An absent optional field is a length of `0xFFFFFFFFFFFFFFFF`, so an absent description and an empty one differ. A repeated field is a tag, then a count, then the values. Nothing is sorted: headings and links are in document order, which doc 11 already fixes, and sorting them would hide a real disagreement between two extractors that found the same links in a different order.
+
+The result is not a format anybody can decode, which is the point, because it is only ever compared. Writing a second implementation in another language is an afternoon and there is nothing in it to disagree about.
+
+The extractor version is the first field, tagged, and that is deliberate. Doc 11.1 promises that the same input and the same version produce the same output, and promises nothing about two versions, so a digest that ignored the version would assert an agreement the spec does not make. Two fetchers running different extractor versions disagree, which is the honest answer, and doc 06.4 treats it as a disagreement rather than as a lie.
+
+Fetch timing, the response headers and the fetcher id are all outside the digest. Two fetchers on different continents see different headers from the same CDN and take different amounts of time, and folding any of that in would make agreement impossible on purpose.
+
+The frame signatures elsewhere in this document are still over canonical CBOR, and that is not the same problem. A signature is verified against the exact bytes that arrived, by the party that received them, so the sender's encoder choices do not have to match anybody else's. The extract digest is compared between two parties who never exchanged bytes, which is what makes it strict.
 
 **The chunk tree.** The coordinator can ask for chunk 47 of a 3 MB document and verify it against `chunk_root` without transferring the whole body. Cheap partial audits are what make audits affordable at scale.
 

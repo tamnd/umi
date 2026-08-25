@@ -2803,6 +2803,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "umi-crawl"
+version = "0.0.1"
+dependencies = [
+ "arrow",
+ "blake3",
+ "bytes",
+ "tempfile",
+ "umi-dedup",
+ "umi-extract",
+ "umi-fetch",
+ "umi-file",
+ "umi-types",
+ "url",
+]
+
+[[package]]
 name = "umi-dedup"
 version = "0.0.1"
 dependencies = [
