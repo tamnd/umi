@@ -7,7 +7,7 @@
 //! something we published and finds out whether the manifests, the signatures,
 //! the chain and the files agree.
 //!
-//! The checking itself is [`umi_publish::verify`]. This file is the printing
+//! The checking itself is [`umi_publish::verify()`]. This file is the printing
 //! and the exit code.
 
 use umi_publish::Hub;
