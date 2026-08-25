@@ -139,7 +139,10 @@ fn digests(parquet: &Path, repeat: usize) {
     );
 
     let bytes = std::fs::read(parquet).expect("read");
-    let cases: [(&str, fn(&[u8])); 2] = [
+    /// The name doc 12.5 publishes the digest under, and the hash itself.
+    type Case = (&'static str, fn(&[u8]));
+
+    let cases: [Case; 2] = [
         ("blake3", |b| {
             std::hint::black_box(blake3::hash(b));
         }),

@@ -127,14 +127,14 @@ pub fn convert(segment: &Segment, out: &Path) -> Result<Converted> {
     }
     writer.close()?;
 
-    let (blake3, sha256, bytes) = digest_file(out)?;
+    let digested = digest_file(out)?;
     let stats = segment.stats();
     Ok(Converted {
         rows,
         row_groups,
-        bytes,
-        blake3,
-        sha256,
+        bytes: digested.bytes,
+        blake3: digested.blake3,
+        sha256: digested.sha256,
         first_ms: stats.first_ms,
         last_ms: stats.last_ms,
     })
@@ -169,7 +169,7 @@ pub fn properties(stream: StreamKind) -> WriterProperties {
         // One shoal is one row group and `flush` is what ends it, so this only
         // has to be large enough never to fire first. Doc 10.3 caps a shoal at
         // 16384 rows.
-        .set_max_row_group_size(1 << 20)
+        .set_max_row_group_row_count(Some(1 << 20))
         // Off by default and on by name below. Doc 12.3 lists seven columns,
         // and leaving it on everywhere would mean parquet-rs building a
         // dictionary for `url` and `markdown` and then discarding it.
@@ -196,7 +196,18 @@ pub fn properties(stream: StreamKind) -> WriterProperties {
 }
 
 /// blake3, sha256 and length of a finished file, in one pass over it.
-fn digest_file(path: &Path) -> Result<([u8; 32], [u8; 32], u64)> {
+/// What one pass over the finished Parquet file produced.
+///
+/// Doc 12.5 publishes both digests, blake3 because it is what we compute
+/// everywhere else and sha256 because it is what every other tool on Earth can
+/// check without installing anything, so both come out of the same read.
+struct Digested {
+    blake3: [u8; 32],
+    sha256: [u8; 32],
+    bytes: u64,
+}
+
+fn digest_file(path: &Path) -> Result<Digested> {
     use std::io::Read as _;
 
     let mut file = File::open(path)?;
@@ -217,7 +228,11 @@ fn digest_file(path: &Path) -> Result<([u8; 32], [u8; 32], u64)> {
         total += read as u64;
     }
     let sha: [u8; 32] = sha.finalize().into();
-    Ok((*blake.finalize().as_bytes(), sha, total))
+    Ok(Digested {
+        blake3: *blake.finalize().as_bytes(),
+        sha256: sha,
+        bytes: total,
+    })
 }
 
 impl From<parquet::errors::ParquetError> for Error {

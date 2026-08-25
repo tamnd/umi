@@ -346,7 +346,10 @@ mod tests {
         // built ones, so that a fifth condition added to `clear` without a
         // matching test here shows up as this test still passing while the new
         // field is never exercised. The count assertion is what catches that.
-        let cases: [(&str, fn(&mut Evidence)); 4] = [
+        /// A name for the condition and the mutation that removes it.
+        type Case = (&'static str, fn(&mut Evidence));
+
+        let cases: [Case; 4] = [
             ("remote", |e| e.remote = None),
             ("read back", |e| e.read_back = None),
             ("manifest", |e| e.manifest = None),
