@@ -352,20 +352,14 @@ fn ls_finds_a_segment_and_counts_its_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = segment(dir.path(), 500);
     assert!(path.exists());
-    inspect::ls(&dir.path().display().to_string()).unwrap();
+    ls_local(dir.path()).unwrap();
 }
 
 #[test]
 fn ls_on_an_empty_directory_is_exit_3_and_not_a_failure() {
     let dir = tempfile::tempdir().unwrap();
-    let failed = inspect::ls(&dir.path().display().to_string()).unwrap_err();
+    let failed = ls_local(dir.path()).unwrap_err();
     assert_eq!(failed.exit(), Exit::NothingToDo);
-}
-
-#[test]
-fn ls_on_a_repository_name_says_which_piece_is_missing() {
-    let failed = inspect::ls("open-index/umi-pages-2026w34-03").unwrap_err();
-    assert!(matches!(failed, Error::NotBuilt(_)));
 }
 
 #[test]
@@ -414,7 +408,17 @@ fn a_converted_parquet_file_reads_back_the_same_rows() {
     let from_parquet = capture(|sink| cat_to(&parquet, Some(3), Some(&["url"]), sink));
     assert_eq!(from_umi, from_parquet);
 
-    inspect::ls(&dir.path().display().to_string()).unwrap();
+    ls_local(dir.path()).unwrap();
+}
+
+/// `umi ls` against a path, with no token and the default organisation, which
+/// is every local case.
+fn ls_local(dir: &Path) -> Result<(), Error> {
+    inspect::ls(&inspect::Ls {
+        target: &dir.display().to_string(),
+        token: None,
+        org: "open-index",
+    })
 }
 
 /// `cat` writes to stdout, so the tests reach one layer under it. The

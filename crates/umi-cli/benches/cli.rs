@@ -95,7 +95,12 @@ fn main() {
     // This prints its listing three times. That is the command doing its job
     // and there is no portable way to silence it without unsafe, so it is left
     // above the number rather than hidden.
-    let (elapsed, _) = best(3, || (inspect::ls(&target), 0));
+    let listing = inspect::Ls {
+        target: &target,
+        token: None,
+        org: "open-index",
+    };
+    let (elapsed, _) = best(3, || (inspect::ls(&listing), 0));
     println!("{:<22} {:>12.2}", "2 files", elapsed.as_secs_f64() * 1000.0);
     println!(
         "which is {:.0} us a file, and a 300 GB slice is about 2400 of them",
