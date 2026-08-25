@@ -32,7 +32,7 @@ Records are ordered by `(PldId, HostId, UrlKey)`. That ordering is the reason ev
 
 Canonicalisation is in doc 11.2 and is part of the key. Changing it changes every key in the system, so it is versioned, and a canonicalisation change is a migration with a plan, not a patch.
 
-## 8.3 The four tables
+## 8.3 The five tables
 
 **Seen set.** `UrlKey -> ()`. The membership structure. This is the hot one.
 
@@ -65,6 +65,26 @@ That is 76 bytes laid out naively and 24 to 32 bytes once the shard encoding in 
 
 **Holding pen.** `(FetcherId, UrlKey) -> PendingDiscovery`. Doc 06.2 layer 7. Bounded and expiring, so it never grows without limit.
 
+**Segments.** `SegmentUlid -> SegmentRow`. This one was not in the first draft of this doc, and doc 12.7's fourth GC condition does not work without it: a local file is only deleted once "the state ledger rows for that segment carry the remote repository, path and digest", and there was nowhere for those to live.
+
+```rust
+struct SegmentRow {
+    stream:        StreamKind,   // Pages | Receipts | Robots
+    local_path:    String,
+    sealed_at_ms:  u64,
+    rows:          u64,
+    bytes:         u64,
+    local_digest:  Digest,       // blake3 of the sealed .umi file
+    remote_repo:   Option<String>,
+    remote_path:   Option<String>,
+    remote_digest: Option<Digest>,   // read back, not the upload's echo
+    manifest_day:  Option<u32>,      // YYYYMMDD of the manifest that lists it
+    deleted_at_ms: Option<u64>,
+}
+```
+
+It is tiny by construction. A coordinator seals about a thousand segments a day and a row is under 200 bytes, so a year of history is 70 MB and there is no reason to prune it, which is convenient because the row surviving the file is exactly what lets an operator answer "where did that segment go" after the local copy is gone. The three `remote_*` columns move from null to set in one write, after the read back digest has been compared, so a crash can leave a segment unpublished but can never leave it half published in a way that satisfies condition 4.
+
 ## 8.4 The trait
 
 Narrow on purpose. It is not a plugin system and it is not a database abstraction. It is the four operations the crawler actually performs, in batch form, because per row operations at 12500 per second are the thing that kills naive designs.
@@ -96,12 +116,22 @@ pub trait State: Send + Sync + 'static {
     async fn evict(&self, plds: &[PldId]) -> Result<EvictReport>;
     async fn resident(&self) -> Result<Vec<PldId>>;
 
+    /// Segment bookkeeping. `published` is the write that makes doc 12.7's
+    /// fourth GC condition true, and it takes the read back digest so that a
+    /// caller cannot make it true by passing the one it uploaded.
+    async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()>;
+    async fn published(&self, id: SegmentUlid, at: &RemoteObject) -> Result<()>;
+    async fn unpublished(&self) -> Result<Vec<SegmentRow>>;
+
     /// Consistent point in time snapshot for publishing and analytics.
-    async fn checkpoint(&self) -> Result<Checkpoint>;
+    /// `now_ms` is passed in rather than read, for the reason doc 11.1 gives.
+    async fn checkpoint(&self, now_ms: u64) -> Result<Checkpoint>;
 
     async fn stats(&self) -> Result<StateStats>;
 }
 ```
+
+Every call that stamps a time takes it as an argument. Doc 11.1 requires that the same input bytes and the same version produce the same output on every machine, and a store that reads the clock cannot be tested against that requirement, because the test would have to assert on a value the test cannot control. The clock is read once, at the top of the crawl loop, and passed down. This costs one parameter on a handful of methods and buys a state layer whose every behaviour is reproducible from a fixture.
 
 Everything else is derived. There is deliberately no `get(url)`, no `scan()`, no generic query. If a caller needs to ask something else, it asks DuckDB against a published checkpoint, not the live store.
 
@@ -127,7 +157,9 @@ Four, with a clear statement of where each one stops. That statement matters mor
 
 `rusqlite` with WAL, one database file per coordinator, one table per structure, `WITHOUT ROWID` on the seen set keyed by `UrlKey`.
 
-Configuration that is not optional: `journal_mode=WAL`, `synchronous=NORMAL`, `mmap_size` set to the smaller of the file size and available memory, `cache_size` negative to express KiB, `wal_autocheckpoint` tuned so checkpoints do not stall admission. `admit` is one prepared `INSERT OR IGNORE` inside one transaction per batch, and the batch is the whole point: 4096 inserts in one transaction is roughly three orders of magnitude faster than 4096 transactions.
+Configuration that is not optional: `journal_mode=WAL`, `mmap_size` set to the smaller of the file size and available memory, `cache_size` negative to express KiB, `wal_autocheckpoint` tuned so checkpoints do not stall admission.
+
+`synchronous` is the one setting that cannot be stated once for the whole connection, and an earlier draft of this doc said `NORMAL` and left it there, which contradicts 8.7. Under WAL with `synchronous=NORMAL` a committed transaction is not on the platter until the next checkpoint, so a power loss loses it. That is the correct trade for `admit`, which 8.7 explicitly allows to lose a group commit window, and the wrong trade for `complete` and for lease issue, which 8.7 requires to be durable before they return. So the setting is per transaction: `PRAGMA synchronous=NORMAL` is the connection default and the `complete` and `lease` paths run `PRAGMA synchronous=FULL` for the duration of their transaction. Two connections with different defaults would be tidier and would cost a second write lock on a single writer database, which is worse. `admit` is one prepared `INSERT OR IGNORE` inside one transaction per batch, and the batch is the whole point: 4096 inserts in one transaction is roughly three orders of magnitude faster than 4096 transactions.
 
 **Where it stops: about 100 million URLs on this hardware.** Beyond that the seen set index stops fitting in page cache and admission goes to disk on every candidate, which at 12500 per second is over. On server1's SSD it might reach 200 million. On server2's rotational disk it will struggle at 50 million.
 

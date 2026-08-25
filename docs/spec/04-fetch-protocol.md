@@ -240,10 +240,13 @@ Receipt {
 }
 
 Outcome = "ok" | "not_modified" | "gone" | "not_found"
+        | "server_error" | "rate_limited"
         | "blocked" | "challenge" | "timeout" | "dns_failure"
         | "tls_failure" | "too_large" | "redirected_off_host"
         | "robots_changed" | "tier_exhausted"
 ```
+
+`server_error` and `rate_limited` were missing from the first draft of this list, and their absence forced two very different situations into `blocked`. A 5xx is the origin having a bad minute and the correct response is to back off and retry with the priority unchanged. A 429 is the origin telling us our rate is wrong and the correct response is to widen the host delay in doc 07.3 and retry. `blocked` means the origin has decided about us specifically, and the correct response is doc 05's tier ladder. Collapsing three responses into one outcome would have made the host delay adapt to server load and the tier ladder escalate against a machine that was simply busy, so the enum splits them.
 
 Four things about this are load bearing.
 

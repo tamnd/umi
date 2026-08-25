@@ -34,6 +34,8 @@ priority = w_host * host_quality
 
 `depth_decay` is `1 / (1 + depth)` where depth is link distance from the nearest seed. Cheap, effective, and the main defence against crawler traps that generate infinite paths.
 
+In fixed point that term needs a stated ceiling, and the first draft did not give one. The score is a `u16` and doc 11.1 forbids floats, so the term is computed as `60000 / (1 + depth)` in integer arithmetic and the depth term's own maximum is 60000, which is depth zero. That leaves 5535 of the `u16` range as headroom so that the five terms can be summed and weighted without the intermediate overflowing, and it makes the term reach zero at depth 60000 rather than asymptotically approaching it in a float. Stating the ceiling is what makes the weights comparable across terms: a weight of 0.2 on depth means a fifth of 60000 and not a fifth of something unspecified.
+
 `link_evidence` is the count of distinct PLDs linking to the URL, log scaled and capped. It arrives late, since we only learn it as we crawl, so it mostly affects recrawl priority rather than first crawl. It is capped hard because it is the term an attacker would target.
 
 `freshness_urgency` is zero for a URL never fetched and rises with overdue-ness for one that has, per 9.4. This is the term that makes revisits compete with discovery on one scale, which is the whole reason there is no separate refresh pipeline.
