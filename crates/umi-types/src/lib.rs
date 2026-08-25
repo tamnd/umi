@@ -310,8 +310,26 @@ impl RowKey {
     ///
     /// Returns [`CanonError`] when the URL is not a crawlable http(s) URL.
     pub fn for_url(url: &str, base: Option<&str>) -> Result<Self, CanonError> {
-        let canonical = canonicalize(url, base)?;
-        let host = host_of(&canonical).ok_or(CanonError::NoHost)?;
+        Self::for_canonical(&canonicalize(url, base)?)
+    }
+
+    /// Derive the three keys from a URL that has already been through
+    /// [`canonicalize`].
+    ///
+    /// The frontier canonicalises once and then needs both the string and the
+    /// keys, and canonicalising a second time to get the keys would double the
+    /// cost of the hottest call in the system: doc 08.1 puts it at about 12500
+    /// candidate URLs a second per host. Passing a string that has not been
+    /// canonicalised produces keys nothing else will match, which is why
+    /// [`for_url`](Self::for_url) is still the way in for everything that has
+    /// a raw URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CanonError::NoHost`] if the string has no host, which for a
+    /// genuinely canonical URL cannot happen.
+    pub fn for_canonical(canonical: &str) -> Result<Self, CanonError> {
+        let host = host_of(canonical).ok_or(CanonError::NoHost)?;
         Ok(Self {
             pld: PldId::derive(pay_level_domain(host).as_bytes()),
             host: HostId::derive(host.as_bytes()),
