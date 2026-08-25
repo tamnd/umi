@@ -2085,6 +2085,11 @@ dependencies = [
 [[package]]
 name = "umi-seed"
 version = "0.0.1"
+dependencies = [
+ "tempfile",
+ "thiserror",
+ "umi-types",
+]
 
 [[package]]
 name = "umi-state"
