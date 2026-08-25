@@ -19,7 +19,7 @@ Durations assume one person, not full time. They are estimates and they are the 
 **Gates.**
 
 1. **Bandwidth, measured on all three boxes.** `umi doctor` reports sustained inbound and outbound for at least 60 seconds on server1, server2 and server3, and the results are written into doc 01. This is the first task of the first milestone because doc 01's entire capacity plan rests on inbound not being metered at 32 TB per month. If it is, the sustainable rate is 81 pages per second per host, not 250, and doc 01 changes before anything else is built.
-2. **Determinism.** The golden corpus of 10000 documents produces byte identical extraction output across three separate machines and two separate builds. Doc 11.1 is either true or the fetch protocol does not work.
+2. **Determinism.** The golden corpus of 10000 documents produces byte identical extraction output across three separate machines and two separate builds. Doc 11.1 is either true or the fetch protocol does not work. **Met.** The corpus is `open-index/umi-golden`, its digests are in `crates/umi-extract/golden/wide.txt`, and it agrees on server1, server2 and server3, in a debug and a release build, and on Linux, macOS and Windows in CI.
 3. **Crash safety.** A 100 iteration test that SIGKILLs the writer at a uniformly random byte offset during a crawl. Every run must recover with at most one shoal lost, no corrupt segment accepted by the reader, and no torn tail surviving.
 4. **The GC rule holds.** A test that fakes an upload success with a corrupted remote copy must leave the local file on disk and exit 6.
 5. **A real published dataset.** One `open-index/umi-focus-*` repository, with a signed manifest, that `umi verify` passes against from a clean machine.
