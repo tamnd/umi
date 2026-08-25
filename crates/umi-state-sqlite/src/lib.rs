@@ -988,7 +988,10 @@ impl State for SqliteState {
             let mut stmt = guard.conn.prepare_cached(text).state()?;
             let found = match query {
                 SegmentQuery::SealedBetween { from_ms, to_ms } => stmt
-                    .query_map(params![row::to_ms(from_ms), row::to_ms(to_ms)], row::segment)
+                    .query_map(
+                        params![row::to_ms(from_ms), row::to_ms(to_ms)],
+                        row::segment,
+                    )
                     .state()?
                     .collect::<rusqlite::Result<Vec<_>>>(),
                 _ => stmt

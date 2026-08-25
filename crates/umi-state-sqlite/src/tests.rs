@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use umi_state::{
-    Candidate, Discovery, FetchOutcome, FetchResult, HostRow, LeaseRequest, Revalidator, SegmentRow,
-    State, Stream, conformance,
+    Candidate, Discovery, FetchOutcome, FetchResult, HostRow, LeaseRequest, Revalidator,
+    SegmentRow, State, Stream, conformance,
 };
 use umi_types::{Digest, FetcherId, RowKey, Tier, Ulid};
 
@@ -182,7 +182,10 @@ async fn a_store_from_an_older_umi_gains_the_new_tables_and_keeps_its_rows() {
 
     let state = SqliteState::open(&path).expect("a version 1 store opens");
     let stats = state.stats().await.expect("stats");
-    assert_eq!(stats.urls_seen, 1, "the migration lost the url that was there");
+    assert_eq!(
+        stats.urls_seen, 1,
+        "the migration lost the url that was there"
+    );
 
     let version: u32 = state
         .lock()

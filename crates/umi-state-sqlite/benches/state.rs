@@ -127,7 +127,11 @@ async fn admission(state: &SqliteState, urls: usize, repeat: usize) {
         let report = state.admit(&candidates).await.expect("admit");
         let each = start.elapsed().as_secs_f64() / batch.len() as f64;
         best = best.min(each);
-        assert_eq!(report.total() as usize, batch.len(), "every candidate lands");
+        assert_eq!(
+            report.total() as usize,
+            batch.len(),
+            "every candidate lands"
+        );
     }
     line("new urls", best);
 
@@ -274,7 +278,8 @@ async fn segments(state: &SqliteState, history: usize, repeat: usize) {
     }
     println!(
         "  {:<24} {:>10.2} us per row, batched {BATCH} at a time, durable",
-        "put_segment", best_put * 1e6
+        "put_segment",
+        best_put * 1e6
     );
 
     // One at a time is what actually happens: a segment seals, and one record
@@ -288,7 +293,8 @@ async fn segments(state: &SqliteState, history: usize, repeat: usize) {
     }
     println!(
         "  {:<24} {:>10.2} ms, which is the fsync, once per sealed segment",
-        "put_segment, one row", single * 1000.0
+        "put_segment, one row",
+        single * 1000.0
     );
 
     for (name, query) in [

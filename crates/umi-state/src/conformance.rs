@@ -837,7 +837,11 @@ async fn a_segment_record_round_trips(state: &dyn State) -> Outcome {
         .await
         .map_err(|e| format!("segment failed: {e}"))?
         .ok_or_else(|| "a segment that was just written read back as none".to_owned())?;
-    ensure_eq!(read, row, "the segment record did not survive the round trip");
+    ensure_eq!(
+        read,
+        row,
+        "the segment record did not survive the round trip"
+    );
     Ok(())
 }
 
@@ -871,13 +875,15 @@ async fn put_segment_replaces_rather_than_merges(state: &dyn State) -> Outcome {
         .await
         .map_err(|e| format!("segment failed: {e}"))?
         .ok_or_else(|| "the segment vanished".to_owned())?;
-    ensure_eq!(read, published, "the second write did not replace the first");
+    ensure_eq!(
+        read,
+        published,
+        "the second write did not replace the first"
+    );
     Ok(())
 }
 
-async fn a_sealed_segment_is_unpublished_until_it_has_a_remote_copy(
-    state: &dyn State,
-) -> Outcome {
+async fn a_sealed_segment_is_unpublished_until_it_has_a_remote_copy(state: &dyn State) -> Outcome {
     state
         .put_segment(&[sealed(1), sealed(2)])
         .await
@@ -906,9 +912,7 @@ async fn a_sealed_segment_is_unpublished_until_it_has_a_remote_copy(
     Ok(())
 }
 
-async fn a_segment_is_collectable_only_once_the_ledger_is_complete(
-    state: &dyn State,
-) -> Outcome {
+async fn a_segment_is_collectable_only_once_the_ledger_is_complete(state: &dyn State) -> Outcome {
     // Doc 12.7's fourth condition, which is the one this table exists for. A
     // segment on the hub whose manifest has not been pushed yet is not
     // collectable, because the chain that proves it is there is not committed.
