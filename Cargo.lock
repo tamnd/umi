@@ -2784,7 +2784,9 @@ version = "0.0.1"
 dependencies = [
  "arrow",
  "blake3",
+ "bytes",
  "clap",
+ "futures-util",
  "hex",
  "http",
  "parquet",

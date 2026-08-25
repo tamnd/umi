@@ -58,6 +58,14 @@ enum Command {
         /// The directory a crawl would write into, for the disk check.
         #[arg(long)]
         out: Option<String>,
+        /// Measure sustained inbound and outbound for real, doc 16's gate 1.1.
+        /// This moves several gigabytes and takes a couple of minutes, so it is
+        /// off unless asked for.
+        #[arg(long)]
+        bandwidth: bool,
+        /// Seconds per direction. Doc 16's gate wants at least 60.
+        #[arg(long, default_value_t = 60, value_name = "SECONDS")]
+        bandwidth_secs: u64,
     },
     /// Print the effective configuration and where every value came from.
     Config,
@@ -338,11 +346,17 @@ fn main() -> ExitCode {
 
 fn run(command: &Command) -> Result<(), Error> {
     match command {
-        Command::Doctor { offline, out } => {
+        Command::Doctor {
+            offline,
+            out,
+            bandwidth,
+            bandwidth_secs,
+        } => {
             let config = load(command)?;
             let checks = doctor::doctor(&doctor::Options {
                 offline: *offline,
                 out: out.clone().unwrap_or(config.out.value).into(),
+                bandwidth: bandwidth.then_some(*bandwidth_secs),
             })?;
             match doctor::worst(&checks) {
                 doctor::Verdict::Bad => Err(Error::NotReady),

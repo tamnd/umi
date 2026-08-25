@@ -10,6 +10,7 @@
 //! returns a bare failure: every error path picks one of doc 14.9's exit codes,
 //! in [`Error::exit`].
 
+pub mod bandwidth;
 pub mod config;
 pub mod crawl;
 pub mod doctor;

@@ -40,6 +40,12 @@ umi-state.workspace = true
 umi-state-sqlite.workspace = true
 
 blake3.workspace = true
+# The upload half of doc 16's gate 1.1 sends one shared buffer from every
+# stream, and `Bytes` is what makes that one allocation rather than eight.
+bytes.workspace = true
+# `join_all` and `bytes_stream` in the bandwidth measurement. Nothing else
+# in the crate needs a stream combinator.
+futures-util.workspace = true
 
 arrow.workspace = true
 clap.workspace = true
