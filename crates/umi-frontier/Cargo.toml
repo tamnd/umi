@@ -13,3 +13,15 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+umi-state = { workspace = true }
+umi-types = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+# Not criterion. The question doc 16 gate 1.1 asks is leases per second against
+# a store, and the answer is a count over a wall clock interval rather than a
+# statistical comparison of two microsecond operations.
+[[bench]]
+name = "schedule"
+harness = false
