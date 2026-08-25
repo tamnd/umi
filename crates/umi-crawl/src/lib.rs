@@ -32,9 +32,12 @@ pub mod fetch;
 pub mod page;
 pub mod robots;
 pub mod run;
+pub mod scope;
 
 #[cfg(test)]
 mod run_tests;
+#[cfg(test)]
+mod scope_tests;
 #[cfg(test)]
 mod tests;
 
@@ -44,3 +47,6 @@ pub use fetch::Fetch;
 pub use page::{Crawled, PageBuilder, PageRow, Snippet, SnippetKind};
 pub use robots::RobotsCache;
 pub use run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
+pub use scope::{
+    Budget, ContentFilter, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,
+};

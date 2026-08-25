@@ -238,6 +238,84 @@ fn main() {
          window full rather than joining chunks, and the gap grows with the batch.",
         barrier.elapsed.as_secs_f64() / no_barrier.elapsed.as_secs_f64().max(1e-9)
     );
+
+    // Part 4. Doc 13.2 says a scope is evaluated per candidate during
+    // admission, and doc 13's own number for admission is 12500 candidates a
+    // second. At 250 pages a second and 140 links a page the loop offers 35000
+    // candidates a second, so a scope has to be cheaper than that or focused
+    // mode is slower than general mode for a reason nobody would guess.
+    let candidates: Vec<&str> = extracted
+        .iter()
+        .flat_map(|e| e.links.links.iter().map(|l| l.url.as_str()))
+        .collect();
+
+    println!();
+    println!(
+        "part 4: Scope::allows over {} real candidates from those pages",
+        candidates.len()
+    );
+    println!(
+        "{:<40}{:>12}{:>14}{:>12}",
+        "scope", "ns/url", "urls/s", "of 35k"
+    );
+
+    for (name, scope) in scopes() {
+        let measured = best_of(
+            5,
+            || (),
+            |()| {
+                for url in &candidates {
+                    // Exactly what `Crawler::follow` asks, including the check
+                    // that skips the parse. Measuring `allows` on its own would
+                    // charge the general crawl for a URL parse it never does.
+                    std::hint::black_box(!scope.filters_links() || scope.allows(url));
+                }
+                candidates.len()
+            },
+        );
+        println!(
+            "{:<40}{:>12.0}{:>14.0}{:>11.1}%",
+            name,
+            measured.per_item().as_secs_f64() * 1e9,
+            measured.per_second(),
+            35_000.0 / measured.per_second() * 100.0,
+        );
+    }
+
+    println!();
+    println!(
+        "the URL parse is the whole cost. A matcher runs on a host string and a\n\
+         path that url::Url already has, so sixteen matchers cost about what one\n\
+         costs and the first one costs everything. The general crawl does not\n\
+         parse at all, which is what Scope::filters_links is for, and a focused\n\
+         crawl spends around two percent of a core on staying inside its scope."
+    );
+}
+
+/// The scopes part 4 measures, from cheapest to most expensive.
+fn scopes() -> Vec<(&'static str, umi_crawl::Scope)> {
+    let host_suffix = umi_crawl::Scope::for_target("example.com").expect("target");
+    let regex = umi_crawl::Scope::from_toml(
+        "name = \"regex\"\ninclude = [{ url_regex = \"https://h[0-9]+\\\\.example/\" }]",
+    )
+    .expect("profile");
+    let many = umi_crawl::Scope::from_toml(&format!(
+        "name = \"many\"\ninclude = [{}]",
+        (0..16)
+            .map(|n| format!("{{ host_suffix = \"h{n}.example\" }}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
+    .expect("profile");
+    vec![
+        (
+            "general, no include and no exclude",
+            umi_crawl::Scope::general(),
+        ),
+        ("one host_suffix", host_suffix),
+        ("16 host_suffix, all of them tried", many),
+        ("one url_regex", regex),
+    ]
 }
 
 /// Hosts for part 1. Enough that a tick is a real batch, few enough that a
@@ -417,7 +495,7 @@ fn config(in_flight: usize, hosts: usize) -> CrawlConfig {
         max_tier: Tier::Plain,
         lease_for: Duration::from_secs(60),
         max_depth: umi_frontier::MAX_DEPTH,
-        crawl_profile: 0,
+        scope: Arc::new(umi_crawl::Scope::general()),
     }
 }
 

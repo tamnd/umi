@@ -64,6 +64,14 @@ url = "2"
 idna = "1"
 percent-encoding = "2"
 
+# Doc 13.2's `url_regex` matcher. The `regex` crate rather than anything with
+# backtracking in it, and this is a safety property rather than a preference: a
+# profile is a file an operator writes and admission runs it against every link
+# on every page, so a pattern that could backtrack would be a way to stop a
+# crawl by writing eight characters in a config file. Linear time matching
+# means the worst a bad pattern costs is a bad pattern.
+regex = "1"
+
 # Extraction. html5ever is the parser doc 11.3 names, and markup5ever_rcdom
 # is the tree it builds into.
 html5ever = "0.39"
