@@ -79,6 +79,16 @@ rayon = "1"
 # two versions of that in one tree would be silly.
 tempfile = "3"
 
+# Doc 12.5 signs every manifest with Ed25519 and doc 04 signs every receipt
+# with it, so there is one signature scheme in the tree. Verification is the
+# strict form, which rejects the small order public keys that make a signature
+# verify under more than one key.
+ed25519-dalek = "3"
+# Only for doc 12.5's second digest. blake3 is what umi computes everywhere
+# else and sha256 is what every other tool on Earth can check without
+# installing anything, which is the whole reason both are published.
+sha2 = "0.11"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"

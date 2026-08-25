@@ -13,3 +13,25 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+arrow = { workspace = true }
+blake3 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+parquet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+umi-file = { workspace = true }
+umi-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# No criterion. The numbers this has to defend are doc 12.2's per segment
+# budgets, which are wall clock seconds on one core and not the microsecond
+# differences criterion exists to resolve, and the same reasoning is written
+# out at the top of umi-file's bench.
+[[bench]]
+name = "publish"
+harness = false

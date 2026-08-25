@@ -11,8 +11,10 @@
 use core::fmt;
 
 pub mod canon;
+pub mod ulid;
 
 pub use canon::{CanonError, canonicalize, pay_level_domain};
+pub use ulid::Ulid;
 
 /// The canonicalisation version these keys are derived under.
 ///
