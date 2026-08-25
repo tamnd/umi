@@ -261,11 +261,30 @@ INSERT INTO etags (etag) VALUES (?1)
 ON CONFLICT(etag) DO UPDATE SET etag = excluded.etag
 RETURNING id";
 
-/// The frontier broken down by state, for [`stats`](crate::SqliteState::stats).
+/// The maintained counters, for [`stats`](crate::SqliteState::stats).
 ///
-/// One grouped scan rather than five counting queries. It is still a scan of
-/// the ledger, so this is not something to call in a loop.
-pub const COUNT_BY_STATE: &str = "SELECT state, COUNT(*) FROM ledger GROUP BY state";
+/// One row of one page, which is what makes the crawl loop's idle tick and doc
+/// 14.3's progress line free. The triggers in schema version 3 keep it true.
+pub const SELECT_COUNTS: &str = "
+SELECT seen, pending, fetched, failed, gone, excluded, held, hosts, leases
+FROM counts WHERE id = 0";
+
+/// The same numbers the hard way, by scanning, which is what the counters mean.
+///
+/// It is the migration's backfill and it is what a later `umi check` compares
+/// the counters against. Nothing on a hot path calls it, and the column order
+/// matches [`SELECT_COUNTS`] so the two results can be compared directly.
+pub const RECOUNT: &str = "
+SELECT
+    (SELECT COUNT(*) FROM seen),
+    (SELECT COUNT(*) FROM ledger WHERE state = 0),
+    (SELECT COUNT(*) FROM ledger WHERE state = 1),
+    (SELECT COUNT(*) FROM ledger WHERE state = 2),
+    (SELECT COUNT(*) FROM ledger WHERE state = 3),
+    (SELECT COUNT(*) FROM ledger WHERE state = 4),
+    (SELECT COUNT(*) FROM pen),
+    (SELECT COUNT(*) FROM hosts),
+    (SELECT COUNT(*) FROM ledger WHERE lease_id IS NOT NULL)";
 
 /// The column list every segment read shares.
 ///

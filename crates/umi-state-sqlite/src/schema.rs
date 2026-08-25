@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 2;
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -217,4 +217,120 @@ CREATE INDEX segments_collectable
     ON segments (sealed_at_ms, id)
     WHERE remote_repo IS NOT NULL AND manifest_day IS NOT NULL
       AND deleted_at_ms IS NULL;
+";
+
+/// Version 3: the counters behind `stats`, maintained by triggers.
+///
+/// `stats` used to be five `COUNT(*)` queries, which is five table scans, which
+/// was 97 ms over 200000 urls on server3 and is linear: 78 seconds at a hundred
+/// million. The crawl loop asks for it on every idle tick, to tell "there are
+/// pending urls waiting their turn" apart from "the frontier is empty", and doc
+/// 14.3's progress line asks for it every five seconds. Both are correct calls
+/// and neither can be dropped, so the counting has to stop being a scan.
+///
+/// One row, one page, updated by triggers. Triggers rather than Rust for two
+/// reasons. They are inside the writing transaction by construction, so a crash
+/// can never leave counts that disagree with the rows, and there is no ordering
+/// to get right because SQLite commits both or neither. And they cannot be
+/// forgotten: a write path added later, or a row changed by hand from the
+/// `sqlite3` shell, moves the counters too, where a delta computed next to each
+/// statement would quietly drift the first time somebody added a sixth writer.
+///
+/// The backfill below is the same scan that used to run on every call, run once
+/// here. It is also the definition of what the counters mean, which is what a
+/// later `umi check` recomputes and compares against.
+const V3: &str = r"
+-- Exactly one row, and the CHECK is what says so. Doc 08.4 already calls these
+-- numbers point in time and does not promise them to be exact under concurrent
+-- admission, which is the licence to maintain them incrementally rather than
+-- lock the hot path to read them.
+CREATE TABLE counts (
+    id       INTEGER PRIMARY KEY CHECK (id = 0),
+    seen     INTEGER NOT NULL,
+    pending  INTEGER NOT NULL,
+    fetched  INTEGER NOT NULL,
+    failed   INTEGER NOT NULL,
+    gone     INTEGER NOT NULL,
+    excluded INTEGER NOT NULL,
+    held     INTEGER NOT NULL,
+    hosts    INTEGER NOT NULL,
+    leases   INTEGER NOT NULL
+) WITHOUT ROWID;
+
+INSERT INTO counts (id, seen, pending, fetched, failed, gone, excluded, held, hosts, leases)
+SELECT 0,
+    (SELECT COUNT(*) FROM seen),
+    (SELECT COUNT(*) FROM ledger WHERE state = 0),
+    (SELECT COUNT(*) FROM ledger WHERE state = 1),
+    (SELECT COUNT(*) FROM ledger WHERE state = 2),
+    (SELECT COUNT(*) FROM ledger WHERE state = 3),
+    (SELECT COUNT(*) FROM ledger WHERE state = 4),
+    (SELECT COUNT(*) FROM pen),
+    (SELECT COUNT(*) FROM hosts),
+    (SELECT COUNT(*) FROM ledger WHERE lease_id IS NOT NULL);
+
+CREATE TRIGGER seen_added AFTER INSERT ON seen BEGIN
+    UPDATE counts SET seen = seen + 1;
+END;
+
+CREATE TRIGGER seen_removed AFTER DELETE ON seen BEGIN
+    UPDATE counts SET seen = seen - 1;
+END;
+
+-- A comparison is 1 or 0 in SQLite, so the arithmetic is the bookkeeping and
+-- there is no branch to get wrong. The update trigger subtracts the old row
+-- and adds the new one, which is correct for a state change, for a lease being
+-- taken or cleared, and for both at once.
+CREATE TRIGGER ledger_added AFTER INSERT ON ledger BEGIN
+    UPDATE counts SET
+        pending  = pending  + (NEW.state = 0),
+        fetched  = fetched  + (NEW.state = 1),
+        failed   = failed   + (NEW.state = 2),
+        gone     = gone     + (NEW.state = 3),
+        excluded = excluded + (NEW.state = 4),
+        leases   = leases   + (NEW.lease_id IS NOT NULL);
+END;
+
+CREATE TRIGGER ledger_changed AFTER UPDATE ON ledger
+WHEN OLD.state <> NEW.state
+  OR (OLD.lease_id IS NULL) <> (NEW.lease_id IS NULL)
+BEGIN
+    UPDATE counts SET
+        pending  = pending  + (NEW.state = 0) - (OLD.state = 0),
+        fetched  = fetched  + (NEW.state = 1) - (OLD.state = 1),
+        failed   = failed   + (NEW.state = 2) - (OLD.state = 2),
+        gone     = gone     + (NEW.state = 3) - (OLD.state = 3),
+        excluded = excluded + (NEW.state = 4) - (OLD.state = 4),
+        leases   = leases   + (NEW.lease_id IS NOT NULL) - (OLD.lease_id IS NOT NULL);
+END;
+
+CREATE TRIGGER ledger_removed AFTER DELETE ON ledger BEGIN
+    UPDATE counts SET
+        pending  = pending  - (OLD.state = 0),
+        fetched  = fetched  - (OLD.state = 1),
+        failed   = failed   - (OLD.state = 2),
+        gone     = gone     - (OLD.state = 3),
+        excluded = excluded - (OLD.state = 4),
+        leases   = leases   - (OLD.lease_id IS NOT NULL);
+END;
+
+CREATE TRIGGER pen_added AFTER INSERT ON pen BEGIN
+    UPDATE counts SET held = held + 1;
+END;
+
+CREATE TRIGGER pen_removed AFTER DELETE ON pen BEGIN
+    UPDATE counts SET held = held - 1;
+END;
+
+-- `put_host` is an upsert, and this is the neat part of doing it in the
+-- database: SQLite fires the insert trigger only when a row was really
+-- inserted and the update trigger when the conflict clause ran instead, so the
+-- count is right without the Rust having to ask which happened.
+CREATE TRIGGER host_added AFTER INSERT ON hosts BEGIN
+    UPDATE counts SET hosts = hosts + 1;
+END;
+
+CREATE TRIGGER host_removed AFTER DELETE ON hosts BEGIN
+    UPDATE counts SET hosts = hosts - 1;
+END;
 ";
