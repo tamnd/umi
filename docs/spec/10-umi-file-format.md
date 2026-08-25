@@ -69,13 +69,15 @@ offset 0
   | header                              4 KiB fixed  |
   +--------------------------------------------------+
   | shoal 0                                          |
+  |   frame header  "SHFR"              64 bytes     |
   |   column chunk 0  (aligned to 64 bytes)          |
   |   column chunk 1                                 |
   |   ...                                            |
   |   shoal directory                                |
-  |   commit record                     32 bytes     |
+  |   commit record "SHOL"              32 bytes     |
   +--------------------------------------------------+
   | shoal 1                                          |
+  |   frame header                                   |
   |   ...                                            |
   |   commit record                                  |
   +--------------------------------------------------+
@@ -97,9 +99,13 @@ The header is fixed at 4 KiB, written once at create, and never rewritten. It ca
 
 The magic appears at both ends. At the start it identifies the file to `file(1)` and to a human. At the end it is the seal marker: a file whose last 4 bytes are not `UMI1` was not closed cleanly and goes down the recovery path in 10.7.
 
-A column chunk is aligned to 64 bytes so that bit packed and fixed width buffers can be handed to the decoder as aligned slices out of an mmap without a copy. The padding costs a few hundred bytes per shoal and is not worth optimising away.
+A column chunk is aligned to 64 bytes so that bit packed and fixed width buffers land on an alignment the decoder is happy with. The padding costs a few hundred bytes per shoal and is not worth optimising away.
 
 The shoal directory sits after the column data rather than before it, because the writer does not know a chunk's encoded length until it has encoded it, and writing the directory first would mean either a seek back or a two pass encode. It lists, per column, the byte offset, the encoded length, the encoding id, the null count, the value count, the min and max for orderable types, and a blake3-128 checksum of the chunk bytes.
+
+Every shoal opens with a 64 byte frame header carrying the magic `SHFR`, the shoal ordinal, the row count, the byte length of the whole shoal including both the frame header and the commit record, and a blake3-128 checksum of the frame header's own first 48 bytes. It exists for one reason: 10.7's recovery scan walks the file forward, and a scan that only has commit records at the end of each shoal has no way to find the first one without already knowing how long the shoal is. The frame header is the thing that tells it. Sealing writes the frame header first with the length field zero, then the column data, then the directory, then rewrites the 8 length bytes in place, then writes the commit record. A frame header whose length is still zero means the process died mid shoal and the scan stops there, which is the same answer it would give for a torn commit record.
+
+The commit record is 32 bytes, which is the constraint the rest of the shoal has to live inside. After the magic, the shoal ordinal and the checksum there is room for a 32 bit offset and a 32 bit length, so every offset in a shoal is relative to the start of that shoal and a single shoal cannot exceed 4 GiB. The writer's 32 MiB seal threshold is three orders of magnitude below that, but a caller who forces a seal on an absurd batch gets a `TooLarge` error rather than a silently wrapped offset.
 
 ## 10.5 The row schema
 
@@ -154,11 +160,13 @@ One cascade, applied per column chunk, chosen by the writer from a fixed set. No
 
 **Short high cardinality strings.** `url`, `final_url`, `links.href`, `links.anchor`, `title` use FSST with a symbol table trained per chunk on a 16 KiB sample. FSST gives random access at roughly memcpy speed and 2 to 3 times compression on URL shaped data, and it composes with what comes next. URLs additionally get prefix elision against the previous value, which inside a host run reduces most URLs to their differing tail. Together these two are the reason a URL costs 28 bytes and not 120.
 
-**Long text.** `markdown` is the only column where a general purpose compressor earns its keep. zstd level 3 with a dictionary trained per shoal over a 2 MiB sample and stored in the chunk. Level 3 rather than higher because doc 01 gives us 2 vCPU and level 3 compresses at around 300 MB/s per core against level 9 at 25 MB/s, and the ratio difference on already extracted markdown is under 8 percent. The dictionary is worth more than the level.
+**Long text.** `markdown` is the only column where a general purpose compressor earns its keep. Plain zstd level 3, no dictionary. Level 3 rather than higher because doc 01 gives us 2 vCPU and level 3 compresses at around 300 MB/s per core against level 9 at 25 MB/s, and the ratio difference on already extracted markdown is under 8 percent.
+
+This spec originally called for a zstd dictionary trained per shoal over a 2 MiB sample and stored in the chunk. It was implemented and measured, and it lost on both axes: writing a segment went from 2095 ms to 22439 ms, and the output was 4.9 percent larger. A dictionary is worth having when the values are short and repetitive, and pages of extracted markdown are neither, so the sample teaches the dictionary nothing that zstd's own window would not have found within the first few kilobytes of each block. The training cost is paid on every shoal and the ratio loss comes from spending the chunk header on a table nothing hits. The dictionary is gone, and 10.10's byte for byte pass through into Parquet is the reason it can never come back: a dictionary compressed frame is not a frame the Parquet reader can take.
 
 **Digests, minhash and simhash.** Stored raw. They are uniformly random by construction and any attempt to compress them costs CPU to produce a slightly larger output. The writer skips them explicitly rather than discovering this per chunk.
 
-**Lists and maps.** The Arrow layout, an offsets column that is delta plus bit packed and a child column encoded by its own rule. `links` decomposes into four sibling child columns rather than an interleaved struct, which is what lets `links.href` share a FSST symbol table across all links in the shoal.
+**Lists and maps.** The Arrow layout, and a child column encoded by its own rule. Arrow holds a list's shape as absolute offsets, but what goes on disk is the per row lengths, because the deltas of a monotonic offsets column are exactly those lengths and storing them directly saves the reader a subtraction pass and saves the writer from having to decide what to do about an offsets column that does not start at zero. The reader runs a prefix sum to get Arrow's offsets back. `links` decomposes into four sibling child columns rather than an interleaved struct, which is what lets `links.href` share a FSST symbol table across all links in the shoal.
 
 **Nulls.** A validity bitmap per chunk, omitted entirely when the chunk has no nulls, which is the common case for most columns.
 
@@ -170,7 +178,7 @@ The writer will be killed. Assume SIGKILL at the worst possible byte offset, ass
 
 **The commit record.** After a shoal's column chunks and directory are written, the writer calls `fdatasync`, then appends a 32 byte commit record, then calls `fdatasync` again. The record is a 4 byte tag `SHOL`, the shoal index, the byte offset of the shoal's first chunk, the byte length of the shoal, and a blake3-128 checksum over the shoal directory. Two syncs per shoal, so at 4 shoals per segment and a segment every 85 seconds that is one sync every 10 seconds. That is affordable even on server2's rotational disks, and it is exactly why shoals are 32 MiB and not 4 MiB.
 
-**Opening a file with no footer.** Scan forward from the header reading commit records. Each one tells you where the next shoal starts. Stop at the first record that fails its checksum, is truncated, or points past EOF. Everything before it is intact and readable. Truncate the file at that point and continue appending, or seal it as a short segment and publish it. Both are safe and the writer picks based on whether the segment is still the active one.
+**Opening a file with no footer.** Scan forward from the header. At each step read the 64 byte frame header, take the shoal length from it, and read the commit record that sits at the end of that length. The frame header is what makes the step possible at all, since the commit record is behind data whose size only the frame header knows. Stop at the first frame header or commit record that fails its checksum, is truncated, carries a zero length, or points past EOF. Everything before it is intact and readable. Truncate the file at that point and continue appending, or seal it as a short segment and publish it. Both are safe and the writer picks based on whether the segment is still the active one.
 
 **Torn writes inside a shoal.** Cannot corrupt a committed shoal, because a shoal is only committed after its own bytes are durable. A torn shoal has no valid commit record and is simply not part of the file.
 
@@ -182,31 +190,30 @@ The writer will be killed. Assume SIGKILL at the worst possible byte offset, ass
 
 ## 10.8 Writer memory
 
-The writer holds one shoal being filled in unencoded column builders, one shoal being encoded and written, and the zstd dictionary training buffer. Unencoded markdown dominates: a 32 MiB encoded shoal is roughly 90 MB of builders. Two in flight plus dictionary training and slack is where the default comes from.
+The writer holds one shoal being filled in unencoded column builders and one shoal being encoded and written. Unencoded markdown dominates: a 32 MiB encoded shoal is roughly 90 MB of builders. Two in flight plus training and slack is where the default comes from.
 
 ```
 default budget          256 MB
   filling shoal          ~90 MB
   encoding shoal         ~90 MB
-  zstd dict training       2 MiB sample, ~16 MB working
   FSST symbol training    ~4 MB
-  slack                   ~55 MB
+  slack                   ~71 MB
 ```
 
-Doc 03.4 caps `umid` on server1 at 1.5 GB RSS and doc 01 says server1 has essentially no free memory. So the writer takes a floor of 64 MB, and under the floor the shoal cap drops to 8 MiB and only one shoal is in flight at a time. That costs compression ratio, because dictionaries and symbol tables are trained on a quarter as much data and prefix elision has less to work with. The expected cost is 8 to 12 percent more bytes, and the measured cost is a milestone 3 number. It is the correct trade on a box with zero free RAM and it must be a configuration value, not a rebuild.
+Doc 03.4 caps `umid` on server1 at 1.5 GB RSS and doc 01 says server1 has essentially no free memory. So the writer takes a floor of 64 MB, and under the floor the shoal cap drops to 8 MiB and only one shoal is in flight at a time. That costs compression ratio, because symbol tables are trained on a quarter as much data and prefix elision has less to work with. The expected cost is 8 to 12 percent more bytes, and the measured cost is a milestone 3 number. It is the correct trade on a box with zero free RAM and it must be a configuration value, not a rebuild.
 
 Encoding is done on a rayon pool, one column chunk per task, because columns are independent and the encode of a full shoal is around 120 ms of single core work that we would rather not add to the fetch loop's latency.
 
 ## 10.9 Reading
 
-The reader mmaps the file, parses the footer, and hands out shoals. There is no buffer pool, no page cache management and no eviction policy, because the whole file is 128 MB and the only reader is a converter that walks it once.
+The reader opens the file, parses the footer, and hands out shoals. There is no buffer pool, no page cache management and no eviction policy, because the whole file is 128 MB and the only reader is a converter that walks it once.
 
-Zero copy means specifically: fixed width columns with no nulls and no encoding, which is all the digest and minhash columns, are exposed as `&[u8]` slices directly into the mapping and become Arrow buffers with no copy at all. Bit packed columns decode into a caller supplied reusable buffer, one shoal's worth at a time. FSST and zstd columns must be decompressed, and that is unavoidable and is most of the read cost.
+This spec originally said the reader mmaps the file and exposes uncompressed fixed width columns as slices into the mapping with no copy at all. That is not reachable here. The workspace denies `unsafe_code`, and every safe mmap wrapper is unsound by construction, because another process truncating the file turns a live slice into a SIGBUS with no way for the type system to have stopped it. So the reader does positioned reads instead: one `read_exact_at` per shoal into a reusable buffer, then decode out of that buffer. The read is a single sequential 32 MiB call rather than a page fault storm, the kernel's readahead does the work mmap would have done, and the cost against the mmap plan is one memcpy per shoal, which is under a percent of a decode that has to run zstd and FSST anyway. Digest and minhash columns still cost nothing to decode, they just get sliced out of the shoal buffer rather than out of a mapping. Bit packed columns decode into a caller supplied reusable buffer, one shoal's worth at a time. FSST and zstd columns must be decompressed, and that is unavoidable and is most of the read cost.
 
 The API is deliberately small:
 
 ```rust
-pub struct Segment { /* mmap + footer */ }
+pub struct Segment { /* file handle + footer */ }
 
 impl Segment {
     pub fn open(path: &Path) -> Result<Segment>;

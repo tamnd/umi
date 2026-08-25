@@ -45,12 +45,12 @@ dictionary encoding    on for host, content_type, lang, outcome, status, tier_us
 statistics             on, page level and column chunk level, for all orderable columns
 column index           written
 offset index           written
-bloom filters          url_key, text_digest
+bloom filters          url_key, body_digest
 sorting columns        none declared
 writer version         2.0
 ```
 
-Bloom filters on `url_key` and `text_digest` and nowhere else. Those two are the columns people do point lookups on, "is this URL in the corpus" and "is this content in the corpus", and a bloom filter turns both into one row group read instead of a full scan. Filters on anything else are bytes we pay for and nobody uses.
+Bloom filters on `url_key` and `body_digest` and nowhere else. Those two are the columns people do point lookups on, "is this URL in the corpus" and "is this content in the corpus", and a bloom filter turns both into one row group read instead of a full scan. Filters on anything else are bytes we pay for and nobody uses. Earlier drafts of this section named the second column `text_digest`, which is not a column doc 10.5 has. The digest of the extracted body is `body_digest` and that is the name in both formats.
 
 Statistics matter more than they look. A consumer filtering on `fetched_at_ms` or on `host` should read three row groups, not the whole file, and that only works if the min and max are written and the writer did not sort rows in a way that makes every row group's range cover everything. Doc 10's 4096 row reorder window groups by host, which incidentally makes the host statistics useful. That is a nice side effect and not a reason to keep the window.
 
@@ -126,6 +126,8 @@ Every day folder in every repository has a manifest, and the manifest is the act
 
 The detached signature is Ed25519 over the canonical serialisation of the manifest, using the publishing key, which is a different key from the crawl identity key in doc 07.2 and from the coordinator lease signing key in doc 04. Three keys with three purposes, published in `umi-meta`, rotated on different schedules, and none of them able to do another's job.
 
+The signature is domain separated, and because a third party has to reproduce it byte for byte to check it, the separation is part of the wire format and belongs in this spec rather than in a code comment. What gets signed is the context string `umi-manifest/1`, then a single zero byte, then the canonical manifest bytes. Three keys published in one place is exactly the situation where a signature produced for one purpose can be presented as one made for another, and the zero byte is what stops it: no context string contains a zero byte, so the boundary between context and payload cannot be moved by choosing a clever payload. Verification prepends the same prefix, so a signature made over the bare manifest bytes fails, which is the intended behaviour and not a compatibility problem, because nothing has been published yet.
+
 Two digests per file, blake3 and sha256, because blake3 is what we compute everywhere else and sha256 is what every other tool on Earth can check without installing anything.
 
 The `verification` counts in the manifest are doc 06's outcome distribution for that file. Publishing them means a consumer who only wants pages we fetched ourselves, or only pages that survived cross fetcher quorum, can filter at file granularity before downloading anything. That is a genuinely useful thing to offer and nobody else offers it.
@@ -150,6 +152,8 @@ A local file is deleted when, and only when, all four of these are true, in this
 2. An independent read of the remote object produced a digest equal to the locally computed digest. Independent means a fresh HTTP request that does not reuse the upload's response, and it means the digest was recomputed from the returned bytes rather than taken from a header.
 3. The manifest entry referencing it has been committed and its signature verified by reading it back.
 4. The state ledger rows for that segment carry the remote repository, path and digest.
+
+Condition 4 names a table that doc 08 does not currently define. Doc 08 owns the frontier, the host table and the recrawl schedule, and none of those know a segment exists. So doc 08 gains a `segments` table, keyed by segment ULID, holding the local path, the seal time, the row count, the local digest, and, once published, the remote repository, the remote path and the digest that was read back. Until a segment has those last three columns filled in, condition 4 is false and the file stays. Putting it in the state store rather than in a side file is the point: the state store is the thing that survives a crash and is the thing an operator can query, and a GC rule whose fourth condition lives in a file that a crash can lose is not a GC rule.
 
 If any of the four is false, the file stays. There is no disk pressure override, no operator flag, no `--force`, and no timeout that eventually gives up and deletes. Doc 15's backpressure exists precisely so that this rule never has to be broken: when the disk fills, the crawl slows down, and that is the correct outcome.
 

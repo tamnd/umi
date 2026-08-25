@@ -43,15 +43,25 @@ Parse with `html5ever` in full spec conformant mode, because the tolerant parsin
 
 Then main content detection, in a cascade borrowed in shape from Trafilatura, which remains the strongest published extractor on the standard benchmarks and does it by combining explicit metadata with node scoring rather than by picking one:
 
-1. If the document has `<article>`, `<main>`, or a node carrying schema.org `articleBody`, take it as the candidate root.
-2. Otherwise score every block level node by an integer function of its text length, its link density in fixed point hundredths, its paragraph count, and a small penalty table keyed on tag name and on class and id substrings from a fixed published list of boilerplate markers. Take the highest scoring subtree.
+1. If the document declares a root, take it. The order is `<main>`, then a node carrying schema.org `articleBody`, then `<article>`, and the order is fixed rather than "whichever we find first" because a page can carry more than one of them and two extractors that disagree about which to prefer produce two different digests for the same bytes. `<main>` goes first because HTML allows at most one visible `<main>` per document, so it is the least ambiguous signal on the page. `<article>` goes last because it is the most ambiguous: a blog index is a page of many `<article>` elements and taking the first would extract one post out of thirty. So `<article>` counts as a declared root only when the document has exactly one, and a document with several falls through to scoring, which is the right answer for an index page.
+2. Otherwise score every candidate container by an integer function of its text length, its link density in fixed point hundredths, its paragraph count, and a small penalty table keyed on tag name and on class and id substrings from a fixed published list of boilerplate markers. Take the highest scoring subtree. A candidate container is a `div`, `section`, `article`, `main`, `td`, `blockquote` or `body`, and not every block level node, because scoring a `p` against its own parent is scoring the same text twice and the winner is then decided by the penalty table rather than by the content. Ties go to the container that appears first in document order, for the reason in 11.1.
 3. If the winning subtree carries less than 200 bytes of text, or if link density in it exceeds 0.66, fall back to the whole `<body>` and set the `boilerplate_uncertain` flag rather than returning nothing. A directory page or a link farm is still a page we want a row for, and refusing to extract it loses the links, which are often its entire value.
 
 Everything in the scoring function is integer arithmetic on fixed point values. No floats, for the reason in 11.1.
 
 Then serialise to a fixed CommonMark subset: ATX headings for `h1` through `h6`, paragraphs, ordered and unordered lists with nesting, blockquotes, fenced code blocks carrying the language from a `class="language-*"` when present, GitHub flavoured tables, inline links, emphasis and strong emphasis, and horizontal rules. Images become their alt text in square brackets followed by the resolved source URL, because the alt text is content and the URL is a link and both are worth keeping while the image bytes are not.
 
-Dropped entirely: `script`, `style`, `noscript`, `svg`, `canvas`, `iframe`, `object`, `embed`, `form`, `input`, `button`, `select`, `nav`, `header`, `footer`, `aside`, and every comment node. Also dropped: all attributes except `href`, `src`, `alt`, `title`, `lang`, `datetime`, and the `class` values used for code language detection. Inline `span` and `div` collapse to their children.
+The drop list is two lists, and an earlier draft of this doc had it as one, which was wrong in both directions.
+
+**Dropped with their subtree**, because nothing inside them is content and nothing inside them is a link worth following: `script`, `style`, `noscript`, `svg`, `canvas`, `iframe`, `object`, `embed`, `input`, `button`, `select`, `textarea`, `option`, and every comment node. `textarea` and `option` are on this list and were not on the original: a `textarea` holds its default value as text and an `option` holds its label, so a parser that walks children without knowing about them silently splices a form's dropdown contents into the middle of the article. This is a real and common corruption on shop and settings pages.
+
+**Dropped from the markdown but still walked for links**: `nav`, `header`, `footer`, and `aside`. These are boilerplate as prose and are the single richest source of site structure there is, and doc 11.4 wants every one of those links. Dropping the subtree would have thrown away exactly the navigation that discovery runs on.
+
+`form` is on neither list, and the original doc had it dropped with its subtree, which was the worst of the mistakes. A `form` is a wrapper, not a kind of content, and a great many sites wrap the entire page body in one so that a search box in the header works. Dropping it took the whole article with it. It collapses to its children like any other wrapper.
+
+`label` and `legend` are also kept, for the mirror image of the reason `textarea` is dropped: they are form associated, so an element name based rule sweeps them up, but their content is ordinary prose written for a human to read.
+
+Also dropped: all attributes except `href`, `src`, `alt`, `title`, `lang`, `datetime`, and the `class` values used for code language detection. Inline `span` and `div` collapse to their children.
 
 Whitespace is normalised: runs of ASCII whitespace collapse to one space, leading and trailing whitespace is trimmed per block, and the whole output is normalised to Unicode NFC. NFC rather than NFKC, because NFKC destroys mathematical notation and full width CJK punctuation, and we crawl a lot of Japanese.
 
@@ -66,6 +76,8 @@ Links are half the reason the crawler exists, so they get more care than the bod
 Resolution goes against `<base href>` when present and well formed, otherwise against the final URL after redirects, never against the requested URL. Getting that backwards is the classic bug that sprays relative links onto the wrong host.
 
 Every link is canonicalised by 11.2 at extraction time, on the fetcher, so the coordinator receives keys it can check against the seen set without re parsing. Links that fail canonicalisation are counted and dropped, and the count is published, because a sudden rise in it is a good signal that an extractor build is broken.
+
+That is two counts and not one. `dropped` is a link that looked like an `http` or `https` URL and would not canonicalise, and it is the number that says an extractor build is broken. `dropped_scheme` is a link whose scheme we do not crawl, and on a normal page it is every `mailto:` and every `javascript:void(0)` in the navigation, which is a large and completely uninteresting number. Publishing them as one column would have buried the signal under the noise, since a page with forty `javascript:` handlers and one genuinely broken URL would look identical to a page with forty one broken URLs.
 
 Schemes other than `http` and `https` are dropped, which covers `javascript:`, `mailto:`, `tel:`, `data:`, and the long tail of application handlers. `mailto:` targets are dropped rather than collected, deliberately, because collecting email addresses at web scale creates an obligation we do not want.
 
@@ -115,6 +127,17 @@ Extracted from the document head and from structured data, with a fixed preceden
 **Feeds.** `link[rel=alternate]` with an RSS or Atom type, resolved and canonicalised, and handed to doc 09's realtime path. This is the cheapest freshness signal on the web and most crawlers ignore it.
 
 **Language.** Trigram detection over the first 4 KiB of extracted text, storing the BCP 47 primary subtag and a confidence. Below 0.5 confidence the language is stored as `und` rather than guessed, because a wrong language label is worse than an absent one for every downstream use. The `lang` attribute on `<html>` is recorded separately, because publisher declared language and detected language disagree often enough to be interesting.
+
+Four fields in this list had no cap in the first draft, and every one of them is attacker or template controlled, which means "no cap" is really "whatever the page felt like". They are capped now, and the caps are part of the format rather than an implementation detail, because a consumer sizing a column needs to know them.
+
+```
+heading text            256 bytes each, 64 entries
+author name             256 bytes, 16 entries
+JSON-LD @type           64 bytes each, 16 entries
+feeds                   16 entries
+```
+
+The counts matter more than the byte lengths. A generated page can carry a `h2` every other line and an e-commerce template can list a hundred `@type` values on one product, and without a cap a single page turns into a metadata row larger than its own content. Everything over the cap is truncated rather than dropped, and truncation sets a flag, so a consumer can tell a two author paper from a page that listed two hundred.
 
 **Quality signals**, computed and published, never applied: text byte count, link count, link density in the extracted subtree, the ratio of extracted text to raw document size, the fraction of text in the top boilerplate scoring node, the count of dropped script and style bytes, and a stopword coverage ratio for the detected language that separates natural language prose from generated word salad. Seven integers that let a consumer build their own filter without re parsing 100 billion pages.
 
