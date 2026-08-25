@@ -294,6 +294,21 @@ impl Publisher {
             convert(&segment, &staged)?
         };
 
+        // Still step 1. The block checksums say the file is not damaged and
+        // they cannot say it is the right file, so the one fact recorded
+        // somewhere else gets compared: how many rows the ledger saw when the
+        // segment was sealed. A disagreement here means either the ledger row
+        // or the file is wrong, and there is no way to tell which from inside
+        // this process, so nothing goes up. Doc 12.7 would otherwise delete the
+        // only copy that could have settled it.
+        if converted.rows != row.rows {
+            let _ = std::fs::remove_file(&staged);
+            return Err(Error::RowCount {
+                expected: row.rows,
+                found: converted.rows,
+            });
+        }
+
         let location = self.config.corpus.locate(
             Family::of(stream),
             converted.first_ms,
@@ -319,9 +334,34 @@ impl Publisher {
             )
             .await?;
 
-        // Step 5. Both halves of it: the hub's own idea of the object's size,
-        // and bytes read back over a fresh request and digested here.
+        // Step 5, first half: the hub's own idea of the object's size. Doc
+        // 12.7's condition 1 is answerable from that alone, and it is answered
+        // here rather than with the other three below, because the read back
+        // is a second request against an object already known to be wrong. A
+        // short object also makes the range read fail as a transport error,
+        // and doc 14.9 maps that to exit 5 and a retry when the honest answer
+        // for a copy that did not arrive whole is exit 6.
+        //
+        // Running the real rule against nothing but the size is the same trick
+        // the gate below uses with no ledger: `clear` stops at the first
+        // condition that fails, so `NotReadBack` is what "condition 1 held"
+        // looks like, and the rule stays in one place.
         let remote = self.remote(&location).await?;
+        let arrived = Evidence {
+            remote: Some(remote),
+            read_back: None,
+            manifest: None,
+            ledger: None,
+        };
+        if let Err(blocked) = gc::clear(&location.repo, &entry, &arrived)
+            && blocked != Blocked::NotReadBack
+        {
+            let _ = std::fs::remove_file(&staged);
+            return Err(Error::NotPublished(blocked));
+        }
+
+        // The second half: bytes read back over a fresh request and digested
+        // here.
         let read_back = self.read_back(&location, &staged, &converted).await?;
 
         // Step 6. The manifest is built from what the hub has, not from what

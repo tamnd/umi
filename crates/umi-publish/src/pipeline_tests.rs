@@ -46,6 +46,10 @@ struct Files {
     /// remote copy is staged, and it only affects reads, so the upload still
     /// looks like it worked.
     lying: ByPath,
+    /// Whether to drop the last byte of everything committed from here on.
+    /// A connection cut just before the end leaves exactly this behind, and
+    /// the hub has no way to know it happened.
+    cut: Arc<Mutex<bool>>,
 }
 
 impl Files {
@@ -60,7 +64,15 @@ impl Files {
             .cloned()
     }
 
-    fn put(&self, repo: &str, path: &str, bytes: Vec<u8>) {
+    /// Store the last byte of everything from here on, which is to say do not.
+    fn cut_uploads(&self) {
+        *self.cut.lock().expect("not poisoned") = true;
+    }
+
+    fn put(&self, repo: &str, path: &str, mut bytes: Vec<u8>) {
+        if *self.cut.lock().expect("not poisoned") && !bytes.is_empty() {
+            bytes.pop();
+        }
         self.stored
             .lock()
             .expect("not poisoned")
@@ -83,8 +95,10 @@ impl Files {
                 serde_json::json!({
                     "type": "file",
                     "path": in_path,
+                    // The pointer file's length, which is the trap the real
+                    // hub sets and the reason `Hub` reads the lfs block.
                     "size": 130,
-                    "lfs": { "oid": "an-oid", "size": bytes.len() },
+                    "lfs": { "oid": sha256(bytes), "size": bytes.len() },
                 })
             })
             .collect()
@@ -656,4 +670,172 @@ fn the_two_spellings_of_a_stream_still_agree() {
             "the discriminants have to line up or a stored segment changes stream"
         );
     }
+}
+
+#[tokio::test]
+async fn a_row_count_that_disagrees_with_the_ledger_stops_the_publish() {
+    // Doc 12.2's first step verifies the segment, and the block checksums can
+    // only say the file is undamaged, not that it is the right file. The one
+    // fact recorded outside it is the row count the ledger took at seal time,
+    // so that is what gets compared. This is the case where they disagree.
+    let fixture = Fixture::new().await;
+    let sealed = fixture.seal(11, 64, DAY_ONE).await;
+    let row = SegmentRow {
+        rows: sealed.rows + 1,
+        ..sealed.clone()
+    };
+    fixture
+        .state
+        .put_segment(std::slice::from_ref(&row))
+        .await
+        .expect("the record goes in");
+
+    let failed = fixture
+        .publisher
+        .publish(&fixture.state, &row, DAY_ONE)
+        .await
+        .expect_err("a segment that is not what the ledger says is not published");
+    assert!(
+        matches!(
+            failed,
+            Error::RowCount {
+                expected: 65,
+                found: 64
+            }
+        ),
+        "{failed}"
+    );
+
+    assert!(
+        std::path::Path::new(&row.local_path).exists(),
+        "the local segment must survive"
+    );
+    assert!(
+        fixture.files.paths().is_empty(),
+        "nothing should have gone up: {:?}",
+        fixture.files.paths()
+    );
+    assert!(
+        !fixture
+            .dir
+            .path()
+            .join("parquet")
+            .join(format!("{}.parquet", row.id.to_text()))
+            .exists(),
+        "the staged copy should be gone"
+    );
+}
+
+#[tokio::test]
+async fn a_truncated_upload_is_not_recorded_and_is_not_deleted() {
+    // The other half of doc 12.7's condition 1. The corrupted case serves
+    // different bytes at the same length; this one stores fewer, which is what
+    // a connection cut just before the end leaves behind, and it has to fail
+    // on the size rather than on anything that was digested.
+    let fixture = Fixture::new().await;
+    let row = fixture.seal(12, 64, DAY_ONE).await;
+    fixture.files.cut_uploads();
+
+    let failed = fixture
+        .publisher
+        .publish(&fixture.state, &row, DAY_ONE)
+        .await
+        .expect_err("a short copy is not published");
+    let Error::NotPublished(Blocked::RemoteSize { expected, found }) = failed else {
+        panic!("expected doc 12.7 condition 1 to fail on the size, got {failed}");
+    };
+    assert_eq!(
+        found,
+        expected - 1,
+        "the hub kept every byte but the last one"
+    );
+
+    assert!(
+        std::path::Path::new(&row.local_path).exists(),
+        "the local segment must survive a failed verification"
+    );
+    let stored = fixture
+        .state
+        .segment(row.id)
+        .await
+        .expect("the ledger answers")
+        .expect("the record is there");
+    assert_eq!(stored.remote, None, "nothing should be recorded");
+    assert!(
+        !fixture
+            .files
+            .paths()
+            .iter()
+            .any(|path| path.starts_with("_manifest/")),
+        "and no manifest should name it: {:?}",
+        fixture.files.paths()
+    );
+}
+
+#[tokio::test]
+async fn a_chain_with_a_link_rewritten_does_not_verify() {
+    // Doc 12.5's chain is the claim that nobody quietly rewrote history, and
+    // the claim is worth what the check is worth. This publishes two days,
+    // then replaces day two with a manifest that is well formed, correctly
+    // signed by the real publishing key, and points at a `prev` that is not
+    // day one. Signing it properly is the point: an attacker who can write to
+    // the repository can produce a document that parses and verifies, and the
+    // only thing that catches this one is the chain.
+    let fixture = Fixture::new().await;
+    let first = fixture.seal(13, 16, DAY_ONE).await;
+    let second = fixture.seal(14, 16, DAY_TWO).await;
+    let one = fixture
+        .publisher
+        .publish(&fixture.state, &first, DAY_ONE)
+        .await
+        .expect("day one publishes");
+    let two = fixture
+        .publisher
+        .publish(&fixture.state, &second, DAY_TWO)
+        .await
+        .expect("day two publishes");
+
+    fixture
+        .publisher
+        .announce(crate::repo::META_REPO, DAY_ONE)
+        .await
+        .expect("the key is published");
+
+    let options = crate::verify::Options::default();
+    let report = crate::verify::verify(fixture.publisher.hub(), &two.repo, &options)
+        .await
+        .expect("the chain as published verifies");
+    assert_eq!(report.days.len(), 2, "two days, chained");
+    assert_ne!(one.day, two.day);
+
+    let good = fixture.files.manifest(&two.repo, &two.day.to_string());
+    let key = SigningKey::from_seed(Role::Publishing, [3u8; 32]);
+
+    let mut forged = good;
+    forged.prev = Some([0x5a; 32]);
+    let signature = forged.sign(&key).expect("sign");
+    fixture.files.corrupt(
+        &format!("_manifest/{}.json", two.day),
+        forged.to_json().expect("json"),
+    );
+    fixture.files.corrupt(
+        &format!("_manifest/{}.json.sig", two.day),
+        signature.to_vec(),
+    );
+
+    let failed = crate::verify::verify(fixture.publisher.hub(), &two.repo, &options)
+        .await
+        .expect_err("a day that points at nothing must not verify");
+    assert!(
+        matches!(failed, Error::Manifest(m) if m.contains("chain")),
+        "{failed}"
+    );
+}
+
+/// sha256 of a slice as the lowercase hex an lfs oid is written in.
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
 }
