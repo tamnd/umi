@@ -110,6 +110,22 @@ impl SigningKey {
             // out.
             return Err(Error::Secret("expected env:NAME or file:PATH"));
         };
+        Self::from_hex(role, &text)
+    }
+
+    /// Decode the 64 hex characters a key is written as.
+    ///
+    /// Split out from [`SigningKey::load`] because the CLI resolves a key
+    /// through doc 14.7's five configuration layers rather than through a
+    /// source string, and arrives holding the hex with nowhere to put it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Secret`] when the text is not 32 bytes of hex, with trailing
+    /// whitespace allowed because a file written by `echo` has a newline on the
+    /// end and refusing that helps nobody. The message never contains the
+    /// value.
+    pub fn from_hex(role: Role, text: &str) -> Result<Self> {
         let mut seed = [0u8; 32];
         hex::decode_to_slice(text.trim(), &mut seed)
             .map_err(|_| Error::Secret("expected 64 hex characters"))?;
@@ -305,6 +321,19 @@ mod tests {
             loaded.verifying().to_hex(),
             key(Role::Publishing).verifying().to_hex()
         );
+    }
+
+    #[test]
+    fn hex_and_a_source_arrive_at_the_same_key() {
+        // The CLI takes the second route, so the two had better agree.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("publish.key");
+        std::fs::write(&path, format!("{}\n", "2a".repeat(32))).expect("write");
+        let loaded =
+            SigningKey::load(Role::Publishing, &format!("file:{}", path.display())).expect("load");
+        let decoded = SigningKey::from_hex(Role::Publishing, &"2a".repeat(32)).expect("from_hex");
+        assert_eq!(loaded.verifying(), decoded.verifying());
+        assert!(SigningKey::from_hex(Role::Publishing, "not hex").is_err());
     }
 
     #[test]

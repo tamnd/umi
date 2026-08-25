@@ -49,7 +49,7 @@ use crate::gc::{self, Blocked, Evidence, LedgerLocation, ManifestCommitted, Read
 use crate::hub::{Hub, Upload};
 use crate::keys::SigningKey;
 use crate::manifest::{FileEntry, Manifest, Verification, segment_text};
-use crate::repo::{Family, Location, locate};
+use crate::repo::{self, Corpus, Family, Location};
 use crate::{Error, Result};
 
 #[cfg(test)]
@@ -65,6 +65,9 @@ pub struct PublishConfig {
     /// temporary and a segment is not, and a reconciliation pass that walked
     /// the segment directory should not have to tell them apart by extension.
     pub staging: PathBuf,
+    /// Which corpus this is publishing into: the organisation doc 14.7 spells
+    /// `publish.org`, and the focused crawl name from doc 13.7 if there is one.
+    pub corpus: Corpus,
     /// Doc 12.4's `NN`, the slice inside the week's repository family.
     pub slice: u16,
     /// Doc 04's coordinator key, hex, for the manifest entry.
@@ -88,6 +91,7 @@ impl Default for PublishConfig {
     fn default() -> Self {
         Self {
             staging: PathBuf::from("parquet"),
+            corpus: Corpus::new(repo::ORG),
             slice: 0,
             coordinator: String::new(),
             extractor: format!("umi/{}", env!("CARGO_PKG_VERSION")),
@@ -147,6 +151,21 @@ impl Publisher {
     #[must_use]
     pub const fn hub(&self) -> &Hub {
         &self.hub
+    }
+
+    /// Put this publisher's key in doc 12.5's directory if it is not there.
+    ///
+    /// Returns whether this call added it, which is true once per key and
+    /// false every time after. Worth calling before the first manifest rather
+    /// than after the last one: a manifest signed by a key that is not
+    /// published is a manifest nobody outside this machine can check, and doc
+    /// 16's gate 1.5 is the test that says so.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the hub says. See [`crate::directory::publish_key`].
+    pub async fn announce(&self, meta_repo: &str, now_ms: u64) -> Result<bool> {
+        crate::directory::publish_key(&self.hub, meta_repo, &self.key.verifying(), now_ms).await
     }
 
     /// Publish every segment the state ledger has no remote copy for.
@@ -275,7 +294,7 @@ impl Publisher {
             convert(&segment, &staged)?
         };
 
-        let location = locate(
+        let location = self.config.corpus.locate(
             Family::of(stream),
             converted.first_ms,
             self.config.slice,
@@ -417,11 +436,11 @@ impl Publisher {
     /// Doc 12.7's first condition: the object is there and it is the right
     /// size.
     async fn remote(&self, location: &Location) -> Result<gc::Remote> {
-        let listing = self.hub.list(&location.repo, &location.path).await?;
-        let found = listing
-            .into_iter()
-            .find(|entry| entry.path == location.path)
-            .ok_or(Error::Manifest("the upload is not in the listing"))?;
+        let found = self
+            .hub
+            .info(&location.repo, &location.path)
+            .await?
+            .ok_or(Error::Manifest("the upload is not on the hub"))?;
         Ok(gc::Remote { bytes: found.size })
     }
 

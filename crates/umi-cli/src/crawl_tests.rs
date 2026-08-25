@@ -9,9 +9,10 @@
 use std::time::Duration;
 
 use super::{
-    Options, Settings, Stall, Stop, Summary, day, default_out, delay_ms, profile_toml, scope_for,
-    seed_url, settings, sources, spent, tier,
+    Options, Publishing, Settings, Stall, Stop, Summary, day, default_out, delay_ms, profile_toml,
+    scope_for, seed_url, settings, sources, spent, tier,
 };
+use crate::config::{Config, Flags, Paths};
 
 fn options(target: &str) -> Options {
     Options {
@@ -258,7 +259,7 @@ fn the_manifest_day_is_the_day_the_crawl_started() {
 #[test]
 fn resuming_something_that_is_not_a_crawl_says_so() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let error = super::resume(dir.path(), false).expect_err("no profile.toml");
+    let error = super::resume(dir.path(), false, None).expect_err("no profile.toml");
     assert!(
         format!("{error}").contains("is not a crawl directory"),
         "got {error}"
@@ -267,14 +268,126 @@ fn resuming_something_that_is_not_a_crawl_says_so() {
 }
 
 #[test]
-fn publishing_is_refused_rather_than_ignored() {
+fn publishing_without_a_token_is_refused_before_anything_is_fetched() {
     // The dangerous version of this is a `--publish` that crawls happily and
     // silently publishes nothing, because the operator then deletes the
-    // directory believing the data is somewhere else.
-    let options = Options {
-        publish: true,
-        ..options("example.com")
+    // directory believing the data is somewhere else. So the check is at the
+    // front, and it names the setting rather than saying "not configured".
+    let config = config_with(&[]);
+    let error = Publishing::resolve(&config, true).expect_err("no token");
+    assert!(format!("{error}").contains("publish.token"), "got {error}");
+    assert_eq!(error.exit(), umi_types::Exit::Usage);
+
+    // A token and no key is the same answer about the other secret. Doc 12.5
+    // keeps them separate and neither one on its own is enough to publish.
+    let error = Publishing::resolve(&config_with(&[("UMI_TOKEN", "env:UMI_TEST_TOKEN")]), true)
+        .expect_err("no key");
+    assert!(format!("{error}").contains("publish.key"), "got {error}");
+}
+
+#[test]
+fn a_token_that_points_at_nothing_is_refused_too() {
+    // Configured, and the indirection does not resolve. A different failure
+    // from not being configured at all, and the message has to say which,
+    // because the fix is different.
+    let config = config_with(&[
+        ("UMI_TOKEN", "env:UMI_TEST_TOKEN_THAT_IS_NOT_SET"),
+        ("UMI_PUBLISH_KEY", "env:UMI_TEST_KEY_THAT_IS_NOT_SET"),
+    ]);
+    let error = Publishing::resolve(&config, true).expect_err("unset");
+    let shown = format!("{error}");
+    assert!(
+        shown.contains("UMI_TEST_TOKEN_THAT_IS_NOT_SET"),
+        "got {shown}"
+    );
+}
+
+#[test]
+fn without_the_flag_no_secret_is_read_at_all() {
+    // A machine with no token still crawls. `--publish` is the only thing that
+    // makes the token a requirement, so resolving must not fail without it.
+    assert!(
+        Publishing::resolve(&config_with(&[]), false)
+            .expect("no flag, no secrets")
+            .is_none()
+    );
+}
+
+#[test]
+fn the_resolved_secrets_do_not_show_up_in_a_debug_line() {
+    // `Options` derives `Debug` and gets logged. This is the guard that stops
+    // that from being a token in somebody's crawl log.
+    let publishing = Publishing {
+        org: "open-index".to_owned(),
+        token: "hf_the_actual_token".to_owned(),
+        key: "2a".repeat(32),
+        slice: 0,
     };
-    let error = super::crawl(&options).expect_err("not built yet");
-    assert!(format!("{error}").contains("Hugging Face"), "got {error}");
+    let shown = format!(
+        "{:?}",
+        Options {
+            publish: Some(publishing),
+            ..options("example.com")
+        }
+    );
+    assert!(!shown.contains("hf_the_actual_token"), "{shown}");
+    assert!(!shown.contains("2a2a"), "{shown}");
+    assert!(shown.contains("open-index"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_recorded_segment_is_one_the_publisher_will_pick_up() {
+    // The handover between this file and doc 12.2's pipeline. Everything the
+    // publisher needs to find a segment, open it and check it later has to be
+    // in the row, and the digest has to be over the file rather than over
+    // anything convenient.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("01K2M8Q0P7R3XN500000000000.umi");
+    std::fs::write(&path, b"not a real segment, but a real file").expect("write");
+
+    let sealed = [umi_crawl::Sealed {
+        path: path.clone(),
+        id: umi_types::Ulid::parse("01K2M8Q0P7R3XN500000000000").expect("parse"),
+        stats: umi_file::SegmentStats {
+            rows: 4096,
+            ..umi_file::SegmentStats::default()
+        },
+    }];
+    let state = umi_state::MemoryState::default();
+    let state: &dyn umi_state::State = &state;
+    super::record(&sealed, state, 1_787_616_000_000)
+        .await
+        .expect("record");
+
+    let due = state
+        .segments(umi_state::SegmentQuery::Unpublished)
+        .await
+        .expect("query");
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].id, sealed[0].id);
+    assert_eq!(due[0].local_path, path.to_string_lossy());
+    assert_eq!(due[0].rows, 4096);
+    assert_eq!(due[0].bytes, 35);
+    assert_eq!(
+        due[0].local_digest.as_bytes(),
+        blake3::hash(b"not a real segment, but a real file").as_bytes()
+    );
+    // Not published and not deleted, which is what makes it due rather than
+    // collectable. Getting this backwards would delete a segment nobody kept.
+    assert!(due[0].remote.is_none());
+    assert!(due[0].local());
+}
+
+/// A [`Config`] built from an environment and nothing else, so that a test
+/// does not depend on whether the developer has a `umi.toml`.
+fn config_with(env: &[(&str, &str)]) -> Config {
+    let paths = Paths {
+        local: std::path::PathBuf::from("/nonexistent/umi.toml"),
+        user: None,
+    };
+    let env = env
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+        .collect();
+    Config::load(&paths, &env, &Flags::default()).expect("no files to fail on")
 }

@@ -53,12 +53,14 @@
 #![forbid(unsafe_code)]
 
 pub mod convert;
+pub mod directory;
 pub mod gc;
 pub mod hub;
 pub mod keys;
 pub mod manifest;
 pub mod pipeline;
 pub mod repo;
+pub mod verify;
 
 #[cfg(test)]
 mod scripted;
@@ -71,7 +73,8 @@ pub use hub::{Commit, Hub, HubConfig, Remote, Retry, Upload, Who};
 pub use keys::{Role, SigningKey, VerifyingKey};
 pub use manifest::{FileEntry, Manifest, Verification};
 pub use pipeline::{PublishConfig, Published, Publisher, stream_kind, stream_of};
-pub use repo::{Family, Location, locate};
+pub use repo::{Corpus, Family, Location, locate};
+pub use verify::{Report, verify};
 
 /// What can go wrong publishing.
 #[derive(Debug, thiserror::Error)]
