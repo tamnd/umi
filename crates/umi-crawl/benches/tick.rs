@@ -470,9 +470,10 @@ fn ok_page(body: &str, media: Media) -> Outcome {
 
 /// Rows counted and thrown away.
 ///
-/// A segment writer costs another 43 us a row, which `rows.rs` measures, and
-/// putting it here would mix the two numbers. What this benchmark is for is
-/// everything the loop does that no other benchmark covers.
+/// Writing them costs another 169 us a row, which part 3 of `rows.rs`
+/// measures, and putting it here would mix the two numbers. What this
+/// benchmark is for is everything the loop does that no other benchmark
+/// covers.
 #[derive(Default)]
 struct Counter(AtomicUsize);
 
