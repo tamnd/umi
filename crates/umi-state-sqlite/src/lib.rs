@@ -69,10 +69,11 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, params};
 use umi_state::{
     AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult, HostRow,
-    Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Result, Revalidator, State,
-    StateError, StateStats, UrlState, next_due_after, retry_after_ms,
+    Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Result, Revalidator,
+    SegmentQuery, SegmentRow, State, StateError, StateStats, UrlState, next_due_after,
+    retry_after_ms,
 };
-use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, UrlKeyFull};
+use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
 
 mod row;
 mod schema;
@@ -921,6 +922,84 @@ impl State for SqliteState {
                 }
             }
             Ok(())
+        })
+    }
+
+    async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        blocking(|| {
+            let mut guard = self.lock();
+            let conn = &mut guard.conn;
+            // Durable, always, and the trait says why: a segment record a
+            // crash can lose is a local file that gets deleted and then reads
+            // as data loss to the next reconciliation pass. About a thousand
+            // of these a day, so the fsync is free in any sense that matters.
+            set_sync(conn, Sync::Durable)?;
+            let tx = conn.transaction().state()?;
+            {
+                let mut put = tx.prepare_cached(sql::PUT_SEGMENT).state()?;
+                for segment in rows {
+                    let remote = segment.remote.as_ref();
+                    put.execute(params![
+                        &segment.id.as_bytes()[..],
+                        i64::from(segment.stream.as_u8()),
+                        segment.local_path.as_str(),
+                        row::to_ms(segment.sealed_at_ms),
+                        row::to_ms(segment.rows),
+                        row::to_ms(segment.bytes),
+                        &segment.local_digest.as_bytes()[..],
+                        remote.map(|r| r.repo.as_str()),
+                        remote.map(|r| r.path.as_str()),
+                        remote.map(|r| r.digest.as_bytes().to_vec()),
+                        segment.manifest_day.map(i64::from),
+                        segment.deleted_at_ms.map(row::to_ms),
+                    ])
+                    .state()?;
+                }
+            }
+            tx.commit().state()
+        })
+    }
+
+    async fn segment(&self, id: Ulid) -> Result<Option<SegmentRow>> {
+        blocking(|| {
+            let guard = self.lock();
+            guard
+                .conn
+                .prepare_cached(sql::SELECT_SEGMENT)
+                .state()?
+                .query_row(params![&id.as_bytes()[..]], row::segment)
+                .optional()
+                .state()
+        })
+    }
+
+    async fn segments(&self, query: SegmentQuery) -> Result<Vec<SegmentRow>> {
+        blocking(|| {
+            let guard = self.lock();
+            let text = match query {
+                SegmentQuery::Unpublished => sql::SELECT_UNPUBLISHED,
+                SegmentQuery::Collectable => sql::SELECT_COLLECTABLE,
+                SegmentQuery::SealedBetween { .. } => sql::SELECT_SEALED_BETWEEN,
+            };
+            let mut stmt = guard.conn.prepare_cached(text).state()?;
+            let found = match query {
+                SegmentQuery::SealedBetween { from_ms, to_ms } => stmt
+                    .query_map(
+                        params![row::to_ms(from_ms), row::to_ms(to_ms)],
+                        row::segment,
+                    )
+                    .state()?
+                    .collect::<rusqlite::Result<Vec<_>>>(),
+                _ => stmt
+                    .query_map([], row::segment)
+                    .state()?
+                    .collect::<rusqlite::Result<Vec<_>>>(),
+            };
+            found.state()
         })
     }
 

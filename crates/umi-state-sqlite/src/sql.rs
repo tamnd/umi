@@ -266,3 +266,68 @@ RETURNING id";
 /// One grouped scan rather than five counting queries. It is still a scan of
 /// the ledger, so this is not something to call in a loop.
 pub const COUNT_BY_STATE: &str = "SELECT state, COUNT(*) FROM ledger GROUP BY state";
+
+/// The column list every segment read shares.
+///
+/// A macro rather than a `const`, because each of the four queries below needs
+/// it as a literal to be assembled by [`concat!`] at compile time. Written
+/// once so that a later migration adding a column is one edit and not four,
+/// and so that [`row::segment`](crate::row::segment), which reads columns by
+/// name, cannot be handed a query that is missing one.
+macro_rules! segment_columns {
+    () => {
+        "SELECT id, stream, local_path, sealed_at_ms, rows, bytes, local_digest,
+                remote_repo, remote_path, remote_digest, manifest_day, deleted_at_ms
+           FROM segments"
+    };
+}
+
+/// One segment by id.
+pub const SELECT_SEGMENT: &str = concat!(segment_columns!(), " WHERE id = ?1");
+
+/// The publisher's backlog: sealed and not on the hub.
+///
+/// `segments_unpublished` in [`schema`](crate::schema) is behind this, and the
+/// `WHERE` matches it word for word so the partial index is usable. The first
+/// version of this had no index on the theory that a coordinator keeping up
+/// has three rows outstanding and SQLite could just walk the seal order index
+/// and test the null. The benchmark disagreed: that walk was 555 ms against a
+/// year of history and got a millisecond slower every day. Three rows out of
+/// 365000 is exactly the shape a partial index is for.
+pub const SELECT_UNPUBLISHED: &str = concat!(
+    segment_columns!(),
+    " WHERE remote_repo IS NULL
+      ORDER BY sealed_at_ms, id"
+);
+
+/// What doc 12.7's rule is evaluated over.
+///
+/// The `WHERE` matches `segments_collectable` in
+/// [`schema`](crate::schema) word for word, which is what makes the partial
+/// index usable. The same trap as the frontier's `ledger_ready` applies: if
+/// the two drift, nothing breaks and every GC pass quietly becomes a full
+/// table scan of a table that only grows.
+pub const SELECT_COLLECTABLE: &str = concat!(
+    segment_columns!(),
+    " WHERE remote_repo IS NOT NULL AND manifest_day IS NOT NULL
+        AND deleted_at_ms IS NULL
+      ORDER BY sealed_at_ms, id"
+);
+
+/// Doc 12.8's reconciliation window, half open.
+pub const SELECT_SEALED_BETWEEN: &str = concat!(
+    segment_columns!(),
+    " WHERE sealed_at_ms >= ?1 AND sealed_at_ms < ?2
+      ORDER BY sealed_at_ms, id"
+);
+
+/// Write a segment record whole.
+///
+/// Last write wins, as with [`PUT_HOST`], and for the same reason: one
+/// coordinator owns the segment and is handing back the record it just
+/// changed.
+pub const PUT_SEGMENT: &str = "
+INSERT OR REPLACE INTO segments (
+    id, stream, local_path, sealed_at_ms, rows, bytes, local_digest,
+    remote_repo, remote_path, remote_digest, manifest_day, deleted_at_ms
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";

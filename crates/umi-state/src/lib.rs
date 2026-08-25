@@ -54,7 +54,7 @@
 
 use std::time::Duration;
 
-use umi_types::{HostId, PldId};
+use umi_types::{HostId, PldId, Ulid};
 
 pub mod conformance;
 pub mod memory;
@@ -67,7 +67,8 @@ pub use memory::MemoryState;
 pub use types::{
     AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, ExcludeReason, FailureKind,
     FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,
-    Priority, Revalidator, RobotsRef, StateStats, TierPolicy, UrlState,
+    Priority, RemoteCopy, Revalidator, RobotsRef, SegmentQuery, SegmentRow, StateStats, Stream,
+    TierPolicy, UrlState,
 };
 
 /// The batch size the whole design is tuned around, from doc 08.5.
@@ -148,7 +149,7 @@ pub type Result<T> = std::result::Result<T, StateError>;
 
 /// The state layer.
 ///
-/// Eleven methods, all batched, all taking time as an argument. Implement it
+/// Fourteen methods, all batched, all taking time as an argument. Implement it
 /// and then run [`conformance::check`] against it: the suite is the definition
 /// of what these doc comments mean, and a backend that has not been through it
 /// has not implemented this trait, it has implemented something that compiles.
@@ -256,9 +257,9 @@ pub trait State: Send + Sync + 'static {
 
     /// Read one host record.
     ///
-    /// The only unbatched read in the trait, and it is here because the host
-    /// table is about 50 million rows fleet wide and fits in memory even on
-    /// server1, so a backend can serve this without touching disk. Returns
+    /// One of two unbatched reads in the trait, and it is here because the
+    /// host table is about 50 million rows fleet wide and fits in memory even
+    /// on server1, so a backend can serve this without touching disk. Returns
     /// `None` for a host we have never fetched.
     ///
     /// # Errors
@@ -282,6 +283,55 @@ pub trait State: Send + Sync + 'static {
     ///
     /// Whatever the store reports.
     async fn put_host(&self, rows: &[HostRow]) -> Result<()>;
+
+    /// Write segment records, replacing any that exist.
+    ///
+    /// Called twice in a segment's life. Once when it is sealed, with the
+    /// remote fields empty, and once when it has been uploaded and read back,
+    /// with them filled in. Last write wins per id, as with
+    /// [`put_host`](State::put_host), and for the same reason: the caller owns
+    /// the record because one coordinator owns the segment.
+    ///
+    /// **Durability: durable.** This is the only method in the trait that is
+    /// unconditionally so, and doc 12.7 is why. A local file is deleted once
+    /// the record says where the remote copy is, so a record that a crash can
+    /// lose is a file that gets deleted and then looks like data loss to the
+    /// next reconciliation pass, which would refetch urls that were published
+    /// perfectly well. The write happens about a thousand times a day against
+    /// a table of a few hundred thousand rows, so an fsync here costs nothing
+    /// worth measuring.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()>;
+
+    /// Read one segment record.
+    ///
+    /// The other unbatched read, and it is here for the same reason: doc 08.3
+    /// sizes a year of segment history at well under 100 MB, so a lookup is
+    /// never the thing that costs anything.
+    ///
+    /// Returns `None` for a ULID this store has never sealed, which is not an
+    /// error: it is the answer doc 12.8 acts on when it finds a file on the
+    /// hub that no segment record claims.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn segment(&self, id: Ulid) -> Result<Option<SegmentRow>>;
+
+    /// Read the segment records matching a query, oldest first.
+    ///
+    /// Ordered by seal time so that the publisher works through a backlog in
+    /// the order it accumulated, which is also the order that empties the disk
+    /// soonest, since the oldest segment is the one whose day folder is most
+    /// likely already committed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn segments(&self, query: SegmentQuery) -> Result<Vec<SegmentRow>>;
 
     /// Bring shards in from cold storage so the domains are local.
     ///
