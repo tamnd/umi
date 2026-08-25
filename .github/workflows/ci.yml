@@ -162,7 +162,25 @@ jobs:
           # Exit 1 with a milestone pointer is the contract for a command
           # that is specified and not built. A zero here would mean a
           # command silently did nothing.
-          if ./target/debug/umi doctor; then
-            echo "umi doctor exited 0 but nothing is implemented"
+          if ./target/debug/umi resume /tmp/not-a-crawl; then
+            echo "umi resume exited 0 but the crawl loop is not built"
+            exit 1
+          fi
+      - name: The commands that are built behave
+        run: |
+          set -e
+          # `--offline` so the runner does not need the network and the job
+          # does not go yellow when huggingface.co is slow. The checks that
+          # matter here are the local ones anyway.
+          ./target/debug/umi doctor --offline
+          ./target/debug/umi config > /dev/null
+          # Doc 14.9: nothing to list is exit 3 and not a failure. A checkout
+          # has no segments in it, so this is the real path.
+          set +e
+          ./target/debug/umi ls . > /dev/null 2>&1
+          code=$?
+          set -e
+          if [ "$code" != "3" ]; then
+            echo "umi ls on an empty tree exited $code, doc 14.9 says 3"
             exit 1
           fi

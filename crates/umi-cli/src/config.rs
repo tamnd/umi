@@ -251,7 +251,7 @@ impl Paths {
 /// process environment and race every other test in the binary.
 pub type Env = BTreeMap<String, String>;
 
-/// Read the environment into the form [`load`] wants.
+/// Read the environment into the form [`Config::load`] wants.
 #[must_use]
 pub fn env_from_process() -> Env {
     std::env::vars()
