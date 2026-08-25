@@ -92,7 +92,7 @@ const STALL_LIMIT: Duration = Duration::from_secs(300);
 /// One struct rather than fifteen arguments, and it is deliberately the shape
 /// of doc 14.3's flag list rather than the shape of [`CrawlConfig`]: the
 /// translation from one to the other is the part worth reading, so it happens
-/// in one visible place in [`settings`] instead of being spread over the parser.
+/// in one visible place, in `settings`, instead of being spread over the parser.
 #[derive(Clone, Debug)]
 pub struct Options {
     /// A domain, a host, a URL, or a path to a scope profile.
