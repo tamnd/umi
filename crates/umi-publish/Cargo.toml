@@ -30,6 +30,11 @@ thiserror = { workspace = true }
 # not own a runtime, it runs on the caller's.
 tokio = { workspace = true }
 umi-file = { workspace = true }
+# Doc 12.2's step 7 writes the remote location into the state ledger, and doc
+# 12.7's fourth condition reads it back out. umi-state is a trait crate over
+# umi-types, so this is not the layering inversion it looks like: no state
+# backend is linked here, only the interface the pipeline calls.
+umi-state = { workspace = true }
 umi-types = { workspace = true }
 
 [dev-dependencies]

@@ -87,6 +87,62 @@ pub struct Converted {
     pub first_ms: u64,
     /// The latest, likewise.
     pub last_ms: u64,
+    /// How the rows were verified, counted off the `verification` column
+    /// rather than assumed.
+    ///
+    /// Doc 12.5 puts these four numbers in every manifest entry, and the
+    /// honest way to fill them in is to count. A publisher that wrote
+    /// `local: rows` because the segment came off this machine would be
+    /// right today and wrong the first time doc 06's remote fetchers deliver
+    /// a row, and it would be wrong in the direction that overstates what the
+    /// corpus is worth.
+    pub verification: Tally,
+}
+
+/// Doc 06's four verification levels, counted.
+///
+/// Named separately from [`crate::Verification`], which is the same four
+/// numbers in the manifest. They stay two types because this one is what the
+/// bytes said and that one is what the document claims, and the conversion
+/// between them is a line somebody can look at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Tally {
+    /// We fetched it ourselves.
+    pub local: u64,
+    /// Two or more independent fetchers agreed.
+    pub quorum: u64,
+    /// We refetched it and got the same answer.
+    pub replayed: u64,
+    /// A single fetcher's word.
+    pub unverified: u64,
+}
+
+impl Tally {
+    /// Count the `verification` column of one batch, if it has one.
+    ///
+    /// Streams other than pages do not carry the column. Their rows are
+    /// counted as `local`, which is true: a receipt or a robots record is
+    /// written by the machine that observed it and there is nobody else's
+    /// claim in it to verify.
+    fn add(&mut self, batch: &arrow::record_batch::RecordBatch) {
+        use arrow::array::AsArray as _;
+        use arrow::datatypes::UInt8Type;
+
+        let Some(column) = batch.column_by_name("verification") else {
+            self.local += batch.num_rows() as u64;
+            return;
+        };
+        for level in column.as_primitive::<UInt8Type>().values() {
+            match level {
+                0 => self.local += 1,
+                1 => self.quorum += 1,
+                2 => self.replayed += 1,
+                // Anything this build does not know is somebody else's claim
+                // that we have not checked, which is exactly `unverified`.
+                _ => self.unverified += 1,
+            }
+        }
+    }
 }
 
 /// Convert one sealed segment into one Parquet file.
@@ -112,11 +168,13 @@ pub fn convert(segment: &Segment, out: &Path) -> Result<Converted> {
 
     let mut rows = 0u64;
     let mut row_groups = 0usize;
+    let mut verification = Tally::default();
     for i in 0..segment.shoals() {
         let shoal = segment.shoal(i)?;
         shoal.verify()?;
         let batch = shoal.to_arrow(&[])?;
         rows += batch.num_rows() as u64;
+        verification.add(&batch);
         writer.write(&batch)?;
         // One shoal, one row group. `flush` closes the current group, and
         // without it parquet-rs would pack shoals together up to its own row
@@ -137,6 +195,7 @@ pub fn convert(segment: &Segment, out: &Path) -> Result<Converted> {
         sha256: digested.sha256,
         first_ms: stats.first_ms,
         last_ms: stats.last_ms,
+        verification,
     })
 }
 

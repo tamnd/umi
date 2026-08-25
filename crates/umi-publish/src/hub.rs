@@ -442,6 +442,32 @@ impl Hub {
         Ok(response.body)
     }
 
+    /// Read a whole small file, or `None` if it is not there.
+    ///
+    /// This is for manifests and their signatures and nothing else. Doc 12.5
+    /// sizes a day manifest at a few hundred kilobytes and a signature at 64
+    /// bytes, so both fit in memory without a thought, and both have to be
+    /// readable without knowing their length in advance, which is what stops
+    /// [`Hub::read_range`] from being the method for the job.
+    ///
+    /// A missing file is `Ok(None)` because that is the normal answer on the
+    /// first segment of a day. The caller starts a new manifest rather than
+    /// treating it as a failure.
+    ///
+    /// # Errors
+    ///
+    /// When the hub answers with anything other than success or a 404.
+    pub async fn read(&self, repo: &str, path: &str) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/datasets/{repo}/resolve/{MAIN}/{path}", self.base);
+        let response = self
+            .send_allowing("reading a file", &[404], || self.client.get(&url))
+            .await?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        Ok(Some(response.body))
+    }
+
     /// Everything under a path, for doc 12.8's reconciliation.
     ///
     /// # Errors
