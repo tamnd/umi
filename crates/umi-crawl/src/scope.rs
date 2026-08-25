@@ -134,6 +134,49 @@ impl Scope {
         Ok(scope)
     }
 
+    /// Add include matchers from doc 14.3's repeatable `--include`.
+    ///
+    /// Each string is read the same way a target is, so `--include
+    /// docs.example.com` and `umi crawl docs.example.com` mean the same
+    /// matcher. A second grammar for the flags would be a second thing to get
+    /// wrong, and the identifier is restamped afterwards because a scope with
+    /// different matchers is a different scope and doc 10.5's `crawl_profile`
+    /// column has to say so.
+    ///
+    /// # Errors
+    ///
+    /// [`ScopeError::Target`] for a string that names nothing.
+    pub fn add_include(&mut self, targets: &[String]) -> Result<(), ScopeError> {
+        self.extend(targets, true)
+    }
+
+    /// Add exclude matchers, as [`add_include`](Self::add_include).
+    ///
+    /// # Errors
+    ///
+    /// As [`add_include`](Self::add_include).
+    pub fn add_exclude(&mut self, targets: &[String]) -> Result<(), ScopeError> {
+        self.extend(targets, false)
+    }
+
+    fn extend(&mut self, targets: &[String], include: bool) -> Result<(), ScopeError> {
+        if targets.is_empty() {
+            return Ok(());
+        }
+        for target in targets {
+            let parsed = Self::for_target(target)?;
+            let list = if include {
+                &mut self.include
+            } else {
+                &mut self.exclude
+            };
+            list.extend(parsed.include);
+        }
+        let source = format!("{}|{}", self.name, targets.join("|"));
+        self.stamp(source.as_bytes());
+        Ok(())
+    }
+
     /// Read doc 13.4's profile.
     ///
     /// # Errors
@@ -159,7 +202,7 @@ impl Scope {
                     .budget
                     .max_duration
                     .as_deref()
-                    .map(duration)
+                    .map(parse_duration)
                     .transpose()?,
                 stop_when_idle: file.budget.stop_when_idle,
             },
@@ -570,7 +613,16 @@ fn matchers(file: Vec<MatcherFile>) -> Result<Vec<Matcher>, ScopeError> {
 /// Not a general duration parser. Doc 13.4's example is `6h` and doc 14.3's is
 /// `--for 30m`, and a profile that wants a duration nobody can read at a glance
 /// is a profile with a different problem.
-fn duration(text: &str) -> Result<Duration, ScopeError> {
+///
+/// Public because `--for` on the command line takes the same spelling as
+/// `max_duration` in the profile, and two parsers that were supposed to agree
+/// would eventually not.
+///
+/// # Errors
+///
+/// [`ScopeError::Duration`] for anything that is not a number and one of those
+/// four letters.
+pub fn parse_duration(text: &str) -> Result<Duration, ScopeError> {
     let text = text.trim();
     let (number, unit) = text.split_at(text.len().saturating_sub(1));
     let value: u64 = number

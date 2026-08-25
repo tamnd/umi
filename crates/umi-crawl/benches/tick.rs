@@ -574,6 +574,7 @@ async fn run<F: Fetch>(crawler: &Crawler<F, Arc<FixedClock>>, n: usize) -> TickR
         total.leased += report.leased;
         total.rows += report.rows;
         total.fetched += report.fetched;
+        total.bytes_fetched += report.bytes_fetched;
         total.links_seen += report.links_seen;
         total.links_admitted += report.links_admitted;
         if i + 1 < n {

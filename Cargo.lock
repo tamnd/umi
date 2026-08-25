@@ -2783,6 +2783,7 @@ name = "umi-cli"
 version = "0.0.1"
 dependencies = [
  "arrow",
+ "blake3",
  "clap",
  "hex",
  "http",
@@ -2794,10 +2795,14 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "umi-crawl",
  "umi-extract",
  "umi-fetch",
  "umi-file",
  "umi-publish",
+ "umi-seed",
+ "umi-state",
+ "umi-state-sqlite",
  "umi-types",
  "url",
 ]

@@ -13,7 +13,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use umi_cli::{Error, config, doctor, get, inspect};
+use umi_cli::{Error, config, crawl, doctor, get, inspect};
 use umi_types::{CANON_VERSION, Exit};
 
 /// An internet scale web crawler that publishes what it finds.
@@ -231,6 +231,33 @@ struct CrawlArgs {
     publish: bool,
 }
 
+impl CrawlArgs {
+    /// The flags and the configuration, as one plan.
+    ///
+    /// Doc 14.7's precedence has already run by the time this is called, so
+    /// `config` holds the answer for anything the flags left out and this is
+    /// only the translation into doc 13's vocabulary.
+    fn plan(&self, config: &config::Config) -> crawl::Options {
+        crawl::Options {
+            target: self.target.clone(),
+            include: self.include.clone(),
+            exclude: self.exclude.clone(),
+            depth: self.depth,
+            links: self.links.clone(),
+            max_pages: self.max_pages,
+            max_duration: self.r#for.clone(),
+            watch: self.watch,
+            rps: config.rps.value,
+            concurrency: config.concurrency.value,
+            tier_max: config.tier_max.value,
+            seed: self.seed.clone(),
+            seeder: self.seeder.clone(),
+            out: self.out.clone(),
+            publish: self.publish,
+        }
+    }
+}
+
 /// Options for `umi fetch`, from doc 14.4.
 #[derive(clap::Args)]
 struct FetchArgs {
@@ -345,7 +372,31 @@ fn run(command: &Command) -> Result<(), Error> {
                 },
             )
         }
+        Command::Crawl(args) => {
+            let config = load(command)?;
+            finish(crawl::crawl(&args.plan(&config)))
+        }
+        Command::Resume { dir } => finish(crawl::resume(std::path::Path::new(dir), false)),
+        Command::Watch { dir } => finish(crawl::resume(std::path::Path::new(dir), true)),
         other => Err(not_built(other)),
+    }
+}
+
+/// Turn a summary into doc 14.9's exit code.
+///
+/// A crawl that stopped on a budget is exit 4 and not exit 0, because doc 14.9
+/// is explicit that a script has to be able to tell "finished, nothing left to
+/// crawl" from "stopped early, there is more", and those are the only two ways
+/// a successful crawl ends.
+fn finish(result: Result<crawl::Summary, Error>) -> Result<(), Error> {
+    let summary = result?;
+    println!(
+        "{} rows in {} files, {} pages fetched, {} failed",
+        summary.rows, summary.files, summary.fetched, summary.failed
+    );
+    match summary.stopped {
+        crawl::Stop::Budget => Err(Error::Budget),
+        crawl::Stop::Idle => Ok(()),
     }
 }
 

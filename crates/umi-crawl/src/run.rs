@@ -154,6 +154,13 @@ pub struct TickReport {
     pub rows: usize,
     /// Fetches that produced a body.
     pub fetched: usize,
+    /// Body bytes as they arrived, before decompression.
+    ///
+    /// Doc 13.2's `max_bytes` is a budget on this number and doc 14.3's
+    /// progress line prints it, and both want what the origin actually sent
+    /// rather than what we kept, because that is the figure the origin sees
+    /// on its own bill.
+    pub bytes_fetched: u64,
     /// Conditional requests that held.
     pub not_modified: usize,
     /// Answers that were a failure of some kind.
@@ -295,6 +302,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                     umi_types::OutcomeCode::NotModified => report.not_modified += 1,
                     _ => report.failed += 1,
                 }
+                report.bytes_fetched += u64::from(row.content_length);
                 report.links_seen += links_seen;
                 candidates.extend(links);
                 rows.push(row);
