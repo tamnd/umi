@@ -13,3 +13,21 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+arrow = { workspace = true }
+blake3 = { workspace = true }
+# Doc 10.8 puts the column encode on a rayon pool, one column chunk per task,
+# because columns are independent and a full shoal is around 120 ms of single
+# core work that should not land on the fetch loop's latency.
+rayon = { workspace = true }
+thiserror = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# Not criterion. The questions doc 10 asks are bytes per page and seconds per
+# segment, which are counts over a wall clock interval rather than a statistical
+# comparison of two microsecond operations.
+[[bench]]
+name = "segment"
+harness = false

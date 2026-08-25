@@ -71,6 +71,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 arrow = "59"
 parquet = { version = "59", default-features = false, features = ["arrow", "zstd", "snap", "base64"] }
 zstd = "0.13"
+# Doc 10.8: one column chunk per task while a shoal is encoded.
+rayon = "1"
 
 # Test only, but it belongs here rather than in one crate's dev-dependencies:
 # every crate that writes a file needs a directory that cleans itself up, and
