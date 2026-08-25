@@ -42,7 +42,7 @@ Places where we picked something defensible and moved on, with what would change
 
 Doc 11.1 requires byte identical extraction output across machines, and doc 10.6 compresses the `markdown` column with zstd. zstd output is not stable across zstd versions, or across builds with different window settings, so it would be reasonable to worry that determinism is impossible.
 
-It is not a problem, because nothing is ever digested over compressed bytes. Doc 04's `extract.digest` is blake3 over the canonical CBOR of the logical extraction values, before any compression. Doc 12's file digests are over the Parquet bytes, which are compared against themselves rather than across machines. The compressed representation is free to differ between two fetchers and nothing in the verification scheme notices.
+It is not a problem, because nothing is ever digested over compressed bytes. Doc 04's `extract.digest` is blake3 over the logical extraction values, tagged and length prefixed, before any compression. Doc 12's file digests are over the Parquet bytes, which are compared against themselves rather than across machines. The compressed representation is free to differ between two fetchers and nothing in the verification scheme notices.
 
 The same argument covers FSST symbol tables, dictionary orderings, and bit packing widths. All of them are representation, none of them are content. The rule to hold onto during implementation is: **digest logical values, never encoded bytes, except when checking that a specific file arrived intact.**
 

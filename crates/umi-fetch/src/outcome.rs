@@ -14,6 +14,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+pub use umi_types::OutcomeCode;
 use umi_types::Revalidator;
 
 use crate::sniff::Media;
@@ -194,34 +195,41 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The string doc 04.5's receipt carries.
+    /// Which of doc 04.5's outcomes this is.
     ///
-    /// Two deviations, flagged rather than papered over. Doc 04.5 lists no
-    /// variant for a plain 5xx and none for a 429. The closest in both cases
-    /// is `blocked`, which means bot management, and folding either into it
-    /// would corrupt the one statistic doc 05.10 exists to publish. This
-    /// returns `server_error` and `rate_limited`, and doc 04's enum wants
-    /// both entries adding.
+    /// This enum is richer than that one, because it carries the body and the
+    /// hops and the timeout stage, and the code is the part that goes in a
+    /// receipt and in the `outcome` column. Two variants collapse on the way
+    /// through and both are deliberate: every [`Stage`] of timeout is one
+    /// `timeout`, since which timer fired is a diagnostic and not something a
+    /// consumer of the dataset can act on, and a 404 and any other unhandled
+    /// 4xx are both `not_found`, since the retry schedule is the same.
     #[must_use]
-    pub const fn wire(&self) -> &'static str {
+    pub const fn code(&self) -> OutcomeCode {
         match self {
-            Self::Ok(_) => "ok",
-            Self::NotModified { .. } => "not_modified",
-            Self::Gone => "gone",
-            Self::RedirectedOffDomain { .. } => "redirected_off_host",
+            Self::Ok(_) => OutcomeCode::Ok,
+            Self::NotModified { .. } => OutcomeCode::NotModified,
+            Self::Gone => OutcomeCode::Gone,
+            Self::RedirectedOffDomain { .. } => OutcomeCode::RedirectedOffHost,
             Self::Failed { failure, .. } => match failure {
-                Failure::Dns => "dns_failure",
-                Failure::Tls => "tls_failure",
-                Failure::Connect => "connect_failure",
-                Failure::Timeout(_) => "timeout",
-                Failure::ServerError => "server_error",
-                Failure::NotFound => "not_found",
-                Failure::Blocked => "blocked",
-                Failure::RateLimited => "rate_limited",
-                Failure::TooLarge => "too_large",
-                Failure::Malformed => "malformed",
+                Failure::Dns => OutcomeCode::DnsFailure,
+                Failure::Tls => OutcomeCode::TlsFailure,
+                Failure::Connect => OutcomeCode::ConnectFailure,
+                Failure::Timeout(_) => OutcomeCode::Timeout,
+                Failure::ServerError => OutcomeCode::ServerError,
+                Failure::NotFound => OutcomeCode::NotFound,
+                Failure::Blocked => OutcomeCode::Blocked,
+                Failure::RateLimited => OutcomeCode::RateLimited,
+                Failure::TooLarge => OutcomeCode::TooLarge,
+                Failure::Malformed => OutcomeCode::Malformed,
             },
         }
+    }
+
+    /// The string doc 04.5's receipt carries.
+    #[must_use]
+    pub const fn wire(&self) -> &'static str {
+        self.code().wire()
     }
 
     /// The page, if there is one.

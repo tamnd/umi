@@ -99,9 +99,12 @@ umi/
     umi-file/          the .umi container, reader and writer (doc 10)
     umi-publish/       Parquet conversion, HF client, manifests, GC (doc 12)
     umi-seed/          Common Crawl and sitemap seeding (doc 13)
+    umi-crawl/         the loop: lease, fetch, extract, sketch, row
     umid/              the coordinator daemon
     umi-cli/           the umi binary (doc 14)
 ```
+
+`umi-crawl` was not in the first version of this list and its absence was a mistake worth explaining. The loop that turns a lease into a row is the one piece that touches the frontier, the fetcher, robots, extraction, dedup and the writer at once, and there are two programs that need it: `umid` runs it as a service and `umi crawl` runs it once from a terminal. Leaving it in either one would have made the other depend on a binary, and putting it in `umi-file` would have made the file format depend on an HTTP client. So it is a crate, it owns the doc 10.5 row builder, and it is the only place where the order of the pipeline is written down.
 
 `umi-types` is the only crate everything depends on and it must stay free of I/O and free of async. If a URL canonicalisation change requires touching six crates, the boundary is wrong.
 
