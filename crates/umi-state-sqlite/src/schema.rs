@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -333,4 +333,20 @@ END;
 CREATE TRIGGER host_removed AFTER DELETE ON hosts BEGIN
     UPDATE counts SET hosts = hosts - 1;
 END;
+";
+
+/// Version 4: doc 07.6's fast streak.
+///
+/// The adaptive delay and the politeness timer were in V1 because doc 08.3
+/// lists them, but nothing moved them until the rate limiter landed, and the
+/// limiter needs one more number: how many consecutive fast answers a host has
+/// given. That is what decides whether its floor is 1000 ms or 200 ms, and it
+/// has to survive a restart or every host on a long crawl would drop back to
+/// the slower floor every time the coordinator is upgraded.
+///
+/// Zero is the right default for an existing store. A host we have no streak
+/// for gets the conservative floor and earns its way down again over the next
+/// minute of crawling, which costs a handful of pages once.
+const V4: &str = r"
+ALTER TABLE hosts ADD COLUMN fast_streak INTEGER NOT NULL DEFAULT 0;
 ";

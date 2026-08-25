@@ -489,6 +489,14 @@ impl State for MemoryState {
                 entry.row = row;
                 entry.lease = None;
             }
+
+            // Doc 07.6's rate limiter, after the ledger row and inside the
+            // same call, so a crash cannot record the page and lose the reason
+            // to slow down for it.
+            let mut host = inner.host_or_default(&outcome.key);
+            if host.observe(&outcome.result, outcome.pace, outcome.finished_ms) {
+                inner.hosts.insert(outcome.key.host, host);
+            }
         }
         Ok(())
     }

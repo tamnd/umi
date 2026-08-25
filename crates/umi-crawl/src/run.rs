@@ -37,7 +37,8 @@ use futures_util::stream::FuturesUnordered;
 use umi_extract::extract;
 use umi_fetch::Outcome;
 use umi_state::{
-    Candidate, Discovery, FetchOutcome, FetchResult, LeaseRequest, Priority, State, StateError,
+    Candidate, Discovery, FetchOutcome, FetchResult, LeaseRequest, Pace, Priority, State,
+    StateError,
 };
 use umi_types::{FetcherId, Revalidator, RowKey, Tier, Verification};
 
@@ -344,6 +345,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         }
 
         let robots_checked_ms = entry.fetched_ms;
+        let started_ms = now();
         let outcome = match self
             .fetch
             .fetch(&lease.url, lease.revalidate.as_ref())
@@ -354,6 +356,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         };
 
         let fetched_at_ms = now();
+        let pace = pace_of(&outcome, started_ms, fetched_at_ms);
 
         // Doc 13.2's content filter, first half. This is the first moment the
         // type and the size exist, and a page rejected here is never extracted.
@@ -368,7 +371,8 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 u32::try_from(page.body.len()).unwrap_or(u32::MAX),
             )
         {
-            return Fetched::excluded(&lease, fetched_at_ms, umi_state::ExcludeReason::ContentType);
+            let reason = umi_state::ExcludeReason::ContentType;
+            return Fetched::excluded(&lease, fetched_at_ms, reason).paced(pace);
         }
 
         let host = host_of(&lease.url).unwrap_or_default();
@@ -387,7 +391,8 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         if let Some(e) = extracted.as_ref()
             && !filter.accepts_lang(e.meta.declared_lang.as_deref())
         {
-            return Fetched::excluded(&lease, fetched_at_ms, umi_state::ExcludeReason::ContentType);
+            let reason = umi_state::ExcludeReason::ContentType;
+            return Fetched::excluded(&lease, fetched_at_ms, reason).paced(pace);
         }
 
         let row = PageRow::build(&Crawled {
@@ -441,6 +446,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             finished_ms: fetched_at_ms,
             tier_used: lease.tier,
             result: result_of(&row, &outcome),
+            pace,
         };
         Fetched {
             row: Some(row),
@@ -554,11 +560,53 @@ impl Fetched {
                 finished_ms: now_ms,
                 tier_used: lease.tier,
                 result,
+                // No request was made, so there is nothing for doc 07.6's rate
+                // limiter to read. The two callers that did make one put it
+                // back with [`Fetched::paced`].
+                pace: Pace::default(),
             },
             links: Vec::new(),
             links_seen: 0,
             disallowed: false,
         }
+    }
+
+    /// Attach what the origin did, for the exclusions that happen after the
+    /// fetch rather than before it.
+    ///
+    /// Doc 13.2's content and language filters both run on a response that
+    /// already arrived. The row is dropped because the crawl asked not to have
+    /// it, and the request still happened, so the politeness timer still moves.
+    fn paced(mut self, pace: Pace) -> Self {
+        self.outcome.pace = pace;
+        self
+    }
+}
+
+/// What one fetch looked like to doc 07.6's rate limiter.
+///
+/// The latency comes from the fetcher's own [`Instant`](std::time::Instant)
+/// when there is one, because that is monotonic and the crawl clock is not.
+/// The fallback is the wall clock either side of the call, which is what a
+/// failure leaves us with: a connection that never opened has no elapsed time
+/// of its own, and how long we waited to find that out is the honest number.
+fn pace_of(outcome: &Outcome, started_ms: u64, finished_ms: u64) -> Pace {
+    let measured = match outcome {
+        Outcome::Ok(page) => Some(page.elapsed),
+        Outcome::NotModified { elapsed, .. } => Some(*elapsed),
+        _ => None,
+    };
+    let latency_ms = measured.map_or_else(
+        || finished_ms.saturating_sub(started_ms),
+        |elapsed| elapsed.as_millis().try_into().unwrap_or(u64::MAX),
+    );
+    let retry_after = match outcome {
+        Outcome::Failed { retry_after, .. } => *retry_after,
+        _ => None,
+    };
+    Pace {
+        latency_ms: Some(u32::try_from(latency_ms).unwrap_or(u32::MAX)),
+        retry_after_ms: retry_after.map(|after| after.ms_from(finished_ms)),
     }
 }
 

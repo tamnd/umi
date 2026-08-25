@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use umi_state::{
-    Candidate, Discovery, FetchOutcome, FetchResult, HostRow, LeaseRequest, Revalidator,
+    Candidate, Discovery, FetchOutcome, FetchResult, HostRow, LeaseRequest, Pace, Revalidator,
     SegmentRow, State, Stream, conformance,
 };
 use umi_types::{Digest, FetcherId, RowKey, Tier, Ulid};
@@ -308,6 +308,7 @@ async fn the_file_holds_no_native_endian_integers() {
             key: lease.key,
             finished_ms: MARKER_MS,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::Fetched {
                 status: 200,
                 content_hash: [7u8; 8],
@@ -575,6 +576,7 @@ async fn etags_are_interned_once_however_often_they_repeat() {
                 key: lease.key,
                 finished_ms: now,
                 tier_used: Tier::Plain,
+                pace: Pace::default(),
                 result: FetchResult::Fetched {
                     status: 200,
                     content_hash: [1u8; 8],
@@ -663,6 +665,7 @@ async fn the_counters_survive_everything_that_writes() {
             key: lease.key,
             finished_ms: T0 + 1000,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result,
         });
     }
@@ -686,6 +689,7 @@ async fn the_counters_survive_everything_that_writes() {
             key: lease.key,
             finished_ms: T0 + 700_000,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::Fetched {
                 status: 200,
                 content_hash: [2u8; 8],

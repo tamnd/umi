@@ -80,6 +80,7 @@ impl Fetch for Canned {
         Ok(self.pages.get(url).cloned().unwrap_or(Outcome::Failed {
             failure: umi_fetch::Failure::NotFound,
             status: Some(404),
+            retry_after: None,
         }))
     }
 }
@@ -324,6 +325,7 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
             Outcome::Failed {
                 failure: umi_fetch::Failure::ServerError,
                 status: Some(503),
+                retry_after: None,
             },
         )
         .html("https://example.com/a", &page("A", &[]));
@@ -471,6 +473,7 @@ async fn a_failed_fetch_still_produces_a_row() {
             Outcome::Failed {
                 failure: umi_fetch::Failure::ServerError,
                 status: Some(503),
+                retry_after: None,
             },
         );
     let crawler = crawler(fetch, state);
@@ -763,4 +766,70 @@ async fn rows_are_stamped_with_the_scope_that_admitted_them() {
     crawler.tick(&sink).await.expect("tick");
 
     assert_eq!(sink.rows()[0].crawl_profile, id);
+}
+
+#[tokio::test]
+async fn what_the_origin_said_about_its_rate_reaches_the_scheduler() {
+    // The end to end half of doc 07.6. A 429 has no body and so no row, and
+    // the `Retry-After` on it is the only thing the origin told us, so if the
+    // loop drops it on the way to `complete` then nothing else can honour it.
+    let state = seeded(&["https://example.com/a"]).await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .outcome(
+            "https://example.com/a",
+            Outcome::Failed {
+                failure: umi_fetch::Failure::RateLimited,
+                status: Some(429),
+                retry_after: Some(umi_fetch::RetryAfter::After(600)),
+            },
+        );
+    let crawler = crawler(fetch, Arc::clone(&state));
+
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.failed, 1);
+
+    let host = umi_types::RowKey::for_url("https://example.com/a", None)
+        .expect("a crawlable url")
+        .host;
+    let row = state
+        .host(host)
+        .await
+        .expect("host")
+        .expect("the host was fetched, so it has a record");
+    assert_eq!(
+        row.next_allowed_ms,
+        T0 + 600_000,
+        "ten minutes was asked for and something else was honoured"
+    );
+    assert_eq!(row.adaptive_delay_ms, 4000, "a 429 is doc 07.6's 4.0 rung");
+    assert_eq!(row.consecutive_failures, 1);
+}
+
+#[tokio::test]
+async fn a_page_that_came_back_quickly_counts_towards_the_fast_floor() {
+    // The other direction, and the one that is easy to leave unwired: the
+    // fetcher measured 40 ms and the host row has to hear about it, or no host
+    // ever earns doc 07.6's 200 ms floor and the crawl is capped at one page
+    // per host per second forever.
+    let state = seeded(&["https://example.com/a"]).await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/a", &page("A", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+
+    crawler.tick(&Collected::default()).await.expect("tick");
+
+    let host = umi_types::RowKey::for_url("https://example.com/a", None)
+        .expect("a crawlable url")
+        .host;
+    let row = state.host(host).await.expect("host").expect("a record");
+    assert_eq!(row.fetches, 1);
+    assert_eq!(row.failures, 0);
+    assert_eq!(row.fast_streak, 1, "a 40 ms answer is a fast one");
+    assert_eq!(
+        row.adaptive_delay_ms,
+        umi_state::HostRow::DEFAULT_FLOOR_MS,
+        "one fast answer does not earn the lower floor"
+    );
 }

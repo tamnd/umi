@@ -19,8 +19,8 @@
 use std::process::ExitCode;
 
 use umi_state::{
-    Candidate, FetchOutcome, FetchResult, HostRow, LeaseRequest, NackReason, Priority, Revalidator,
-    State,
+    Candidate, FetchOutcome, FetchResult, HostRow, LeaseRequest, NackReason, Pace, Priority,
+    Revalidator, State,
 };
 use umi_state_sqlite::SqliteState;
 use umi_types::{FetcherId, RowKey, Tier};
@@ -170,6 +170,7 @@ async fn write(path: &str) -> Result<String, String> {
                     key: lease.key,
                     finished_ms: lease.not_before_ms + 1,
                     tier_used: Tier::Plain,
+                    pace: Pace::default(),
                     result: FetchResult::Fetched {
                         status: 200,
                         content_hash: u64::from(round * 1000 + n as u32).to_le_bytes(),
@@ -286,6 +287,7 @@ async fn verify(path: &str) -> Result<String, String> {
                 key: lease.key,
                 finished_ms,
                 tier_used: Tier::Plain,
+                pace: Pace::default(),
                 result: FetchResult::NotModified {
                     status: 304,
                     revalidate: lease.revalidate.clone().unwrap_or_default(),

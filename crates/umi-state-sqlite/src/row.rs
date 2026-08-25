@@ -202,8 +202,35 @@ pub fn host_record(row: &Row<'_>) -> rusqlite::Result<HostRow> {
         fetches: count(row, "fetches")?,
         failures: count(row, "failures")?,
         consecutive_failures: small(row, "consecutive_failures")?,
+        fast_streak: small(row, "fast_streak")?,
         blocked: row.get::<_, i64>("blocked")? != 0,
         refusing: row.get::<_, i64>("refusing")? != 0,
+    })
+}
+
+/// The pacing half of a host record, for [`sql::SELECT_PACE`].
+///
+/// Everything doc 07.6's rate limiter does not read is left at its default,
+/// which is safe only because the write side is [`sql::PACE_HOST`] and that is
+/// as narrow as this is. A row from here must never be handed to `put_host`,
+/// which would write those defaults over a real robots record.
+///
+/// [`sql::SELECT_PACE`]: crate::sql::SELECT_PACE
+/// [`sql::PACE_HOST`]: crate::sql::PACE_HOST
+pub fn pacing(row: &Row<'_>, host_id: HostId) -> rusqlite::Result<HostRow> {
+    Ok(HostRow {
+        host: host_id,
+        pld: pld(row, "pld")?,
+        adaptive_delay_ms: small(row, "adaptive_delay_ms")?,
+        crawl_delay_ms: row
+            .get::<_, Option<i64>>("crawl_delay_ms")?
+            .map(|ms| u32::try_from(ms).unwrap_or(u32::MAX)),
+        next_allowed_ms: from_ms(row.get("next_allowed_ms")?),
+        fetches: count(row, "fetches")?,
+        failures: count(row, "failures")?,
+        consecutive_failures: small(row, "consecutive_failures")?,
+        fast_streak: small(row, "fast_streak")?,
+        ..HostRow::default()
     })
 }
 

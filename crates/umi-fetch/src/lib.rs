@@ -63,7 +63,7 @@ pub mod headers;
 pub mod outcome;
 pub mod sniff;
 
-pub use outcome::{Failure, Hop, Outcome, OutcomeCode, Page, Stage, Version};
+pub use outcome::{Failure, Hop, Outcome, OutcomeCode, Page, RetryAfter, Stage, Version};
 pub use sniff::Media;
 pub use umi_types::Revalidator;
 
@@ -242,6 +242,7 @@ impl Fetcher {
             Err(_) => Ok(Outcome::Failed {
                 status: None,
                 failure: Failure::Timeout(Stage::Total),
+                retry_after: None,
             }),
         }
     }
@@ -263,6 +264,7 @@ impl Fetcher {
                     return Outcome::Failed {
                         status: None,
                         failure,
+                        retry_after: None,
                     };
                 }
             };
@@ -270,6 +272,11 @@ impl Fetcher {
             let status = response.status().as_u16();
             let version = Version::from(response.version());
             let head = response.headers().clone();
+            // Read once, at the top, so that every way out of this loop that
+            // has a response behind it carries what the origin asked for. A
+            // `Retry-After` on a 429 is the whole message and the 429 has no
+            // body to put it in.
+            let retry_after = headers::retry_after(&head);
 
             // 304 is a 3xx and is not a redirect, so it has to be answered
             // before the `Location` handling below ever looks at it.
@@ -287,6 +294,7 @@ impl Fetcher {
                     return Outcome::Failed {
                         status: Some(status),
                         failure: Failure::Malformed,
+                        retry_after,
                     };
                 }
                 if registrable_domain(&target) != origin_domain {
@@ -311,6 +319,7 @@ impl Fetcher {
                     Some(failure) => Outcome::Failed {
                         status: Some(status),
                         failure,
+                        retry_after,
                     },
                 };
             }
@@ -322,6 +331,7 @@ impl Fetcher {
                 return Outcome::Failed {
                     status: Some(status),
                     failure: Failure::TooLarge,
+                    retry_after,
                 };
             }
 
@@ -332,6 +342,7 @@ impl Fetcher {
                     return Outcome::Failed {
                         status: Some(status),
                         failure,
+                        retry_after,
                     };
                 }
             };

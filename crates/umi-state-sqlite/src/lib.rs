@@ -61,6 +61,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -725,6 +726,19 @@ impl State for SqliteState {
             set_sync(&inner.conn, Sync::Durable)?;
             let tx = inner.conn.transaction().state()?;
 
+            // Doc 07.6's rate limiter, held per host across the whole batch
+            // rather than read and written per url. A tick's completions run
+            // heavily to a handful of hosts, so this turns two statements per
+            // url into two per host, and it is also the only way the streak
+            // and the failure counters come out right: eight completions for
+            // one host are eight observations of that host in order, not eight
+            // independent reads of the same starting row.
+            // The flag is whether anything in the batch actually moved this
+            // host. A tick made entirely of robots exclusions is a real tick
+            // and it made no requests, so it must not leave a host record
+            // behind saying we spoke to somebody we did not.
+            let mut paced: HashMap<HostId, (HostRow, bool)> = HashMap::new();
+
             for outcome in outcomes {
                 let before: Option<LedgerRow> = tx
                     .prepare_cached(sql::SELECT_LEDGER)
@@ -864,6 +878,59 @@ impl State for SqliteState {
                         &outcome.key.url.as_bytes()[..],
                     ])
                     .state()?;
+
+                // A completion with no latency behind it never reached the
+                // wire, so it has nothing to say about the host and there is no
+                // point reading one. A tick spent entirely on a disallowed site
+                // is all of these, and it should cost no host statements at all.
+                if outcome.pace.latency_ms.is_none() {
+                    continue;
+                }
+
+                // Read through on the first completion for a host and keep it,
+                // so the observations below stack. A host with no record yet
+                // starts from `HostRow::new`, which is what the lease query's
+                // COALESCE defaults already assume.
+                let seat = match paced.entry(outcome.key.host) {
+                    Entry::Occupied(seat) => seat.into_mut(),
+                    Entry::Vacant(seat) => {
+                        let stored = tx
+                            .prepare_cached(sql::SELECT_PACE)
+                            .state()?
+                            .query_row(params![&outcome.key.host.as_bytes()[..]], |read| {
+                                row::pacing(read, outcome.key.host)
+                            })
+                            .optional()
+                            .state()?;
+                        let host = stored
+                            .unwrap_or_else(|| HostRow::new(outcome.key.host, outcome.key.pld));
+                        seat.insert((host, false))
+                    }
+                };
+                seat.1 |= seat
+                    .0
+                    .observe(&outcome.result, outcome.pace, outcome.finished_ms);
+            }
+
+            {
+                let mut pace = tx.prepare_cached(sql::PACE_HOST).state()?;
+                for (host, moved) in paced.values() {
+                    if !*moved {
+                        continue;
+                    }
+                    pace.execute(params![
+                        &host.host.as_bytes()[..],
+                        &host.pld.as_bytes()[..],
+                        i64::from(host.adaptive_delay_ms),
+                        row::to_ms(host.next_allowed_ms),
+                        row::to_ms(host.fetches),
+                        row::to_ms(host.failures),
+                        i64::from(host.consecutive_failures),
+                        i64::from(host.fast_streak),
+                        i64::from(Tier::default().as_u8()),
+                    ])
+                    .state()?;
+                }
             }
 
             tx.commit().state()
@@ -952,6 +1019,7 @@ impl State for SqliteState {
                         row::to_ms(host.fetches),
                         row::to_ms(host.failures),
                         i64::from(host.consecutive_failures),
+                        i64::from(host.fast_streak),
                         i64::from(host.blocked),
                         i64::from(host.refusing),
                     ])
@@ -1176,10 +1244,6 @@ fn insert_ledger(
     Ok(())
 }
 
-/// Put an ETag in the pool and return the reference a ledger row stores.
-///
-/// One statement rather than an insert and a select, because `RETURNING` gives
-/// the id whether the row was new or already there.
 fn intern_etag(tx: &rusqlite::Transaction<'_>, etag: &str) -> Result<u32> {
     let id: i64 = tx
         .prepare_cached(sql::INTERN_ETAG)

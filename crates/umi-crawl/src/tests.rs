@@ -203,6 +203,7 @@ fn a_failure_row_says_what_failed_and_nothing_more() {
     let outcome = Outcome::Failed {
         status: Some(503),
         failure: Failure::ServerError,
+        retry_after: None,
     };
     let row = PageRow::build(&crawled(&outcome, None));
     assert_eq!(row.status, 503);
@@ -215,6 +216,7 @@ fn a_failure_row_says_what_failed_and_nothing_more() {
     let outcome = Outcome::Failed {
         status: None,
         failure: Failure::Timeout(Stage::Read),
+        retry_after: None,
     };
     let row = PageRow::build(&crawled(&outcome, None));
     assert_eq!(row.status, 0);
@@ -246,10 +248,12 @@ fn two_error_rows_agree_with_each_other_because_they_have_the_same_content() {
     let a = Outcome::Failed {
         status: Some(500),
         failure: Failure::ServerError,
+        retry_after: None,
     };
     let b = Outcome::Failed {
         status: Some(502),
         failure: Failure::ServerError,
+        retry_after: None,
     };
     let a = PageRow::build(&crawled(&a, None));
     let b = PageRow::build(&crawled(&b, None));
@@ -417,6 +421,7 @@ fn the_batch_matches_doc_10_5_for_every_shape_of_row() {
         &Outcome::Failed {
             status: None,
             failure: Failure::Dns,
+            retry_after: None,
         },
         None,
     )));
@@ -439,6 +444,7 @@ fn the_columns_hold_what_the_rows_held() {
         &Outcome::Failed {
             status: Some(404),
             failure: Failure::NotFound,
+            retry_after: None,
         },
         None,
     ));

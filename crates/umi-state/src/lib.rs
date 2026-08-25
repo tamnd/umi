@@ -58,12 +58,14 @@ use umi_types::{HostId, PldId, Ulid};
 
 pub mod conformance;
 pub mod memory;
+pub mod pace;
 mod types;
 
 #[cfg(test)]
 mod tests;
 
 pub use memory::MemoryState;
+pub use pace::Pace;
 pub use types::{
     AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, ExcludeReason, FailureKind,
     FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,

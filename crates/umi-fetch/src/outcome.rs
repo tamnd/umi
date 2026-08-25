@@ -103,6 +103,48 @@ pub struct Page {
     pub elapsed: Duration,
 }
 
+/// What a `Retry-After` header said, in the form the origin used.
+///
+/// Kept in the origin's form rather than resolved to a wait, because the date
+/// form needs to know what time it is and nothing in this crate reads a clock.
+/// That is the same rule doc 11.1 puts on the row builder and it holds here for
+/// the same reason: a fetcher that reads the wall clock cannot be replayed, and
+/// two fetchers of the same response would disagree about a header that the
+/// origin was perfectly precise about. [`RetryAfter::ms_from`] is where the
+/// caller, which does know the time, turns it into a number of milliseconds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RetryAfter {
+    /// The delta-seconds form, which is what almost every origin sends.
+    After(u32),
+    /// The HTTP-date form, as milliseconds since the Unix epoch.
+    At(u64),
+}
+
+impl RetryAfter {
+    /// Doc 07.6 honours `Retry-After` up to a day and no further.
+    ///
+    /// A longer one is not a lie, it is a site telling us to come back next
+    /// week, and the frontier already has a way to express that: the url falls
+    /// due later. Parking the whole host for a fortnight on the strength of one
+    /// header is a much bigger decision than the header is making.
+    pub const MAX_MS: u32 = 24 * 60 * 60 * 1000;
+
+    /// How long to wait, for a caller that knows what time it is.
+    ///
+    /// A date in the past is zero rather than an error. Clocks disagree by a
+    /// few seconds all the time and an origin that says "retry at 12:00:03"
+    /// when we think it is 12:00:05 is asking for nothing, not for a negative
+    /// wait.
+    #[must_use]
+    pub fn ms_from(self, now_ms: u64) -> u32 {
+        let ms = match self {
+            Self::After(seconds) => u64::from(seconds).saturating_mul(1000),
+            Self::At(at_ms) => at_ms.saturating_sub(now_ms),
+        };
+        u32::try_from(ms).unwrap_or(u32::MAX).min(Self::MAX_MS)
+    }
+}
+
 /// Why a fetch produced no body.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]
@@ -180,6 +222,12 @@ pub enum Outcome {
         status: Option<u16>,
         /// What went wrong.
         failure: Failure,
+        /// `Retry-After`, when the response carried one. Doc 07.6's rate
+        /// limiter honours it, which is why it is on the outcome rather than
+        /// only in the kept headers: a 429 has no body and so no row, and the
+        /// one thing the origin said is the one thing we would otherwise
+        /// throw away.
+        retry_after: Option<RetryAfter>,
     },
     /// A redirect left the registrable domain the lease was for. Doc 04.7 says
     /// a fetcher must not follow one: it stops, and the coordinator admits the
@@ -282,6 +330,7 @@ mod tests {
                 Outcome::Failed {
                     status: None,
                     failure: *failure,
+                    retry_after: None,
                 }
                 .wire()
             })
@@ -305,6 +354,7 @@ mod tests {
                 Outcome::Failed {
                     status: None,
                     failure: Failure::Timeout(stage),
+                    retry_after: None,
                 }
                 .wire(),
                 "timeout"
@@ -317,14 +367,17 @@ mod tests {
         let blocked = Outcome::Failed {
             status: Some(403),
             failure: Failure::Blocked,
+            retry_after: None,
         };
         let tls = Outcome::Failed {
             status: None,
             failure: Failure::Tls,
+            retry_after: None,
         };
         let broken = Outcome::Failed {
             status: Some(500),
             failure: Failure::ServerError,
+            retry_after: None,
         };
         assert!(blocked.is_block_signal());
         assert!(tls.is_block_signal(), "doc 05.8 names the handshake case");

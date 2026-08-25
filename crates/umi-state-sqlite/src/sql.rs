@@ -179,6 +179,47 @@ INSERT INTO hosts (
 ) VALUES (?1, ?2, ?4, ?3, ?5, ?5, ?5, 0, 0, 0, 0, 0, '', 0, 0, 0, 0, 0)
 ON CONFLICT(host) DO UPDATE SET next_allowed_ms = ?3";
 
+/// The eight columns doc 07.6's rate limiter reads, and no more.
+///
+/// `complete` calls this once per host in the batch and the wide
+/// [`SELECT_HOST`] would make it pay for a robots digest, a tier policy and two
+/// string allocations it has no use for. The rate limiter reads seven integers
+/// and writes six of them, so this reads seven integers.
+pub const SELECT_PACE: &str = "
+SELECT pld, adaptive_delay_ms, crawl_delay_ms, next_allowed_ms,
+       fetches, failures, consecutive_failures, fast_streak
+  FROM hosts WHERE host = ?1";
+
+/// Write back what doc 07.6's rate limiter decided, and nothing else.
+///
+/// Narrow for the same reason [`BUMP_HOST_CLOCK`] is narrow. This path owns six
+/// integers and nothing else on the record, and writing all twenty five columns
+/// would mean every completion also rewrote a robots digest and a sitemap list
+/// it had read a moment earlier and not changed. Today the single writer rule in
+/// doc 08.7 means that would still be correct, just wasteful. It stops being
+/// correct the day the writer is no longer alone, and there is no reason to
+/// leave that lying around.
+///
+/// The insert branch is for a host we have somehow never leased, which cannot
+/// happen through the crawl loop because a completion follows a lease. It is
+/// here so that a store hand fed a completion still ends up with a coherent
+/// record rather than none.
+pub const PACE_HOST: &str = "
+INSERT INTO hosts (
+    host, pld, adaptive_delay_ms, next_allowed_ms,
+    tier_preferred, tier_max, tier_last_success, tier_blocks,
+    tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
+    sitemaps, fetches, failures, consecutive_failures, fast_streak,
+    blocked, refusing
+) VALUES (?1, ?2, ?3, ?4, ?9, ?9, ?9, 0, 0, 0, 0, 0, '', ?5, ?6, ?7, ?8, 0, 0)
+ON CONFLICT(host) DO UPDATE SET
+    adaptive_delay_ms    = ?3,
+    next_allowed_ms      = ?4,
+    fetches              = ?5,
+    failures             = ?6,
+    consecutive_failures = ?7,
+    fast_streak          = ?8";
+
 /// The row `complete` needs before it can work out what changed.
 pub const SELECT_LEDGER: &str = "
 SELECT host, url_key_full, depth, priority, state, next_due_ms, last_fetch_ms,
@@ -227,7 +268,7 @@ SELECT host, pld, robots_digest, robots_fetched_ms, robots_expires_ms,
        tier_preferred, tier_max, tier_last_success, tier_blocks,
        tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
        content_usage, sitemaps, fetches, failures, consecutive_failures,
-       blocked, refusing
+       fast_streak, blocked, refusing
   FROM hosts
  WHERE host = ?1";
 
@@ -243,10 +284,10 @@ INSERT OR REPLACE INTO hosts (
     tier_preferred, tier_max, tier_last_success, tier_blocks,
     tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
     content_usage, sitemaps, fetches, failures, consecutive_failures,
-    blocked, refusing
+    fast_streak, blocked, refusing
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
 )";
 
 /// Put an ETag in the pool and get back the reference a ledger row stores.

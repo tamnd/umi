@@ -52,7 +52,7 @@
 use std::time::Instant;
 
 use umi_state::{
-    Candidate, Discovery, FetchOutcome, FetchResult, LeaseRequest, Priority, RemoteCopy,
+    Candidate, Discovery, FetchOutcome, FetchResult, LeaseRequest, Pace, Priority, RemoteCopy,
     Revalidator, SegmentQuery, SegmentRow, State, Stream,
 };
 use umi_state_sqlite::SqliteState;
@@ -222,6 +222,13 @@ async fn completing(state: &SqliteState, repeat: usize) {
                 key: lease.key,
                 finished_ms: now,
                 tier_used: Tier::Plain,
+                // A latency, so doc 07.6's rate limiter actually runs. It
+                // reads and writes a host row per host in the batch and that
+                // cost belongs in the number, not outside it.
+                pace: Pace {
+                    latency_ms: Some(120 + (n % 400) as u32),
+                    retry_after_ms: None,
+                },
                 result: FetchResult::Fetched {
                     status: 200,
                     // Half the pages changed, so both branches of
