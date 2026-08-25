@@ -194,6 +194,10 @@ The writer will be killed. Assume SIGKILL at the worst possible byte offset, ass
 
 **What we do not do.** No double write, no journal, no torn page protection beyond the commit record, no `O_DIRECT`, no `fsync` on the directory entry past file creation. Append only files plus commit records give the same guarantee for a fraction of the write amplification, and write amplification on server2's disks is the thing to avoid.
 
+**Measured, rather than asserted.** Everything above is a claim about what happens when a process dies, and doc 16's gate 1.3 is where it stops being a claim. The suite lives in `crates/umi-file/tests/crash.rs`. It spawns a writer, kills it a hundred times at offsets drawn from a fixed seed, and checks that what the killed process left behind is a prefix of the bytes a clean run produces and nothing else. That prefix result is what licenses the rest of the suite to work by cutting a good file rather than by killing a process, which is how it can then check a hundred exact offsets, a tail of somebody else's bytes where the short file should have been, a shoal whose directory changed under a valid commit record, and a column chunk that changed under a valid directory. Every one of them has to come back as the committed prefix, with the shoal that was in flight missing and no shoal before it.
+
+The two digest checks are the ones worth naming, because they are the ones a reasonable person would call redundant. Removing either leaves the whole suite passing except for the one case written for it, which is the argument for having written those cases rather than trusting that a torn write always shortens a file.
+
 ## 10.8 Writer memory
 
 The writer holds one shoal being filled in unencoded column builders and one shoal being encoded and written. Unencoded markdown dominates: a 32 MiB encoded shoal is roughly 90 MB of builders. Two in flight plus training and slack is where the default comes from.
