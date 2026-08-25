@@ -12,6 +12,8 @@ use std::time::Duration;
 
 use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
 
+use crate::pace::Pace;
+
 // A fetcher needs this to build a conditional request and needs nothing else
 // from the state layer, so it lives in umi-types and is re-exported here. Doc
 // 04.5 is the reason: a community fetcher implements the protocol, not the
@@ -272,6 +274,13 @@ pub struct FetchOutcome {
     pub tier_used: Tier,
     /// The answer.
     pub result: FetchResult,
+    /// What the response looked like to doc 07.6's rate limiter.
+    ///
+    /// Facts, not a decision: how long it took and what `Retry-After` said.
+    /// The delay those turn into is computed by
+    /// [`HostRow::observe`](crate::HostRow::observe) on the coordinator, so a
+    /// fetcher cannot report itself a faster rate.
+    pub pace: Pace,
 }
 
 /// The five things a fetch can conclude.
@@ -538,6 +547,10 @@ pub struct HostRow {
     pub failures: u64,
     /// Consecutive failures right now, which drives the host level backoff.
     pub consecutive_failures: u16,
+    /// Consecutive fast successful responses, which is what earns a host the
+    /// 200 ms floor in [`floor_ms`](HostRow::floor_ms). Reset by anything that
+    /// is not both fast and successful.
+    pub fast_streak: u16,
     /// Blocked by an operator under doc 07.7. Never crawled, never admitted,
     /// and never silently reversed.
     pub blocked: bool,

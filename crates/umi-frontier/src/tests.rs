@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 
 use umi_state::{
-    Discovery, FetchOutcome, FetchResult, HostRow, Lease, MemoryState, Revalidator, State,
+    Discovery, FetchOutcome, FetchResult, HostRow, Lease, MemoryState, Pace, Revalidator, State,
 };
 use umi_types::{HostId, PldId, RowKey, Tier};
 
@@ -46,6 +46,7 @@ async fn complete(state: &MemoryState, leases: &[Lease], now_ms: u64) {
             key: lease.key,
             finished_ms: now_ms,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::Fetched {
                 status: 200,
                 content_hash: [1u8; 8],

@@ -202,6 +202,7 @@ pub fn host_record(row: &Row<'_>) -> rusqlite::Result<HostRow> {
         fetches: count(row, "fetches")?,
         failures: count(row, "failures")?,
         consecutive_failures: small(row, "consecutive_failures")?,
+        fast_streak: small(row, "fast_streak")?,
         blocked: row.get::<_, i64>("blocked")? != 0,
         refusing: row.get::<_, i64>("refusing")? != 0,
     })

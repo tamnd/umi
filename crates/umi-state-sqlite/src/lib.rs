@@ -61,6 +61,7 @@
 
 #![forbid(unsafe_code)]
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -725,6 +726,19 @@ impl State for SqliteState {
             set_sync(&inner.conn, Sync::Durable)?;
             let tx = inner.conn.transaction().state()?;
 
+            // Doc 07.6's rate limiter, held per host across the whole batch
+            // rather than read and written per url. A tick's completions run
+            // heavily to a handful of hosts, so this turns two statements per
+            // url into two per host, and it is also the only way the streak
+            // and the failure counters come out right: eight completions for
+            // one host are eight observations of that host in order, not eight
+            // independent reads of the same starting row.
+            // The flag is whether anything in the batch actually moved this
+            // host. A tick made entirely of robots exclusions is a real tick
+            // and it made no requests, so it must not leave a host record
+            // behind saying we spoke to somebody we did not.
+            let mut paced: HashMap<HostId, (HostRow, bool)> = HashMap::new();
+
             for outcome in outcomes {
                 let before: Option<LedgerRow> = tx
                     .prepare_cached(sql::SELECT_LEDGER)
@@ -864,6 +878,37 @@ impl State for SqliteState {
                         &outcome.key.url.as_bytes()[..],
                     ])
                     .state()?;
+
+                // Read through on the first completion for a host and keep it,
+                // so the observations below stack. A host with no record yet
+                // starts from `HostRow::new`, which is what the lease query's
+                // COALESCE defaults already assume.
+                let seat = match paced.entry(outcome.key.host) {
+                    Entry::Occupied(seat) => seat.into_mut(),
+                    Entry::Vacant(seat) => {
+                        let stored = tx
+                            .prepare_cached(sql::SELECT_HOST)
+                            .state()?
+                            .query_row(params![&outcome.key.host.as_bytes()[..]], row::host_record)
+                            .optional()
+                            .state()?;
+                        let host = stored
+                            .unwrap_or_else(|| HostRow::new(outcome.key.host, outcome.key.pld));
+                        seat.insert((host, false))
+                    }
+                };
+                seat.1 |= seat
+                    .0
+                    .observe(&outcome.result, outcome.pace, outcome.finished_ms);
+            }
+
+            {
+                let mut put = tx.prepare_cached(sql::PUT_HOST).state()?;
+                for (host, moved) in paced.values() {
+                    if *moved {
+                        put_host(&mut put, host)?;
+                    }
+                }
             }
 
             tx.commit().state()
@@ -928,34 +973,7 @@ impl State for SqliteState {
             {
                 let mut put = tx.prepare_cached(sql::PUT_HOST).state()?;
                 for host in rows {
-                    let robots = host.robots;
-                    put.execute(params![
-                        &host.host.as_bytes()[..],
-                        &host.pld.as_bytes()[..],
-                        robots.map(|r| r.digest.as_bytes().to_vec()),
-                        robots.map(|r| row::to_ms(r.fetched_ms)),
-                        robots.map(|r| row::to_ms(r.expires_ms)),
-                        robots.map(|r| i64::from(r.authoritative)),
-                        i64::from(host.adaptive_delay_ms),
-                        host.crawl_delay_ms.map(i64::from),
-                        row::to_ms(host.next_allowed_ms),
-                        i64::from(host.tier.preferred.as_u8()),
-                        i64::from(host.tier.max.as_u8()),
-                        i64::from(host.tier.last_success.as_u8()),
-                        i64::from(host.tier.consecutive_blocks),
-                        row::to_ms(host.tier.last_probe_down_ms),
-                        i64::from(host.tier.render_required),
-                        i64::from(host.tier.weak_revalidator),
-                        i64::from(host.tier.lying_revalidator),
-                        host.content_usage.as_deref(),
-                        row::join_sitemaps(&host.sitemaps),
-                        row::to_ms(host.fetches),
-                        row::to_ms(host.failures),
-                        i64::from(host.consecutive_failures),
-                        i64::from(host.blocked),
-                        i64::from(host.refusing),
-                    ])
-                    .state()?;
+                    put_host(&mut put, host)?;
                 }
             }
             tx.commit().state()?;
@@ -1173,6 +1191,47 @@ fn insert_ledger(
         i64::from(row.fail_streak),
     ])
     .state()?;
+    Ok(())
+}
+
+/// Bind and run one host upsert.
+///
+/// Shared by [`put_host`](SqliteState::put_host) and by `complete`, which
+/// writes the rate limiter's answer under doc 07.6. One function because the
+/// column order in [`sql::PUT_HOST`] has twenty five entries and two hand
+/// written copies of it would eventually disagree about one of them, which is
+/// the sort of bug that shows up as a host with somebody else's crawl delay.
+fn put_host(statement: &mut rusqlite::CachedStatement<'_>, host: &HostRow) -> Result<()> {
+    let robots = host.robots;
+    statement
+        .execute(params![
+            &host.host.as_bytes()[..],
+            &host.pld.as_bytes()[..],
+            robots.map(|r| r.digest.as_bytes().to_vec()),
+            robots.map(|r| row::to_ms(r.fetched_ms)),
+            robots.map(|r| row::to_ms(r.expires_ms)),
+            robots.map(|r| i64::from(r.authoritative)),
+            i64::from(host.adaptive_delay_ms),
+            host.crawl_delay_ms.map(i64::from),
+            row::to_ms(host.next_allowed_ms),
+            i64::from(host.tier.preferred.as_u8()),
+            i64::from(host.tier.max.as_u8()),
+            i64::from(host.tier.last_success.as_u8()),
+            i64::from(host.tier.consecutive_blocks),
+            row::to_ms(host.tier.last_probe_down_ms),
+            i64::from(host.tier.render_required),
+            i64::from(host.tier.weak_revalidator),
+            i64::from(host.tier.lying_revalidator),
+            host.content_usage.as_deref(),
+            row::join_sitemaps(&host.sitemaps),
+            row::to_ms(host.fetches),
+            row::to_ms(host.failures),
+            i64::from(host.consecutive_failures),
+            i64::from(host.fast_streak),
+            i64::from(host.blocked),
+            i64::from(host.refusing),
+        ])
+        .state()?;
     Ok(())
 }
 

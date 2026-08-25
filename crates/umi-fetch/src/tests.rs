@@ -14,7 +14,9 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use super::{Failure, FetchConfig, Fetcher, Media, Outcome, Revalidator, Stage, USER_AGENT};
+use super::{
+    Failure, FetchConfig, Fetcher, Media, Outcome, RetryAfter, Revalidator, Stage, USER_AGENT,
+};
 
 /// What the scripted origin does once it has read a request.
 enum Reply {
@@ -401,6 +403,7 @@ async fn a_declared_length_over_the_cap_is_refused_before_the_body_is_read() {
         Outcome::Failed {
             status: Some(200),
             failure: Failure::TooLarge,
+            retry_after: None,
         }
     );
 }
@@ -430,6 +433,7 @@ async fn a_body_that_declares_no_length_is_still_capped() {
         Outcome::Failed {
             status: Some(200),
             failure: Failure::TooLarge,
+            retry_after: None,
         }
     );
 }
@@ -453,6 +457,7 @@ async fn an_origin_that_goes_quiet_mid_body_hits_the_read_timeout() {
         Outcome::Failed {
             status: Some(200),
             failure: Failure::Timeout(Stage::Read),
+            retry_after: None,
         }
     );
 }
@@ -484,6 +489,7 @@ async fn an_origin_that_trickles_forever_hits_the_total_timeout() {
         Outcome::Failed {
             status: None,
             failure: Failure::Timeout(Stage::Total),
+            retry_after: None,
         }
     );
 }
@@ -500,6 +506,7 @@ async fn the_status_classes_land_where_the_scheduler_expects_them() {
     let failed = |status, failure| Outcome::Failed {
         status: Some(status),
         failure,
+        retry_after: None,
     };
     let cases = [
         Case {
@@ -566,6 +573,9 @@ async fn a_rate_limit_is_not_a_block() {
         Outcome::Failed {
             status: Some(429),
             failure: Failure::RateLimited,
+            // Doc 07.6 honours this and a 429 has no body to carry it, so the
+            // outcome is the only place it can survive the fetch.
+            retry_after: Some(RetryAfter::After(60)),
         }
     );
     assert!(!outcome.is_block_signal());
@@ -658,6 +668,7 @@ async fn nothing_listening_is_a_connect_failure_and_not_a_panic() {
             Outcome::Failed {
                 failure: Failure::Connect | Failure::Timeout(Stage::Connect),
                 status: None,
+                ..
             }
         ),
         "{outcome:?}"

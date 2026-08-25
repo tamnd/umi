@@ -101,7 +101,9 @@ pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
             Ok(())
         }
         Outcome::Gone => Err(Error::Fetch("410 gone".to_owned())),
-        Outcome::Failed { status, failure } => Err(Error::Fetch(match status {
+        Outcome::Failed {
+            status, failure, ..
+        } => Err(Error::Fetch(match status {
             Some(code) => format!("{code}, {failure:?}"),
             None => format!("{failure:?}"),
         })),

@@ -36,7 +36,7 @@ use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 
 use crate::{
     Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow, LeaseRequest,
-    NackReason, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow, State, Stream,
+    NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow, State, Stream,
     retry_after_ms,
 };
 
@@ -181,6 +181,9 @@ where
     run!(a_higher_priority_url_is_leased_first);
     run!(lease_returns_work_in_the_order_the_trait_promises);
     run!(a_host_politeness_timer_holds_the_whole_host);
+    run!(latency_creep_slows_a_host_down_with_nothing_having_failed);
+    run!(retry_after_holds_the_whole_host_for_what_it_asked_for);
+    run!(a_lease_that_never_reached_the_wire_is_not_counted_as_a_fetch);
     run!(a_host_record_round_trips);
     run!(an_unknown_host_reads_back_as_none);
     run!(put_host_replaces_rather_than_merges);
@@ -282,6 +285,7 @@ fn fetched(lease: &crate::Lease, finished_ms: u64, body: &str) -> FetchOutcome {
         key: lease.key,
         finished_ms,
         tier_used: Tier::Plain,
+        pace: Pace::default(),
         result: FetchResult::Fetched {
             status: 200,
             content_hash: crate::memory::content_hash(body),
@@ -546,6 +550,7 @@ async fn a_gone_url_is_never_leased_again(state: &dyn State) -> Outcome {
             key: leases[0].key,
             finished_ms: T0 + 500,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::Gone { status: 410 },
         }])
         .await
@@ -566,6 +571,7 @@ async fn an_excluded_url_is_never_leased_again(state: &dyn State) -> Outcome {
             key: leases[0].key,
             finished_ms: T0 + 500,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::Excluded {
                 reason: crate::ExcludeReason::Robots,
             },
@@ -589,6 +595,7 @@ async fn a_failed_url_comes_back_only_after_its_backoff(state: &dyn State) -> Ou
             key: leases[0].key,
             finished_ms: finished,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::Failed {
                 status: Some(500),
                 kind: FailureKind::ServerError,
@@ -628,6 +635,7 @@ async fn a_revalidator_comes_back_on_the_next_lease(state: &dyn State) -> Outcom
             key: leases[0].key,
             finished_ms: T0 + 500,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::Fetched {
                 status: 200,
                 content_hash: crate::memory::content_hash("hello"),
@@ -733,6 +741,135 @@ async fn a_host_politeness_timer_holds_the_whole_host(state: &dyn State) -> Outc
         !later.is_empty(),
         "the host never became leasable after its timer passed"
     );
+    Ok(())
+}
+
+async fn latency_creep_slows_a_host_down_with_nothing_having_failed(state: &dyn State) -> Outcome {
+    // Doc 07.6's 1.3 rung, through the trait. Every request here succeeds and
+    // the origin never complains, it only gets slower, and a backend that
+    // waits for an error before easing off has already made somebody's
+    // afternoon worse.
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let host = key(&urls[0]).host;
+
+    let before = state
+        .host(host)
+        .await
+        .map_err(|e| format!("host failed: {e}"))?
+        .map_or(HostRow::INITIAL_DELAY_MS, |row| row.adaptive_delay_ms);
+
+    let mut now = T0;
+    for _ in 0..3 {
+        let leases = lease_one(state, now).await?;
+        ensure!(!leases.is_empty(), "nothing was leased");
+        let slow = Pace {
+            latency_ms: Some(5000),
+            retry_after_ms: None,
+        };
+        state
+            .complete(&[FetchOutcome {
+                pace: slow,
+                ..fetched(&leases[0], now + 5000, "body")
+            }])
+            .await
+            .map_err(|e| format!("complete failed: {e}"))?;
+        now += 60 * 60 * 1000;
+    }
+
+    let after = state
+        .host(host)
+        .await
+        .map_err(|e| format!("host failed: {e}"))?
+        .ok_or("the host has no record after three fetches")?;
+    ensure!(
+        after.adaptive_delay_ms > before,
+        "three slow answers did not slow the crawler down"
+    );
+    ensure_eq!(
+        after.failures,
+        0,
+        "nothing failed and something was counted"
+    );
+    Ok(())
+}
+
+async fn retry_after_holds_the_whole_host_for_what_it_asked_for(state: &dyn State) -> Outcome {
+    // The url that was rate limited has its own backoff, so the interesting
+    // question is about the rest of the host. An origin that says "not for
+    // five minutes" means the site, not the page, and a crawler that moves on
+    // to the next url on the same host has honoured nothing.
+    let urls: Vec<String> = (0..4).map(path_url).collect();
+    admit_all(state, &urls).await?;
+
+    let leases = state
+        .lease(&request(T0, 1))
+        .await
+        .map_err(|e| format!("lease failed: {e}"))?;
+    ensure_eq!(leases.len(), 1, "nothing was leased");
+
+    let finished = T0 + 200;
+    let asked_ms = 5 * 60 * 1000;
+    state
+        .complete(&[FetchOutcome {
+            lease: leases[0].id,
+            key: leases[0].key,
+            finished_ms: finished,
+            tier_used: Tier::Plain,
+            pace: Pace {
+                latency_ms: Some(200),
+                retry_after_ms: Some(asked_ms),
+            },
+            result: FetchResult::Failed {
+                status: Some(429),
+                kind: FailureKind::Blocked,
+            },
+        }])
+        .await
+        .map_err(|e| format!("complete failed: {e}"))?;
+
+    let too_soon = lease_one(state, finished + u64::from(asked_ms) / 2).await?;
+    ensure!(
+        too_soon.is_empty(),
+        "a host was crawled again inside the window it asked for"
+    );
+
+    let due = lease_one(state, finished + u64::from(asked_ms) + 1000).await?;
+    ensure!(!due.is_empty(), "the host never came back after the window");
+    Ok(())
+}
+
+async fn a_lease_that_never_reached_the_wire_is_not_counted_as_a_fetch(
+    state: &dyn State,
+) -> Outcome {
+    // Robots excluded it before anything went on the wire. Doc 08.4 counts
+    // fetches per host and a crawl of a disallowed site must not report
+    // thousands of requests it never made.
+    admit_all(state, &[host_url(1)]).await?;
+    let leases = lease_one(state, T0).await?;
+    ensure_eq!(leases.len(), 1, "nothing was leased");
+    let host = leases[0].key.host;
+
+    state
+        .complete(&[FetchOutcome {
+            lease: leases[0].id,
+            key: leases[0].key,
+            finished_ms: T0 + 5,
+            tier_used: Tier::Plain,
+            pace: Pace::default(),
+            result: FetchResult::Excluded {
+                reason: crate::ExcludeReason::Robots,
+            },
+        }])
+        .await
+        .map_err(|e| format!("complete failed: {e}"))?;
+
+    let fetches = state
+        .host(host)
+        .await
+        .map_err(|e| format!("host failed: {e}"))?
+        .map_or(0, |row| row.fetches);
+    ensure_eq!(fetches, 0, "an exclusion was counted as a request");
     Ok(())
 }
 

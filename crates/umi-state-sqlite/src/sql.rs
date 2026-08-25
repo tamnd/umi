@@ -227,7 +227,7 @@ SELECT host, pld, robots_digest, robots_fetched_ms, robots_expires_ms,
        tier_preferred, tier_max, tier_last_success, tier_blocks,
        tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
        content_usage, sitemaps, fetches, failures, consecutive_failures,
-       blocked, refusing
+       fast_streak, blocked, refusing
   FROM hosts
  WHERE host = ?1";
 
@@ -243,10 +243,10 @@ INSERT OR REPLACE INTO hosts (
     tier_preferred, tier_max, tier_last_success, tier_blocks,
     tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
     content_usage, sitemaps, fetches, failures, consecutive_failures,
-    blocked, refusing
+    fast_streak, blocked, refusing
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+    ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
 )";
 
 /// Put an ETag in the pool and get back the reference a ledger row stores.

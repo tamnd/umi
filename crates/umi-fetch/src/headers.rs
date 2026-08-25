@@ -17,6 +17,9 @@
 
 use http::HeaderMap;
 
+use crate::date;
+use crate::outcome::RetryAfter;
+
 /// The published subset, from `docs/spec/11-extraction-and-dedup.md` section
 /// 11.5. Sixteen entries, fixed, no wildcards and no configuration.
 pub const KEPT: [&str; 16] = [
@@ -72,6 +75,24 @@ pub fn kept(headers: &HeaderMap) -> Vec<(String, String)> {
     out
 }
 
+/// `Retry-After`, in whichever of the two forms the origin used.
+///
+/// RFC 9110 section 10.2.3 allows delta-seconds or an HTTP-date and origins
+/// send both, so both are read. The digits are tried first because that is the
+/// overwhelmingly common form and because an HTTP-date never starts with one.
+///
+/// Anything that is neither is `None`. A `Retry-After: soon` is not a number we
+/// can honour and guessing at one would be worse than falling back to the
+/// adaptive delay, which is already a considered answer.
+#[must_use]
+pub fn retry_after(headers: &HeaderMap) -> Option<RetryAfter> {
+    let value = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse::<u32>() {
+        return Some(RetryAfter::After(seconds));
+    }
+    date::parse(value).map(RetryAfter::At)
+}
+
 /// Blake3 over a canonical serialisation of every header, kept or not.
 ///
 /// Canonical means: lowercase the name, keep the value bytes exactly as they
@@ -107,7 +128,7 @@ pub fn digest(headers: &HeaderMap) -> [u8; 32] {
 mod tests {
     use http::{HeaderMap, HeaderValue};
 
-    use super::{KEPT, NEVER_STORED, digest, kept};
+    use super::{KEPT, NEVER_STORED, RetryAfter, digest, kept, retry_after};
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();
@@ -231,6 +252,59 @@ mod tests {
         ]);
         let names: Vec<_> = kept(&map).into_iter().map(|(name, _)| name).collect();
         assert_eq!(names, vec!["content-type", "etag", "server"]);
+    }
+
+    #[test]
+    fn retry_after_reads_both_of_the_forms_rfc_9110_allows() {
+        // Delta seconds is what almost everybody sends and the date form is
+        // what the rest send, so a limiter that reads only the first honours
+        // nothing on the sites most likely to be asking.
+        let seconds = headers(&[("retry-after", "120")]);
+        assert_eq!(retry_after(&seconds), Some(RetryAfter::After(120)));
+
+        let date = headers(&[("retry-after", "Wed, 21 Oct 2015 07:28:00 GMT")]);
+        assert_eq!(retry_after(&date), Some(RetryAfter::At(1_445_412_480_000)));
+
+        // Whitespace around the value is the origin's business and not ours.
+        let padded = headers(&[("retry-after", "  30  ")]);
+        assert_eq!(retry_after(&padded), Some(RetryAfter::After(30)));
+    }
+
+    #[test]
+    fn a_retry_after_we_cannot_read_is_nothing_rather_than_a_guess() {
+        // Falling back to the adaptive delay is already a considered answer.
+        // Inventing a number from a header we did not understand is not.
+        for value in ["soon", "", "-5", "1.5", "tomorrow"] {
+            let map = headers(&[("retry-after", value)]);
+            assert_eq!(retry_after(&map), None, "{value:?}");
+        }
+        assert_eq!(retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn a_retry_after_never_parks_a_host_for_longer_than_a_day() {
+        // A week is not a lie, it is a site telling us to come back next week,
+        // and the frontier already says that by scheduling the url later.
+        // Parking a whole host on the strength of one header is a much bigger
+        // decision than the header is making.
+        let now = 1_700_000_000_000;
+        assert_eq!(RetryAfter::After(60).ms_from(now), 60_000);
+        assert_eq!(RetryAfter::After(u32::MAX).ms_from(now), RetryAfter::MAX_MS);
+        assert_eq!(RetryAfter::At(now + 5000).ms_from(now), 5000);
+        assert_eq!(
+            RetryAfter::At(now + 30 * u64::from(RetryAfter::MAX_MS)).ms_from(now),
+            RetryAfter::MAX_MS
+        );
+    }
+
+    #[test]
+    fn a_retry_after_date_in_the_past_asks_for_nothing() {
+        // Clocks disagree by a few seconds all day long. An origin that says
+        // "retry at 12:00:03" when we think it is 12:00:05 is asking for
+        // nothing, not for a negative wait.
+        let now = 1_700_000_000_000;
+        assert_eq!(RetryAfter::At(now - 2000).ms_from(now), 0);
+        assert_eq!(RetryAfter::At(0).ms_from(now), 0);
     }
 
     #[test]

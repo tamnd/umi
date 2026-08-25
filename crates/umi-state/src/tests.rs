@@ -276,6 +276,7 @@ async fn a_conditional_request_does_not_move_the_change_clock() {
             key,
             finished_ms: T0 + 1000,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::Fetched {
                 status: 200,
                 content_hash: content_hash("body one"),
@@ -316,6 +317,7 @@ async fn a_conditional_request_does_not_move_the_change_clock() {
             key,
             finished_ms: finished,
             tier_used: Tier::Plain,
+            pace: Pace::default(),
             result: FetchResult::NotModified {
                 status: 304,
                 revalidate: Revalidator::default(),
@@ -362,6 +364,7 @@ async fn a_repeated_etag_is_interned_once() {
                 key: leases[0].key,
                 finished_ms: now + 1,
                 tier_used: Tier::Plain,
+                pace: Pace::default(),
                 result: FetchResult::Fetched {
                     status: 200,
                     content_hash: content_hash("shared"),
@@ -410,6 +413,7 @@ async fn a_completion_from_a_lease_that_already_expired_still_counts() {
             key,
             finished_ms: long_after,
             tier_used: Tier::Emulated,
+            pace: Pace::default(),
             result: FetchResult::Fetched {
                 status: 200,
                 content_hash: content_hash("late"),
@@ -569,4 +573,245 @@ fn an_error_says_which_domain_could_not_be_warmed() {
     };
     assert!(too_big.to_string().contains("9000"));
     assert!(too_big.to_string().contains(&BATCH.to_string()));
+}
+
+/// One host to run the rate limiter over, at its starting delay.
+fn paced_host() -> HostRow {
+    host_row("https://example.com/")
+}
+
+/// A response that arrived, with a latency and nothing else.
+const fn took(ms: u32) -> Pace {
+    Pace {
+        latency_ms: Some(ms),
+        retry_after_ms: None,
+    }
+}
+
+/// What doc 07.6 calls a fast 200.
+const fn ok() -> FetchResult {
+    FetchResult::Fetched {
+        status: 200,
+        content_hash: [0u8; 8],
+        revalidate: Revalidator {
+            etag: None,
+            last_modified_ms: None,
+        },
+    }
+}
+
+const fn failed(status: Option<u16>, kind: FailureKind) -> FetchResult {
+    FetchResult::Failed { status, kind }
+}
+
+#[test]
+fn latency_creep_alone_backs_us_off() {
+    // The rung that matters most and the one a crawler is most tempted to
+    // skip. Nothing here errors: the origin answers every single request with
+    // a 200, it just takes longer and longer about it, and doc 07.6 wants us
+    // to notice that before the operator does.
+    let mut host = paced_host();
+    assert_eq!(host.adaptive_delay_ms, HostRow::INITIAL_DELAY_MS);
+
+    for _ in 0..5 {
+        assert!(host.observe(&ok(), took(3000), T0));
+    }
+    assert_eq!(
+        host.adaptive_delay_ms, 3712,
+        "five slow answers should be five 1.3 steps"
+    );
+    assert_eq!(host.failures, 0, "nothing failed");
+    assert_eq!(host.fetches, 5);
+}
+
+#[test]
+fn the_four_rungs_are_the_ones_doc_07_6_wrote_down() {
+    let cases = [
+        (ok(), took(100), 900),
+        (ok(), took(2001), 1300),
+        (failed(Some(429), FailureKind::Blocked), took(50), 4000),
+        (failed(Some(503), FailureKind::ServerError), took(50), 4000),
+        (failed(Some(500), FailureKind::ServerError), took(50), 2000),
+        (failed(None, FailureKind::Connect), took(50), 2000),
+        (failed(None, FailureKind::Tls), took(50), 2000),
+        (failed(None, FailureKind::Timeout), took(50), 2000),
+    ];
+    for (result, pace, want) in cases {
+        let mut host = paced_host();
+        // The 0.9 rung is invisible at the default floor, which is also 1000,
+        // so this asks what the step computed rather than what the clamp
+        // allowed. Every host in the table starts from the same delay.
+        host.fast_streak = super::pace::FAST_STREAK;
+        assert!(host.observe(&result, pace, T0));
+        assert_eq!(host.adaptive_delay_ms, want, "{result:?} at {pace:?}");
+    }
+}
+
+#[test]
+fn an_answer_that_is_not_about_load_changes_nothing() {
+    // A 404 is a correct, cheap answer about a page that is not there. A site
+    // with a lot of dead links must not read as a site with spare capacity,
+    // and it must not read as a site in trouble either.
+    for kind in [
+        FailureKind::NotFound,
+        FailureKind::Rejected,
+        FailureKind::Malformed,
+    ] {
+        let mut host = paced_host();
+        host.fast_streak = super::pace::FAST_STREAK;
+        assert!(!host.observe(&failed(Some(404), kind), took(30), T0));
+        assert_eq!(host.adaptive_delay_ms, HostRow::INITIAL_DELAY_MS);
+        assert_eq!(host.fetches, 0, "{kind:?} moved a counter");
+    }
+
+    let mut host = paced_host();
+    assert!(!host.observe(&FetchResult::Gone { status: 410 }, took(30), T0));
+    assert_eq!(host.next_allowed_ms, 0);
+}
+
+#[test]
+fn a_lease_that_never_became_a_request_is_not_an_observation() {
+    // Robots excluded it before anything went on the wire, so there is no
+    // latency, no host to be polite to yet, and nothing to write. Doc 08.4
+    // counts hosts, and a crawl of a disallowed site must not leave fifty
+    // thousand records saying we spoke to somebody we never contacted.
+    let mut host = paced_host();
+    let excluded = FetchResult::Excluded {
+        reason: crate::ExcludeReason::Robots,
+    };
+    assert!(!host.observe(&excluded, Pace::default(), T0));
+    assert_eq!(host.fetches, 0);
+
+    // The same variant with a latency is doc 13.2's content filter, which runs
+    // on a response the origin actually served, and that one counts.
+    let mut host = paced_host();
+    host.fast_streak = super::pace::FAST_STREAK;
+    assert!(host.observe(&excluded, took(50), T0));
+    assert_eq!(host.fetches, 1);
+    assert_eq!(host.adaptive_delay_ms, 900);
+}
+
+#[test]
+fn recovery_is_gradual_and_stops_at_the_floor() {
+    // Backing off is one step and coming back is many, which is the whole
+    // asymmetry. Count them, because "it recovers eventually" is also true of
+    // a crawler that recovers in two requests.
+    let mut host = paced_host();
+    host.fast_streak = super::pace::FAST_STREAK;
+    host.observe(&failed(Some(429), FailureKind::Blocked), took(20), T0);
+    assert_eq!(host.adaptive_delay_ms, 4000);
+    assert_eq!(host.fast_streak, 0, "a 429 is not a fast success");
+
+    let mut steps = 0;
+    while host.adaptive_delay_ms > HostRow::DEFAULT_FLOOR_MS {
+        host.observe(&ok(), took(100), T0);
+        steps += 1;
+        assert!(steps < 100, "the delay is not coming down");
+    }
+    assert_eq!(steps, 14, "0.9 per clean answer, from 4000 to 1000");
+
+    // And it stays there, because the fast floor has to be earned separately.
+    for _ in 0..10 {
+        host.observe(&ok(), took(100), T0);
+    }
+    assert_eq!(host.adaptive_delay_ms, HostRow::DEFAULT_FLOOR_MS);
+}
+
+#[test]
+fn the_fast_floor_is_earned_by_a_streak_and_lost_by_one_bad_answer() {
+    let mut host = paced_host();
+    for _ in 0..super::pace::FAST_STREAK - 1 {
+        host.observe(&ok(), took(100), T0);
+    }
+    assert_eq!(host.floor_ms(), HostRow::DEFAULT_FLOOR_MS);
+    assert_eq!(host.adaptive_delay_ms, HostRow::DEFAULT_FLOOR_MS);
+
+    host.observe(&ok(), took(100), T0);
+    assert_eq!(host.floor_ms(), HostRow::FAST_FLOOR_MS);
+
+    // A response that is merely not slow does not count towards the streak.
+    // Five a second is the most this crawler ever sends anybody and a host
+    // that takes a second to answer has not earned it.
+    host.observe(&ok(), took(super::pace::FAST_MS + 1), T0);
+    assert_eq!(host.floor_ms(), HostRow::DEFAULT_FLOOR_MS);
+    assert_eq!(host.fast_streak, 0);
+}
+
+#[test]
+fn nothing_ever_goes_below_five_requests_a_second_or_above_a_minute() {
+    let mut host = paced_host();
+    host.fast_streak = super::pace::FAST_STREAK;
+    for _ in 0..500 {
+        host.observe(&ok(), took(10), T0);
+    }
+    assert_eq!(host.adaptive_delay_ms, HostRow::FAST_FLOOR_MS);
+
+    for _ in 0..500 {
+        host.observe(&failed(Some(503), FailureKind::ServerError), took(10), T0);
+    }
+    assert_eq!(host.adaptive_delay_ms, HostRow::MAX_DELAY_MS);
+    assert_eq!(host.consecutive_failures, 500);
+}
+
+#[test]
+fn retry_after_is_a_minimum_and_never_shortens_our_own_wait() {
+    // An origin that asks for a second while we are already waiting eight gets
+    // eight. Waiting longer than we were asked to has never annoyed anybody,
+    // and treating the header as the answer rather than as a floor is how a
+    // crawler talks itself into speeding up.
+    let mut host = paced_host();
+    host.adaptive_delay_ms = 8000;
+    host.observe(
+        &failed(Some(429), FailureKind::Blocked),
+        Pace {
+            latency_ms: Some(40),
+            retry_after_ms: Some(1000),
+        },
+        T0,
+    );
+    assert_eq!(
+        host.next_allowed_ms,
+        T0 + 32_000,
+        "8000 backed off to 32000"
+    );
+
+    let mut host = paced_host();
+    host.observe(
+        &failed(Some(503), FailureKind::ServerError),
+        Pace {
+            latency_ms: Some(40),
+            retry_after_ms: Some(600_000),
+        },
+        T0,
+    );
+    assert_eq!(
+        host.next_allowed_ms,
+        T0 + 600_000,
+        "ten minutes is longer than the delay ceiling and it is honoured exactly"
+    );
+}
+
+#[test]
+fn a_crawl_delay_from_robots_is_honoured_alongside_the_adaptive_one() {
+    // Two floors, both of them minimums, and the larger wins. A site that
+    // published `Crawl-delay: 30` said thirty seconds even on the request that
+    // came back in forty milliseconds.
+    let mut host = paced_host();
+    host.crawl_delay_ms = Some(30_000);
+    host.fast_streak = super::pace::FAST_STREAK;
+    host.observe(&ok(), took(40), T0);
+    assert_eq!(host.adaptive_delay_ms, 900);
+    assert_eq!(host.next_allowed_ms, T0 + 30_000);
+}
+
+#[test]
+fn the_politeness_timer_only_moves_forward() {
+    // `lease` has already spaced out everything else it handed out for this
+    // host. A completion that arrives out of order, or one for a request that
+    // started long before, must not pull that back and let the next url go
+    // early.
+    let mut host = paced_host();
+    host.next_allowed_ms = T0 + 60_000;
+    host.observe(&ok(), took(40), T0);
+    assert_eq!(host.next_allowed_ms, T0 + 60_000);
 }
