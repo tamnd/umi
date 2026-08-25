@@ -16,16 +16,28 @@ workspace = true
 name = "rows"
 harness = false
 
+[[bench]]
+name = "tick"
+harness = false
+
 [dependencies]
 arrow.workspace = true
+async-trait.workspace = true
 blake3.workspace = true
+futures-util.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true }
+url.workspace = true
 umi-dedup.workspace = true
 umi-extract.workspace = true
 umi-fetch.workspace = true
 umi-file.workspace = true
+umi-frontier.workspace = true
+umi-robots.workspace = true
+umi-state.workspace = true
 umi-types.workspace = true
 
 [dev-dependencies]
 bytes.workspace = true
 tempfile.workspace = true
-url.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
