@@ -13,3 +13,14 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
+thiserror = { workspace = true }
+umi-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+# No criterion, for the same reason umi-file's bench gives: the bar is doc
+# 08.1's admission rate in whole URLs a second, not a microsecond difference.
+[[bench]]
+name = "seeding"
+harness = false
