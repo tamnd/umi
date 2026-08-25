@@ -118,7 +118,10 @@ pub fn extract_digest(extracted: &Extracted) -> [u8; 32] {
     feed.byte(u8::from(extracted.robots.noindex));
     feed.byte(u8::from(extracted.robots.nofollow));
 
-    feed.count(tag::WITHHELD, usize::from(extracted.content_withheld.is_some()));
+    feed.count(
+        tag::WITHHELD,
+        usize::from(extracted.content_withheld.is_some()),
+    );
     if let Some(reason) = extracted.content_withheld {
         feed.byte(withheld_code(reason));
     }

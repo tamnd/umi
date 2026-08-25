@@ -422,7 +422,11 @@ impl PageRow {
             + some(self.content_usage.as_ref())
             + self.tier_path.len()
             + self.headings.iter().map(String::len).sum::<usize>()
-            + self.snippets.iter().map(|s| s.text.len() + 1).sum::<usize>()
+            + self
+                .snippets
+                .iter()
+                .map(|s| s.text.len() + 1)
+                .sum::<usize>()
             + self
                 .links
                 .iter()

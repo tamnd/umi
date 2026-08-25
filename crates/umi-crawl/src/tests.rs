@@ -154,10 +154,7 @@ fn the_snippets_column_repeats_the_dedicated_columns_on_purpose() {
 fn a_noindex_page_keeps_its_links_and_loses_its_prose() {
     // Doc 11.4. This is the one place extraction makes a policy decision and
     // getting it backwards would publish content a publisher asked us not to.
-    let body = html(&prose()).replace(
-        "<head>",
-        "<head><meta name='robots' content='noindex'>",
-    );
+    let body = html(&prose()).replace("<head>", "<head><meta name='robots' content='noindex'>");
     let row = row_of(&body);
 
     assert_eq!(row.markdown, None);
@@ -400,9 +397,8 @@ fn the_batch_matches_doc_10_5_for_every_shape_of_row() {
     let ok = row_of(&html(&prose()));
     builder.push(&ok);
 
-    let noindex = row_of(
-        &html(&prose()).replace("<head>", "<head><meta name='robots' content='noindex'>"),
-    );
+    let noindex =
+        row_of(&html(&prose()).replace("<head>", "<head><meta name='robots' content='noindex'>"));
     builder.push(&noindex);
 
     let not_modified = PageRow::build(&crawled(
@@ -600,7 +596,9 @@ fn a_row_the_builder_wrote_survives_a_round_trip_through_a_segment() {
     assert_eq!(segment.shoals(), 1);
     let shoal = segment.shoal(0).expect("the only shoal");
     shoal.verify().expect("the checksums hold");
-    let back = shoal.to_arrow(&["url", "minhash", "simhash"]).expect("decode");
+    let back = shoal
+        .to_arrow(&["url", "minhash", "simhash"])
+        .expect("decode");
     assert_eq!(back.num_rows(), 1);
     assert_eq!(back.column(0).as_string::<i32>().value(0), URL);
     assert_eq!(
