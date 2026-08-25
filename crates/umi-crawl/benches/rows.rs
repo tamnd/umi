@@ -22,15 +22,17 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use umi_crawl::page::{PageBuilder, PageRow};
-use umi_crawl::{Crawled, extract_digest};
+use umi_crawl::run::Sink;
+use umi_crawl::{Crawled, SegmentInfo, SegmentSink, extract_digest};
 use umi_extract::{Extracted, extract};
 use umi_fetch::Outcome;
 use umi_fetch::outcome::{Page, Version};
+use umi_file::WriterConfig;
 use umi_types::{FetcherId, Revalidator, RowKey, Tier, Verification};
 
 mod support;
 
-use support::{MEDIAN_HTML, Run, best, html_of};
+use support::{MEDIAN_HTML, Run, best, best_of, html_of};
 
 const T0: u64 = 1_760_000_000_000;
 
@@ -155,6 +157,63 @@ fn main() {
     });
     line("push then finish", finish);
 
+    // Part 3. The same rows, onto a real disk. Part 2 stops at an Arrow batch
+    // in memory, and the writer is where the rest of doc 10 happens: every
+    // column chunk is encoded, compressed and checksummed, the shoal directory
+    // is written, and the footer is built at the seal. That is the last stage
+    // between a fetch and a file somebody can publish, so it belongs in the
+    // per page budget rather than in a footnote.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let batches = 2;
+    let through = per_shoal * batches;
+    println!();
+    println!(
+        "part 3: through the sink onto disk, {through} rows, {batches} shoals \
+         and a seal"
+    );
+    println!(
+        "{:<34}{:>10}{:>13}{:>12}",
+        "stage", "us/row", "rows/s", "of budget"
+    );
+
+    let mut on_disk = 0u64;
+    let mut logical = 0u64;
+    let sunk = best_of(
+        3,
+        || tempfile::tempdir().expect("tempdir"),
+        |dir| {
+            let sink =
+                SegmentSink::create(dir.path(), SegmentInfo::default(), WriterConfig::default())
+                    .expect("create");
+            runtime.block_on(async {
+                for i in 0..batches {
+                    let batch: Vec<PageRow> = (0..per_shoal)
+                        .map(|n| rows[(i * per_shoal + n) % rows.len()].clone())
+                        .collect();
+                    sink.take(&batch).await.expect("take");
+                }
+            });
+            let sealed = sink.finish().expect("finish").expect("a segment was open");
+            on_disk = sealed.stats.encoded_bytes;
+            logical = sealed.stats.logical_bytes;
+            through
+        },
+    );
+    line("SegmentSink::take plus the seal", sunk);
+
+    println!();
+    println!(
+        "the file holds {:.1} KB per row against {:.1} KB of columns, so the\n\
+         compression doc 10.2 budgets for is {:.1}x and a 128 MB segment holds\n\
+         about {} rows.",
+        on_disk as f64 / through as f64 / 1024.0,
+        logical as f64 / through as f64 / 1024.0,
+        logical as f64 / on_disk as f64,
+        (128 << 20) / (on_disk / through as u64).max(1)
+    );
+
     println!();
     let per_row = whole.per_item() + finish.per_item();
     let rows_per_second = 1.0 / per_row.as_secs_f64();
@@ -167,6 +226,14 @@ fn main() {
     println!(
         "at 250 pages a second the builder is using {:.1} percent of one core.",
         250.0 * per_row.as_secs_f64() * 100.0
+    );
+    let to_disk = whole.per_item() + sunk.per_item();
+    println!(
+        "one row all the way onto disk costs {:.0} us, which is {:.0} pages a\n\
+         second on one core, or {:.1} percent of a core at gate 1.1's 250.",
+        to_disk.as_secs_f64() * 1e6,
+        1.0 / to_disk.as_secs_f64(),
+        250.0 * to_disk.as_secs_f64() * 100.0
     );
     println!(
         "everything above except the chunk tree scales with text and not with\n\

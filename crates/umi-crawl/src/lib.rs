@@ -33,11 +33,14 @@ pub mod page;
 pub mod robots;
 pub mod run;
 pub mod scope;
+pub mod sink;
 
 #[cfg(test)]
 mod run_tests;
 #[cfg(test)]
 mod scope_tests;
+#[cfg(test)]
+mod sink_tests;
 #[cfg(test)]
 mod tests;
 
@@ -50,3 +53,4 @@ pub use run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
 pub use scope::{
     Budget, ContentFilter, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,
 };
+pub use sink::{Sealed, SegmentInfo, SegmentSink};

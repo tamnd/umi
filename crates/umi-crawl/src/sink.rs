@@ -1,0 +1,325 @@
+//! A [`Sink`] that writes rows into doc 10's segments.
+//!
+//! The loop produces rows and does not care where they go. This is where they
+//! go when the answer is a file: rows become shoals, shoals become a segment,
+//! and a segment seals at doc 10.3's caps. What happens to a sealed segment
+//! after that is the caller's problem, which is what keeps Parquet, manifests
+//! and Hugging Face out of this file.
+//!
+//! # Time
+//!
+//! Nothing here reads a clock, and that is doc 11.1 rather than tidiness. Two
+//! machines running the same build over the same input have to produce the same
+//! bytes, and a writer that stamped a segment with the wall clock could not.
+//! So both the timestamps this file needs come out of the rows: `created_ms` is
+//! the earliest `fetched_at_ms` in the first batch, and the age half of the
+//! seal rule is measured against the latest one seen since. A crawl that is
+//! fetching pages is a crawl whose row times move, so the age cap still fires;
+//! a crawl that has stopped fetching does not seal on age, which is correct,
+//! because there is nothing to seal.
+//!
+//! # Identifiers
+//!
+//! Segment ULIDs are derived rather than drawn. Doc 12.4 wants 48 bits of
+//! timestamp and 80 bits of entropy, and the entropy here is a digest over the
+//! coordinator key and a counter. That gives every coordinator a distinct
+//! stream of identifiers, gives one coordinator identifiers that never repeat,
+//! and gives a test the same file names on every run. A random source would
+//! have cost the last of those and bought nothing the first two do not already
+//! provide.
+
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use umi_file::{Create, SegmentWriter, WriterConfig};
+use umi_file::{SegmentStats, StreamKind};
+use umi_types::Ulid;
+
+use crate::page::{PageBuilder, PageRow};
+use crate::run::{CrawlError, Sink};
+
+/// Everything about a segment that does not change from one to the next.
+///
+/// Doc 10.4's header carries the versions that produced the rows, and they are
+/// per build rather than per segment, so they are given once here instead of
+/// at every roll.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentInfo {
+    /// Which stream, which for the crawl loop is always
+    /// [`StreamKind::Pages`].
+    pub stream: StreamKind,
+    /// Doc 04's coordinator key, which is also the entropy this sink derives
+    /// its segment identifiers from.
+    pub coordinator: [u8; 32],
+    /// Doc 11.2's canonicalisation version.
+    pub canon_version: u32,
+    /// Doc 11.3's extractor version.
+    pub extractor_version: u32,
+    /// Doc 13.2's `Scope::id`, the same number that is on every row.
+    pub crawl_profile: u32,
+}
+
+impl Default for SegmentInfo {
+    fn default() -> Self {
+        Self {
+            stream: StreamKind::Pages,
+            coordinator: [0u8; 32],
+            // One each, which is what every segment written so far carries.
+            // These are the numbers a reader compares to decide whether two
+            // rows are comparable, so they move when doc 11.2 or doc 11.3
+            // changes and not when this crate does.
+            canon_version: 1,
+            extractor_version: 1,
+            crawl_profile: 0,
+        }
+    }
+}
+
+/// A segment that reached its cap and was closed.
+#[derive(Clone, Debug)]
+pub struct Sealed {
+    /// Where it is.
+    pub path: PathBuf,
+    /// Its identifier, which is also its file name without the extension.
+    pub id: Ulid,
+    /// What went into it.
+    pub stats: SegmentStats,
+}
+
+/// Rows into `.umi` segments in a directory.
+///
+/// One segment is open at a time. Doc 10.3 seals at 128 MB or 15 minutes,
+/// whichever comes first, and both are in [`WriterConfig`] rather than here so
+/// that a caller who wants small segments for a test does not need a second
+/// way to say so.
+pub struct SegmentSink {
+    dir: PathBuf,
+    info: SegmentInfo,
+    config: WriterConfig,
+    open: Mutex<Open>,
+}
+
+/// The mutable half, behind one lock.
+///
+/// A `std::sync::Mutex` and not the async one, because nothing inside the lock
+/// awaits. Rows are encoded into memory and the file is only touched when a
+/// shoal or a segment closes, so the critical section is CPU work that finishes
+/// in microseconds. An async mutex here would add a scheduling point per batch
+/// to protect against a wait that cannot happen.
+struct Open {
+    writer: Option<SegmentWriter>,
+    id: Ulid,
+    counter: u64,
+    latest_ms: u64,
+    sealed: Vec<Sealed>,
+    rows: u64,
+}
+
+impl SegmentSink {
+    /// The file extension doc 10.1 gives the container.
+    pub const EXTENSION: &'static str = "umi";
+
+    /// Open a sink over `dir`, creating the directory if it is not there.
+    ///
+    /// No segment is created yet. A crawl that leases nothing should leave no
+    /// files behind, and a crawl that produces one row should leave one
+    /// segment rather than an empty one and then a real one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever creating the directory reports.
+    pub fn create(
+        dir: impl Into<PathBuf>,
+        info: SegmentInfo,
+        config: WriterConfig,
+    ) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self {
+            dir,
+            info,
+            config,
+            open: Mutex::new(Open {
+                writer: None,
+                id: Ulid::default(),
+                counter: 0,
+                latest_ms: 0,
+                sealed: Vec::new(),
+                rows: 0,
+            }),
+        })
+    }
+
+    /// The directory segments land in.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    /// How many rows have been written, across every segment including the
+    /// open one.
+    #[must_use]
+    pub fn rows(&self) -> u64 {
+        self.locked().rows
+    }
+
+    /// Take the segments that have sealed since the last call.
+    ///
+    /// Draining rather than borrowing, because the caller's next move is to
+    /// convert each one and then forget it, and a list that grew for the life
+    /// of a crawl would be a list with a hundred thousand entries in it by the
+    /// end.
+    pub fn sealed(&self) -> Vec<Sealed> {
+        std::mem::take(&mut self.locked().sealed)
+    }
+
+    /// Close the open segment, if there is one.
+    ///
+    /// Called at the end of a crawl and at a checkpoint. Doc 16's gate 1.3 is
+    /// about what a crash leaves behind, and the answer for an unsealed segment
+    /// is that its committed shoals are readable and its buffered rows are not,
+    /// which is why a clean stop calls this and a crash does not lose more than
+    /// the last shoal.
+    ///
+    /// # Errors
+    ///
+    /// [`CrawlError::Sink`] if the seal failed, which leaves the partial file
+    /// on disk for somebody to look at.
+    pub fn finish(&self) -> Result<Option<Sealed>, CrawlError> {
+        let mut open = self.locked();
+        let sealed = seal(&mut open, &self.dir)?;
+        if let Some(sealed) = sealed.clone() {
+            open.sealed.push(sealed);
+        }
+        Ok(sealed)
+    }
+
+    fn locked(&self) -> std::sync::MutexGuard<'_, Open> {
+        // A poisoned lock means a panic inside a previous `take`, and every
+        // path in there is memory. Recovering the guard rather than
+        // propagating keeps a panic in one batch from turning into a crawler
+        // that cannot write anything ever again.
+        self.open.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Derive the next segment identifier.
+    ///
+    /// blake3 over the coordinator key and the counter, truncated to the 80
+    /// bits doc 12.4 wants. Two coordinators never collide because their keys
+    /// differ, one coordinator never repeats because its counter does not, and
+    /// a test gets the same names twice because neither input is random.
+    fn next_id(&self, counter: u64, created_ms: u64) -> Ulid {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.info.coordinator);
+        hasher.update(&counter.to_le_bytes());
+        let mut entropy = [0u8; 10];
+        entropy.copy_from_slice(&hasher.finalize().as_bytes()[..10]);
+        Ulid::new(created_ms, entropy)
+    }
+
+    /// Open a segment stamped `created_ms`.
+    fn open_segment(&self, open: &mut Open, created_ms: u64) -> Result<(), CrawlError> {
+        let id = self.next_id(open.counter, created_ms);
+        open.counter += 1;
+        let path = self
+            .dir
+            .join(format!("{}.{}", id.to_text(), Self::EXTENSION));
+        let writer = SegmentWriter::create(
+            &path,
+            Create {
+                stream: self.info.stream,
+                segment_id: *id.as_bytes(),
+                coordinator: self.info.coordinator,
+                created_ms,
+                canon_version: self.info.canon_version,
+                extractor_version: self.info.extractor_version,
+                crawl_profile: self.info.crawl_profile,
+            },
+            self.config,
+        )
+        .map_err(sink_error)?;
+        open.writer = Some(writer);
+        open.id = id;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl Sink for SegmentSink {
+    async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut open = self.locked();
+
+        let first_ms = rows.iter().map(|r| r.fetched_at_ms).min().unwrap_or(0);
+        open.latest_ms = open
+            .latest_ms
+            .max(rows.iter().map(|r| r.fetched_at_ms).max().unwrap_or(0));
+        if open.writer.is_none() {
+            self.open_segment(&mut open, first_ms)?;
+        }
+
+        // Shoals, not one batch. A tick's batch is whatever the frontier
+        // handed out, and doc 10.4's caps are about what a reader has to hold
+        // in memory to decode one shoal, so the two numbers have nothing to do
+        // with each other and the sink is where they are reconciled.
+        let mut builder = PageBuilder::new();
+        for row in rows {
+            builder.push(row);
+            open.rows += 1;
+            if builder.is_full() {
+                let batch = std::mem::take(&mut builder).finish();
+                push(&mut open, &batch)?;
+            }
+        }
+        if !builder.is_empty() {
+            let batch = builder.finish();
+            push(&mut open, &batch)?;
+        }
+
+        // The roll happens after the batch, never in the middle of one. A
+        // segment that closed halfway through a tick would put two file names
+        // on one page's neighbours for no reason a reader could see, and the
+        // cost of overshooting the cap by one batch is a few megabytes.
+        let latest_ms = open.latest_ms;
+        let full = open
+            .writer
+            .as_ref()
+            .is_some_and(|w| w.should_seal(latest_ms));
+        if full {
+            let sealed = seal(&mut open, &self.dir)?;
+            if let Some(sealed) = sealed {
+                open.sealed.push(sealed);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Push one batch into the open writer.
+fn push(open: &mut Open, batch: &arrow::record_batch::RecordBatch) -> Result<(), CrawlError> {
+    open.writer
+        .as_mut()
+        .ok_or_else(|| CrawlError::Sink("no segment is open".to_owned()))?
+        .push(batch)
+        .map_err(sink_error)
+}
+
+/// Close the open writer and describe what it produced.
+fn seal(open: &mut Open, dir: &Path) -> Result<Option<Sealed>, CrawlError> {
+    let Some(writer) = open.writer.take() else {
+        return Ok(None);
+    };
+    let id = open.id;
+    let stats = writer.seal().map_err(sink_error)?;
+    Ok(Some(Sealed {
+        path: dir.join(format!("{}.{}", id.to_text(), SegmentSink::EXTENSION)),
+        id,
+        stats,
+    }))
+}
+
+fn sink_error(error: umi_file::Error) -> CrawlError {
+    CrawlError::Sink(error.to_string())
+}
