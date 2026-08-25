@@ -58,6 +58,62 @@ jobs:
       - run: cargo test --workspace --all-features
       - run: cargo build --workspace
 
+  # Doc 16's gate 1.2. Doc 11.1 promises byte identical extraction on every
+  # machine forever, and doc 06 makes that promise load bearing, because a
+  # fetcher somebody else runs is trusted by comparing its extraction against
+  # ours. The twenty three document corpus in the repository is checked by the
+  # ordinary test job; this is the ten thousand real pages that catch the
+  # divergences nobody thought to write a fixture for.
+  #
+  # The corpus is 1.5 GB of HTML, so it lives in a dataset rather than in git
+  # and is cached here by the digest the golden file records. A cache that
+  # served the wrong file would be caught anyway: the test digests what it
+  # opened and compares that against the same recorded line before it looks at
+  # a single page.
+  golden:
+    name: golden corpus (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Which corpus the digests were recorded against
+        id: corpus
+        run: |
+          set -e
+          digest=$(sed -n 's/^corpus blake3=//p' crates/umi-extract/golden/wide.txt)
+          test -n "$digest"
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: corpus/wide.parquet
+          key: golden-${{ steps.corpus.outputs.digest }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          mkdir -p corpus
+          curl -sSfL -o corpus/wide.parquet \
+            https://huggingface.co/datasets/open-index/umi-golden/resolve/main/wide.parquet
+      # Release, because the same comparison in a debug build takes twelve
+      # minutes rather than ninety seconds, and the three operating systems
+      # here are already three independently compiled binaries. The debug
+      # against release comparison is in docs/spec/11-extraction-and-dedup.md.
+      #
+      # An absolute path, because cargo gives an integration test the package
+      # directory as its working directory, and `corpus/wide.parquet` from
+      # crates/umi-extract is a real directory holding the other corpus.
+      - env:
+          UMI_GOLDEN_CORPUS: ${{ github.workspace }}/corpus/wide.parquet
+        run: cargo test -p umi-extract --test wide --release -- --ignored --nocapture
+
   # The pin says 1.98 and the README says 1.98, so a build that only works
   # on something newer is a bug in one of them. This job asserts it out
   # loud instead of trusting the file.

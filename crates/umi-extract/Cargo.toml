@@ -28,6 +28,15 @@ url = { workspace = true }
 blake3 = { workspace = true }
 hex = { workspace = true }
 
+# For the wide golden corpus only. Doc 16's gate 1.2 needs ten thousand real
+# pages and the only sane way to ship ten thousand pages is one Parquet file,
+# so the test that reads it needs a Parquet reader. Development only: this
+# crate takes bytes and a URL and returns a struct, and nothing about that
+# should make a caller link arrow.
+arrow = { workspace = true }
+parquet = { workspace = true }
+url = { workspace = true }
+
 # Not criterion. Doc 11.9's question is milliseconds per page across a corpus,
 # where the tail across documents is the interesting statistic, and that is a
 # sort over `Instant`, not a statistical harness for microsecond comparisons.

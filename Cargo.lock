@@ -2845,10 +2845,12 @@ dependencies = [
 name = "umi-extract"
 version = "0.0.1"
 dependencies = [
+ "arrow",
  "blake3",
  "hex",
  "html5ever",
  "markup5ever_rcdom",
+ "parquet",
  "serde_json",
  "umi-types",
  "unicode-normalization",
