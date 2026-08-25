@@ -879,6 +879,14 @@ impl State for SqliteState {
                     ])
                     .state()?;
 
+                // A completion with no latency behind it never reached the
+                // wire, so it has nothing to say about the host and there is no
+                // point reading one. A tick spent entirely on a disallowed site
+                // is all of these, and it should cost no host statements at all.
+                if outcome.pace.latency_ms.is_none() {
+                    continue;
+                }
+
                 // Read through on the first completion for a host and keep it,
                 // so the observations below stack. A host with no record yet
                 // starts from `HostRow::new`, which is what the lease query's
@@ -887,9 +895,11 @@ impl State for SqliteState {
                     Entry::Occupied(seat) => seat.into_mut(),
                     Entry::Vacant(seat) => {
                         let stored = tx
-                            .prepare_cached(sql::SELECT_HOST)
+                            .prepare_cached(sql::SELECT_PACE)
                             .state()?
-                            .query_row(params![&outcome.key.host.as_bytes()[..]], row::host_record)
+                            .query_row(params![&outcome.key.host.as_bytes()[..]], |read| {
+                                row::pacing(read, outcome.key.host)
+                            })
                             .optional()
                             .state()?;
                         let host = stored
@@ -903,11 +913,23 @@ impl State for SqliteState {
             }
 
             {
-                let mut put = tx.prepare_cached(sql::PUT_HOST).state()?;
+                let mut pace = tx.prepare_cached(sql::PACE_HOST).state()?;
                 for (host, moved) in paced.values() {
-                    if *moved {
-                        put_host(&mut put, host)?;
+                    if !*moved {
+                        continue;
                     }
+                    pace.execute(params![
+                        &host.host.as_bytes()[..],
+                        &host.pld.as_bytes()[..],
+                        i64::from(host.adaptive_delay_ms),
+                        row::to_ms(host.next_allowed_ms),
+                        row::to_ms(host.fetches),
+                        row::to_ms(host.failures),
+                        i64::from(host.consecutive_failures),
+                        i64::from(host.fast_streak),
+                        i64::from(Tier::default().as_u8()),
+                    ])
+                    .state()?;
                 }
             }
 
@@ -973,7 +995,35 @@ impl State for SqliteState {
             {
                 let mut put = tx.prepare_cached(sql::PUT_HOST).state()?;
                 for host in rows {
-                    put_host(&mut put, host)?;
+                    let robots = host.robots;
+                    put.execute(params![
+                        &host.host.as_bytes()[..],
+                        &host.pld.as_bytes()[..],
+                        robots.map(|r| r.digest.as_bytes().to_vec()),
+                        robots.map(|r| row::to_ms(r.fetched_ms)),
+                        robots.map(|r| row::to_ms(r.expires_ms)),
+                        robots.map(|r| i64::from(r.authoritative)),
+                        i64::from(host.adaptive_delay_ms),
+                        host.crawl_delay_ms.map(i64::from),
+                        row::to_ms(host.next_allowed_ms),
+                        i64::from(host.tier.preferred.as_u8()),
+                        i64::from(host.tier.max.as_u8()),
+                        i64::from(host.tier.last_success.as_u8()),
+                        i64::from(host.tier.consecutive_blocks),
+                        row::to_ms(host.tier.last_probe_down_ms),
+                        i64::from(host.tier.render_required),
+                        i64::from(host.tier.weak_revalidator),
+                        i64::from(host.tier.lying_revalidator),
+                        host.content_usage.as_deref(),
+                        row::join_sitemaps(&host.sitemaps),
+                        row::to_ms(host.fetches),
+                        row::to_ms(host.failures),
+                        i64::from(host.consecutive_failures),
+                        i64::from(host.fast_streak),
+                        i64::from(host.blocked),
+                        i64::from(host.refusing),
+                    ])
+                    .state()?;
                 }
             }
             tx.commit().state()?;
@@ -1194,51 +1244,6 @@ fn insert_ledger(
     Ok(())
 }
 
-/// Bind and run one host upsert.
-///
-/// Shared by [`put_host`](SqliteState::put_host) and by `complete`, which
-/// writes the rate limiter's answer under doc 07.6. One function because the
-/// column order in [`sql::PUT_HOST`] has twenty five entries and two hand
-/// written copies of it would eventually disagree about one of them, which is
-/// the sort of bug that shows up as a host with somebody else's crawl delay.
-fn put_host(statement: &mut rusqlite::CachedStatement<'_>, host: &HostRow) -> Result<()> {
-    let robots = host.robots;
-    statement
-        .execute(params![
-            &host.host.as_bytes()[..],
-            &host.pld.as_bytes()[..],
-            robots.map(|r| r.digest.as_bytes().to_vec()),
-            robots.map(|r| row::to_ms(r.fetched_ms)),
-            robots.map(|r| row::to_ms(r.expires_ms)),
-            robots.map(|r| i64::from(r.authoritative)),
-            i64::from(host.adaptive_delay_ms),
-            host.crawl_delay_ms.map(i64::from),
-            row::to_ms(host.next_allowed_ms),
-            i64::from(host.tier.preferred.as_u8()),
-            i64::from(host.tier.max.as_u8()),
-            i64::from(host.tier.last_success.as_u8()),
-            i64::from(host.tier.consecutive_blocks),
-            row::to_ms(host.tier.last_probe_down_ms),
-            i64::from(host.tier.render_required),
-            i64::from(host.tier.weak_revalidator),
-            i64::from(host.tier.lying_revalidator),
-            host.content_usage.as_deref(),
-            row::join_sitemaps(&host.sitemaps),
-            row::to_ms(host.fetches),
-            row::to_ms(host.failures),
-            i64::from(host.consecutive_failures),
-            i64::from(host.fast_streak),
-            i64::from(host.blocked),
-            i64::from(host.refusing),
-        ])
-        .state()?;
-    Ok(())
-}
-
-/// Put an ETag in the pool and return the reference a ledger row stores.
-///
-/// One statement rather than an insert and a select, because `RETURNING` gives
-/// the id whether the row was new or already there.
 fn intern_etag(tx: &rusqlite::Transaction<'_>, etag: &str) -> Result<u32> {
     let id: i64 = tx
         .prepare_cached(sql::INTERN_ETAG)
