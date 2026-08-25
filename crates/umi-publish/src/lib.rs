@@ -110,6 +110,24 @@ pub enum Error {
     #[error("the published copy did not check out: {0}")]
     NotPublished(Blocked),
 
+    /// The file held a different number of rows than the ledger recorded when
+    /// the segment was sealed.
+    ///
+    /// Doc 12.2's first step verifies the segment before anything is converted,
+    /// and this is the part of it the checksums cannot see: a file whose blocks
+    /// all check out can still be the wrong file, or a file the ledger's row
+    /// was written for and then truncated at a block boundary. Publishing it
+    /// would put a row count in the manifest that nothing else in the system
+    /// agrees with, and doc 12.7 would then delete the only copy that could
+    /// have settled the argument.
+    #[error("the segment holds {found} rows and the ledger says {expected}")]
+    RowCount {
+        /// What the state ledger recorded at seal time.
+        expected: u64,
+        /// What the file turned out to hold.
+        found: u64,
+    },
+
     /// The state ledger would not answer. Kept as a string for the same
     /// reason as [`Error::Parquet`]: a caller of this crate should not have to
     /// name a state backend's error type to handle a publish failure.

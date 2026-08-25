@@ -257,7 +257,7 @@ fn a_token_in_the_environment_is_not_a_literal_in_a_config_file() {
 
 #[test]
 fn every_error_has_the_exit_code_doc_14_9_gives_it() {
-    let cases: [(Error, Exit); 13] = [
+    let cases: [(Error, Exit); 15] = [
         (Error::NoColumn("body".to_owned()), Exit::Usage),
         (Error::BadUrl("not a url".to_owned()), Exit::Usage),
         (Error::Missing("publish.token".to_owned()), Exit::Usage),
@@ -267,9 +267,10 @@ fn every_error_has_the_exit_code_doc_14_9_gives_it() {
         (Error::NotReady, Exit::Resource),
         (Error::NotBuilt("milestone 2"), Exit::Failure),
         (Error::Io(std::io::Error::other("disk")), Exit::Failure),
-        // The four publishing cases, which are the reason `Error::Publish`
-        // keeps the cause instead of flattening it to a string. A hub that
-        // timed out is worth retrying and a digest that did not match is not.
+        // The publishing cases, which are the reason `Error::Publish` keeps
+        // the cause instead of flattening it to a string. A hub that timed out
+        // is worth retrying, and a copy that came back short, digested
+        // differently or held the wrong number of rows is not.
         (
             Error::Publish(umi_publish::Error::Transport {
                 what: "uploading",
@@ -289,6 +290,22 @@ fn every_error_has_the_exit_code_doc_14_9_gives_it() {
             Error::Publish(umi_publish::Error::NotPublished(
                 umi_publish::Blocked::DigestMismatch,
             )),
+            Exit::Verification,
+        ),
+        (
+            Error::Publish(umi_publish::Error::NotPublished(
+                umi_publish::Blocked::RemoteSize {
+                    expected: 1024,
+                    found: 1023,
+                },
+            )),
+            Exit::Verification,
+        ),
+        (
+            Error::Publish(umi_publish::Error::RowCount {
+                expected: 65,
+                found: 64,
+            }),
             Exit::Verification,
         ),
         (

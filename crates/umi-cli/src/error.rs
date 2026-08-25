@@ -148,6 +148,7 @@ fn publishing(cause: &umi_publish::Error) -> Exit {
         Publish::NotPublished(_)
         | Publish::BadSignature
         | Publish::Manifest(_)
+        | Publish::RowCount { .. }
         | Publish::Segment(_)
         | Publish::Parquet(_) => Exit::Verification,
         // A missing token, an unusable key, a full disk. All of them are this
