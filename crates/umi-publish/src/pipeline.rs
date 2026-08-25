@@ -44,7 +44,7 @@ use umi_file::{Segment, StreamKind};
 use umi_state::{RemoteCopy, SegmentQuery, SegmentRow, State, Stream};
 use umi_types::{Digest, Ulid};
 
-use crate::convert::{Converted, convert};
+use crate::convert::{Converted, convert, describe};
 use crate::gc::{self, Blocked, Evidence, LedgerLocation, ManifestCommitted, ReadBack};
 use crate::hub::{Hub, Upload};
 use crate::keys::SigningKey;
@@ -289,10 +289,7 @@ impl Publisher {
             .config
             .staging
             .join(format!("{}.parquet", row.id.to_text()));
-        let converted = {
-            let segment = Segment::open(Path::new(&row.local_path))?;
-            convert(&segment, &staged)?
-        };
+        let converted = stage(Path::new(&row.local_path), &staged)?;
 
         // Still step 1. The block checksums say the file is not damaged and
         // they cannot say it is the right file, so the one fact recorded
@@ -652,6 +649,34 @@ impl Publisher {
         state.put_segment(&[gone]).await?;
         Ok(())
     }
+}
+
+/// Doc 12.2's steps 1, 2 and 3, for either kind of local file.
+///
+/// A ledger row written by `umi crawl --publish` points at a `.umi` segment and
+/// that is the path doc 12.2 describes. A ledger row written by plain
+/// `umi crawl` points at a Parquet file, because doc 13.5's directory converts
+/// each segment as it seals and keeps `data/*.parquet`, so by the time somebody
+/// runs `umi publish` on that directory there is no segment left to convert.
+/// Both end up with the same [`Converted`] and everything downstream is the
+/// same code.
+///
+/// The Parquet file is copied into staging rather than uploaded where it lies,
+/// and that is not tidiness. Step 8 deletes `local_path` when doc 12.7's four
+/// conditions hold, and `publish` deletes the staged file unconditionally on
+/// the way out. If those two were the same path, a run that had the GC blocked
+/// would still lose the operator's only local copy through the second delete,
+/// which is the exact outcome doc 12.7 exists to prevent.
+fn stage(local: &Path, staged: &Path) -> Result<Converted> {
+    if local.extension().is_some_and(|kind| kind == "parquet") {
+        std::fs::copy(local, staged)?;
+        // The copy is described rather than the original, so what gets
+        // digested is the file that gets uploaded. A copy that arrived short
+        // is caught by the row count check on the way out of here.
+        return describe(staged);
+    }
+    let segment = Segment::open(local)?;
+    convert(&segment, staged)
 }
 
 /// The three arm match doc 08.3 promised.

@@ -9,6 +9,7 @@
 //! step                                    doc 12.2 budget   measured here
 //! 1  verify every chunk checksum          ~1 s              part 1, folded in
 //! 2  convert shoals to Parquet            ~30 s at 0.4 core part 1
+//! 1 to 3 again, off a finished Parquet    the same          part 1, second row
 //! 3  digest the Parquet, blake3 + sha256  ~2 s              part 2
 //! 5  verify the remote copy               ~3 s              part 5, local half
 //! 6  append and sign the manifest         ~2 s              part 3
@@ -42,7 +43,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use umi_file::{Create, Segment, SegmentWriter, StreamKind, WriterConfig, sample};
-use umi_publish::convert::convert;
+use umi_publish::convert::{convert, describe};
 use umi_publish::keys::{Role, SigningKey};
 use umi_publish::manifest::{FileEntry, Manifest, Verification, segment_text};
 
@@ -157,17 +158,38 @@ fn conversion(umi: &Path, out: &Path, rows: usize, repeat: usize) -> u64 {
         bytes = converted.bytes;
     }
 
-    let pages_per_s = rows as f64 / best;
+    // The other way into steps 1 to 3. A crawl directory that ran without
+    // `--publish` converted its segments at seal time and deleted the `.umi`,
+    // so `umi publish` on that directory reads the Parquet back instead, which
+    // is a decode of every page with no write on the end of it. It goes
+    // against the same budget, and how much cheaper it is decides whether
+    // publishing a finished directory is something an operator thinks about.
+    let mut described = f64::MAX;
+    for _ in 0..repeat {
+        let start = Instant::now();
+        let seen = describe(out).expect("describe");
+        assert_eq!(seen.rows, rows as u64);
+        described = described.min(start.elapsed().as_secs_f64());
+    }
+
     // Per 128 MB of segment, because that is the unit doc 12.2 budgets. The
     // sample segment is smaller than a real one, so this is scaled rather than
     // measured directly, and it is the honest way to compare against a budget
-    // written per segment.
-    let per_segment = best * SEGMENT_BYTES / std::fs::metadata(umi).expect("stat").len() as f64;
-    println!(
-        "  {:<24} {pages_per_s:>12.0} {per_segment:>14.2} {:>15.2}%",
-        "convert and verify",
-        250.0 / pages_per_s * 100.0
-    );
+    // written per segment. Both rows scale by the segment size, including the
+    // one that reads the Parquet, because both do the same rows.
+    let scale = SEGMENT_BYTES / std::fs::metadata(umi).expect("stat").len() as f64;
+    let per_segment = best * scale;
+    for (name, seconds) in [
+        ("convert and verify", best),
+        ("describe, no segment", described),
+    ] {
+        println!(
+            "  {name:<24} {:>12.0} {:>14.2} {:>15.2}%",
+            rows as f64 / seconds,
+            seconds * scale,
+            250.0 / (rows as f64 / seconds) * 100.0
+        );
+    }
     if per_segment > 30.0 {
         println!("  OVER doc 12.2's 30 s. The publisher falls behind production.");
     } else {

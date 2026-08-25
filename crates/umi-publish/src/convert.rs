@@ -199,6 +199,87 @@ pub fn convert(segment: &Segment, out: &Path) -> Result<Converted> {
     })
 }
 
+/// Read back a Parquet file that was converted earlier and say the same things
+/// about it that [`convert`] says about the file it just wrote.
+///
+/// [`convert`] is the path for a segment that is still a `.umi`. This is the
+/// path for a crawl directory that ran without `--publish`, which doc 13.5 says
+/// converts each segment as it seals and deletes the `.umi`, so by the time
+/// somebody runs `umi publish` on it the only copy of those rows is Parquet.
+/// Without this there would be no way to publish that directory at all, and
+/// `umi crawl` with no flags is the shape doc 14.1 makes the first promise
+/// about.
+///
+/// Every column is read and not just the two this needs. That is deliberate and
+/// it is doc 12.2's step 1: for a segment, step 1 is verifying the shoal
+/// checksums, and the honest equivalent for a file that is already Parquet is
+/// decoding every page so that the footer, the page headers and the compressed
+/// blocks all have to hold together. A version of this that projected two
+/// columns would be faster and would publish a file with a corrupt `markdown`
+/// column without noticing.
+///
+/// # Errors
+///
+/// Whatever Parquet reports, which for a damaged file is what stops it going
+/// up, and whatever the filesystem reports on the read for the digests.
+pub fn describe(path: &Path) -> Result<Converted> {
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use parquet::errors::ParquetError;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(File::open(path)?)?;
+    let row_groups = builder.metadata().num_row_groups();
+    let reader = builder.build()?;
+
+    let mut rows = 0u64;
+    let mut verification = Tally::default();
+    let (mut first_ms, mut last_ms) = (0u64, 0u64);
+    for batch in reader {
+        // Arrow's error rather than Parquet's, because the decode is what
+        // fails when a page does not hold together, and it is put back into a
+        // Parquet error so that doc 14.9 reads it as exit 6 with everything
+        // else that means "this file is not what it claims to be".
+        let batch = batch.map_err(|cause| ParquetError::ArrowError(cause.to_string()))?;
+        rows += batch.num_rows() as u64;
+        verification.add(&batch);
+        times(&batch, &mut first_ms, &mut last_ms);
+    }
+
+    let digested = digest_file(path)?;
+    Ok(Converted {
+        rows,
+        row_groups,
+        bytes: digested.bytes,
+        blake3: digested.blake3,
+        sha256: digested.sha256,
+        first_ms,
+        last_ms,
+        verification,
+    })
+}
+
+/// Widen the time span to cover one batch.
+///
+/// Deliberately the same rule the segment writer uses to fill in its footer
+/// statistics, down to treating zero as "nothing seen yet", so that a segment
+/// converted by [`convert`] and the same file read back by [`describe`] report
+/// the same span rather than two spans that usually agree. A stream with no
+/// `fetched_at_ms` leaves both at zero, which the writer does too and for the
+/// same reason: there is no time in those rows to report.
+fn times(batch: &arrow::record_batch::RecordBatch, first_ms: &mut u64, last_ms: &mut u64) {
+    let Some(column) = batch.column_by_name("fetched_at_ms") else {
+        return;
+    };
+    let Some(values) = column.as_any().downcast_ref::<arrow::array::UInt64Array>() else {
+        return;
+    };
+    for value in values.values() {
+        if *first_ms == 0 || *value < *first_ms {
+            *first_ms = *value;
+        }
+        *last_ms = (*last_ms).max(*value);
+    }
+}
+
 /// Doc 12.3's writer settings, all of them, in one place.
 ///
 /// Fixed rather than configurable. A published corpus whose encoding depends on

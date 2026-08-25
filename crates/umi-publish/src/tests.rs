@@ -119,6 +119,46 @@ fn every_stream_converts_and_reads_back_exactly() {
 }
 
 #[test]
+fn describing_a_converted_file_says_what_the_conversion_said() {
+    // This is the property `umi publish <dir>` rests on. A crawl that ran
+    // without `--publish` converted its segments at seal time and deleted the
+    // `.umi`, so the only thing left to publish is the Parquet, and the
+    // manifest entry for it has to come out the same as if the segment were
+    // still here. Every field except the digests would be easy to get subtly
+    // wrong, so all of them are compared rather than a couple.
+    for stream in sample::EVERY_STREAM {
+        let dir = tempdir();
+        let (umi, _) = segment(dir.path(), stream, 1000);
+        let out = dir.path().join("segment.parquet");
+        let converted = convert(&Segment::open(&umi).expect("open"), &out).expect("convert");
+
+        let described = crate::describe(&out).expect("describe");
+        assert_eq!(described, converted, "{stream:?}");
+    }
+}
+
+#[test]
+fn describing_a_damaged_file_fails_rather_than_publishing_it() {
+    // The reason `describe` reads every column instead of the two it needs. A
+    // projection would read the footer, get the row count and the times, and
+    // never touch the page this test breaks, which would put a file with an
+    // unreadable column into a signed manifest.
+    let dir = tempdir();
+    let (umi, _) = segment(dir.path(), StreamKind::Pages, 1000);
+    let out = dir.path().join("segment.parquet");
+    convert(&Segment::open(&umi).expect("open"), &out).expect("convert");
+
+    let mut bytes = std::fs::read(&out).expect("read");
+    // A quarter of the way in, which is data rather than the header or the
+    // footer, and a whole byte rather than a bit so zstd is certain to notice.
+    let at = bytes.len() / 4;
+    bytes[at] ^= 0xff;
+    std::fs::write(&out, &bytes).expect("write");
+
+    assert!(crate::describe(&out).is_err());
+}
+
+#[test]
 fn one_shoal_is_one_row_group() {
     // Doc 12.3 makes this exact rather than approximate, and the reason is that
     // it is what makes a corrupted segment damage exactly one file and what

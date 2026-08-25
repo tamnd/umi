@@ -257,11 +257,12 @@ fn a_token_in_the_environment_is_not_a_literal_in_a_config_file() {
 
 #[test]
 fn every_error_has_the_exit_code_doc_14_9_gives_it() {
-    let cases: [(Error, Exit); 15] = [
+    let cases: [(Error, Exit); 16] = [
         (Error::NoColumn("body".to_owned()), Exit::Usage),
         (Error::BadUrl("not a url".to_owned()), Exit::Usage),
         (Error::Missing("publish.token".to_owned()), Exit::Usage),
         (Error::Empty, Exit::NothingToDo),
+        (Error::NothingToDo("already published"), Exit::NothingToDo),
         (Error::Fetch("connection reset".to_owned()), Exit::Network),
         (Error::Unreadable(3), Exit::Verification),
         (Error::NotReady, Exit::Resource),
