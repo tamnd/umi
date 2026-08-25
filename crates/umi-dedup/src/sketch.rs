@@ -42,6 +42,9 @@ pub const BANDS: usize = 8;
 /// at roughly 0.77 Jaccard.
 pub const BAND_ROWS: usize = PERMUTATIONS / BANDS;
 
+/// How many bytes one band takes in the encoded sketch.
+const BAND_BYTES: usize = BAND_ROWS * 4;
+
 /// The multiply and xor constants for the 64 permutations.
 ///
 /// A const fn rather than a literal table, so that the seed is visible and the
@@ -210,8 +213,9 @@ impl Sketch {
     #[must_use]
     pub fn to_bytes(&self) -> [u8; SKETCH_BYTES] {
         let mut out = [0u8; SKETCH_BYTES];
-        for (slot, value) in out.chunks_exact_mut(4).zip(self.minhash) {
-            slot.copy_from_slice(&value.to_le_bytes());
+        let (words, _) = out.as_chunks_mut::<4>();
+        for (slot, value) in words.iter_mut().zip(self.minhash) {
+            *slot = value.to_le_bytes();
         }
         out
     }
@@ -226,8 +230,9 @@ impl Sketch {
     #[must_use]
     pub fn from_bytes(minhash: &[u8; SKETCH_BYTES], simhash: u64) -> Self {
         let mut values = [0u32; PERMUTATIONS];
-        for (slot, bytes) in values.iter_mut().zip(minhash.chunks_exact(4)) {
-            *slot = u32::from_le_bytes(bytes.try_into().expect("chunks_exact(4) gives 4 bytes"));
+        let (words, _) = minhash.as_chunks::<4>();
+        for (slot, bytes) in values.iter_mut().zip(words) {
+            *slot = u32::from_le_bytes(*bytes);
         }
         let empty = values.iter().all(|v| *v == u32::MAX);
         Self {
@@ -259,13 +264,11 @@ impl Default for Sketch {
 pub fn bands(sketch: &Sketch) -> [u64; BANDS] {
     let bytes = sketch.to_bytes();
     let mut out = [0u64; BANDS];
-    for (slot, band) in out.iter_mut().zip(bytes.chunks_exact(BAND_ROWS * 4)) {
+    let (rows, _) = bytes.as_chunks::<BAND_BYTES>();
+    for (slot, band) in out.iter_mut().zip(rows) {
         let digest = blake3::hash(band);
-        *slot = u64::from_le_bytes(
-            digest.as_bytes()[..8]
-                .try_into()
-                .expect("a blake3 digest is 32 bytes"),
-        );
+        let (head, _) = digest.as_bytes().as_chunks::<8>();
+        *slot = u64::from_le_bytes(head[0]);
     }
     out
 }

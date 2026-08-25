@@ -65,15 +65,15 @@ impl ChunkTree {
         let mut levels = vec![level.clone()];
         while level.len() > 1 {
             let mut up = Vec::with_capacity(level.len().div_ceil(2));
-            let mut pair = level.chunks_exact(2);
-            for two in &mut pair {
+            let (pairs, rest) = level.as_chunks::<2>();
+            for two in pairs {
                 up.push(node(&two[0], &two[1]));
             }
             // An odd node rides up unchanged. Duplicating it instead, which is
             // what Bitcoin does, makes a tree of n leaves and a tree of n+1
             // leaves where the last is repeated produce the same root, and that
             // is a real forgery and not a theoretical one.
-            if let [odd] = pair.remainder() {
+            if let [odd] = rest {
                 up.push(*odd);
             }
             levels.push(up.clone());

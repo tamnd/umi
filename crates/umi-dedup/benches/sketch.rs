@@ -217,7 +217,7 @@ fn text_of(bytes: usize) -> String {
         word += 1;
         // A sentence every dozen words or so, which is what puts punctuation
         // inside the shingles the way real text does.
-        if word % 13 == 0 {
+        if word.is_multiple_of(13) {
             out.push('.');
         }
         out.push(' ');

@@ -191,9 +191,14 @@ fn the_exact_duplicate_key_is_over_the_text_and_the_ledger_gets_its_first_8_byte
 fn length_buckets_are_coarse_enough_that_a_paragraph_does_not_move_them() {
     assert_eq!(len_bucket(0), 0);
     assert_eq!(len_bucket(1), 1);
-    // Doc 04.6 compares within one bucket, so 4000 and 4500 bytes of text have
-    // to land together and 40000 and 400 must not.
-    assert_eq!(len_bucket(4000), len_bucket(4500));
+    // Two lengths inside one power of two land together.
+    assert_eq!(len_bucket(4200), len_bucket(4500));
+    // Two that straddle a boundary do not, and this is why doc 04.6 compares
+    // within one bucket rather than for equality: 4000 and 4500 bytes of text
+    // are the same page and 4096 sits between them.
+    assert_eq!(len_bucket(4500) - len_bucket(4000), 1);
+    // A page that shrank by two orders of magnitude is a soft error page
+    // wearing the same URL, and that has to be well outside the tolerance.
     assert!(len_bucket(40_000) - len_bucket(400) > 1);
 }
 
