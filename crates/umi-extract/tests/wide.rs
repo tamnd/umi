@@ -188,6 +188,10 @@ fn report(expected: &str, found: &str) -> ! {
         "the corpus is not the one the digests were recorded against"
     );
 
+    // Kept before the shadowing below, for the case where the maps agree.
+    let (expected_text, found_text) = (expected, found);
+    let (expected_len, found_len) = (expected.len(), found.len());
+
     let body = |text: &str| -> std::collections::BTreeMap<String, String> {
         text.lines()
             .filter(|line| !line.starts_with('#') && !line.starts_with("corpus "))
@@ -215,6 +219,24 @@ fn report(expected: &str, found: &str) -> ! {
             ));
         }
     }
+
+    // Nothing diverged and yet the two strings are not equal, so the difference
+    // is in something `str::lines` throws away. That is line endings, and the
+    // way it happens is a checkout on Windows rewriting the recorded file to
+    // CRLF, which `.gitattributes` is supposed to prevent. Say that, rather
+    // than printing "0 of 10000 documents extracted differently" and leaving
+    // somebody to work out what a difference of zero documents means.
+    assert!(
+        !diverged.is_empty(),
+        "every digest matches and the files still differ, so the difference is \
+         in the line endings or the trailing bytes. Recorded: {} bytes, {} of \
+         them CR. Extracted: {} bytes, {} of them CR. Check that .gitattributes \
+         still covers crates/*/golden/**.",
+        expected_len,
+        expected_text.bytes().filter(|byte| *byte == b'\r').count(),
+        found_len,
+        found_text.bytes().filter(|byte| *byte == b'\r').count(),
+    );
 
     let total = diverged.len();
     diverged.truncate(20);

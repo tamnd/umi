@@ -10,3 +10,9 @@
 # because the point of keeping expected markdown next to each input is that a
 # change reads as a diff rather than as a hash that moved.
 crates/*/corpus/** -text
+
+# The recorded digests are the other side of the same problem. A test that
+# writes LF and compares against a file git handed back with CRLF fails on a
+# difference git introduced, and it fails confusingly, because every digest on
+# every line still matches. Store them as they are written.
+crates/*/golden/** -text
