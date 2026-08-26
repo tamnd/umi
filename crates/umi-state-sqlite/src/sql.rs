@@ -224,7 +224,7 @@ ON CONFLICT(host) DO UPDATE SET
 pub const SELECT_LEDGER: &str = "
 SELECT host, url_key_full, depth, priority, state, next_due_ms, last_fetch_ms,
        last_change_ms, fetch_count, change_count, content_hash, etag_ref,
-       last_mod_ms, status, tier_used, fail_streak
+       last_mod_ms, status, tier_used, fail_streak, observed_secs
   FROM ledger
  WHERE pld = ?1 AND host = ?2 AND url_key = ?3";
 
@@ -249,9 +249,10 @@ UPDATE ledger SET
     status         = ?11,
     tier_used      = ?12,
     fail_streak    = ?13,
+    observed_secs  = ?14,
     lease_id       = NULL,
     lease_expires  = NULL
- WHERE pld = ?14 AND host = ?15 AND url_key = ?16";
+ WHERE pld = ?15 AND host = ?16 AND url_key = ?17";
 
 /// Give a url back without recording anything about it.
 ///

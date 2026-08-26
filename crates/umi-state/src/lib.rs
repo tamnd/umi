@@ -57,6 +57,7 @@ use std::time::Duration;
 use umi_types::{HostId, PldId, Ulid};
 
 pub mod conformance;
+pub mod freshness;
 pub mod memory;
 pub mod pace;
 mod types;
@@ -64,6 +65,9 @@ mod types;
 #[cfg(test)]
 mod tests;
 
+pub use freshness::{
+    INITIAL_REFRESH, MAX_REFRESH, MIN_REFRESH, next_due_after, refresh_interval_ms,
+};
 pub use memory::MemoryState;
 pub use pace::Pace;
 pub use types::{
@@ -86,17 +90,6 @@ pub const BATCH: usize = 4096;
 /// A crash loses at most this much admission. It never loses a completion and
 /// it never loses a lease.
 pub const GROUP_COMMIT: Duration = Duration::from_millis(200);
-
-/// The first refresh interval for a URL we have just fetched.
-pub const INITIAL_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
-
-/// The floor on refresh, so a page that changes on every fetch cannot turn
-/// into a hot loop against one origin.
-pub const MIN_REFRESH: Duration = Duration::from_secs(60 * 60);
-
-/// The ceiling on refresh. A page nothing has changed in months still gets
-/// looked at, because the alternative is a corpus that quietly rots.
-pub const MAX_REFRESH: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// What can go wrong underneath.
 ///
@@ -421,41 +414,6 @@ pub trait State: Send + Sync + 'static {
     ///
     /// Whatever the store reports.
     async fn stats(&self) -> Result<StateStats>;
-}
-
-/// When to look at a URL again, given whether the content actually changed.
-///
-/// This lives in the trait crate rather than in each backend for one reason:
-/// four backends with four refresh policies would make the crawl's freshness
-/// depend on which store an operator picked, and freshness is the thing doc 01
-/// claims over Common Crawl. So it is one function and every backend calls it.
-///
-/// The rule is the standard adaptive one. A URL fetched for the first time
-/// comes back after [`INITIAL_REFRESH`]. After that, halve the interval that
-/// was actually served when the content changed, double it when it did not,
-/// and clamp to [`MIN_REFRESH`] and [`MAX_REFRESH`]. It converges on roughly
-/// the page's own change period, which is what doc 12's estimator refines
-/// later with the `change_count` and `fetch_count` this maintains.
-///
-/// `row` is the row as it was **before** this fetch was applied, so
-/// `last_fetch_ms` is the previous fetch and the gap between the two is the
-/// interval that was actually served.
-#[must_use]
-pub fn next_due_after(row: &LedgerRow, changed: bool, now_ms: u64) -> u64 {
-    // A first fetch has nothing to compare against. `changed` is true for it
-    // by construction, since the stored hash was zero, and treating that as
-    // evidence would put every page on Earth on a twelve hour cycle after one
-    // look at it.
-    if row.fetch_count == 0 || row.last_fetch_ms == 0 {
-        return now_ms.saturating_add(INITIAL_REFRESH.as_millis() as u64);
-    }
-    let previous = now_ms.saturating_sub(row.last_fetch_ms);
-    let next = if changed { previous / 2 } else { previous * 2 };
-    let clamped = next.clamp(
-        MIN_REFRESH.as_millis() as u64,
-        MAX_REFRESH.as_millis() as u64,
-    );
-    now_ms.saturating_add(clamped)
 }
 
 /// How long to wait after a failure, from the ladder in doc 05.8.

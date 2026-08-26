@@ -160,6 +160,7 @@ pub fn ledger(row: &Row<'_>) -> rusqlite::Result<LedgerRow> {
         status: small(row, "status")?,
         tier_used: tier(row, "tier_used")?,
         fail_streak: small(row, "fail_streak")?,
+        observed_secs: small(row, "observed_secs")?,
     })
 }
 

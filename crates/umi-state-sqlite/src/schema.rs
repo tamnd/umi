@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -349,4 +349,26 @@ END;
 /// minute of crawling, which costs a handful of pages once.
 const V4: &str = r"
 ALTER TABLE hosts ADD COLUMN fast_streak INTEGER NOT NULL DEFAULT 0;
+";
+
+/// Version 5: how long each URL has been watched for, which is the denominator
+/// of the change rate estimator in doc 09.4.
+///
+/// Zero for every row written before this, and zero is the right answer for
+/// them: it says we have no observation window yet. `admit` never sets it
+/// either, for the same reason, so the default carries the insert.
+///
+/// The counters have to come back to zero with it. They count fetches, the new
+/// column measures the window those fetches span, and a row claiming a hundred
+/// fetches inside a window of nothing would be read as a page that changes
+/// several times an hour. Doc 09.4 says `fetch_count since last reset` for
+/// exactly this reason, and this is the reset. What it costs is the lifetime
+/// count on the `attempt` field of a lease, which nothing schedules from.
+const V5: &str = r"
+ALTER TABLE ledger ADD COLUMN observed_secs INTEGER NOT NULL DEFAULT 0;
+
+UPDATE ledger
+   SET fetch_count  = MIN(fetch_count, 1),
+       change_count = MIN(change_count, 1)
+ WHERE fetch_count > 1;
 ";

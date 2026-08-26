@@ -33,6 +33,23 @@ async fn the_reference_backend_conforms() {
     );
 }
 
+/// A row that has been fetched, with no revalidator on it.
+///
+/// [`LedgerRow::default`] is not that. Its `etag_ref` of zero means the first
+/// ETag in the shard's pool rather than none, which is what
+/// [`LedgerRow::NO_ETAG`] is for, and the estimator treats a row with a
+/// revalidator differently.
+fn watched(fetch_count: u32, change_count: u32, observed_ms: u64) -> LedgerRow {
+    LedgerRow {
+        fetch_count,
+        change_count,
+        observed_secs: (observed_ms / 1000) as u32,
+        last_fetch_ms: T0,
+        etag_ref: LedgerRow::NO_ETAG,
+        ..LedgerRow::default()
+    }
+}
+
 #[test]
 fn a_first_fetch_is_looked_at_again_the_next_day() {
     // A first fetch has nothing to compare against, so `changed` does not come
@@ -42,37 +59,45 @@ fn a_first_fetch_is_looked_at_again_the_next_day() {
     let row = LedgerRow::default();
     assert_eq!(next_due_after(&row, false, T0), T0 + DAY);
     assert_eq!(next_due_after(&row, true, T0), T0 + DAY);
+    // And it has watched the page for nothing so far, whatever the clock says.
+    assert_eq!(row.observed_secs_after(T0), 0);
 }
 
 #[test]
 fn a_page_that_keeps_changing_converges_downward() {
-    // Fetch it, find it changed every time, and the interval walks down to the
-    // floor rather than to zero.
-    let mut row = LedgerRow {
-        fetch_count: 1,
-        last_fetch_ms: T0,
-        ..LedgerRow::default()
-    };
+    // Fetch it, find it changed every time, and the interval walks down rather
+    // than hunting around. It does not reach the floor: a page that changes on
+    // every visit at a five minute spacing is above the churn ceiling and doc
+    // 09.4 says to stop tracking it and sample it instead, which is what the
+    // last assertion is about.
+    let mut row = watched(1, 1, 0);
     let mut now = T0 + DAY;
-    for _ in 0..12 {
-        let next = next_due_after(&row, true, now);
+    let mut previous = DAY;
+    for _ in 0..6 {
+        let interval = refresh_interval_ms(&row, true, now);
+        assert!(interval <= previous, "{interval} is not below {previous}");
+        previous = interval;
+        row.observed_secs = row.observed_secs_after(now);
         row.last_fetch_ms = now;
         row.fetch_count += 1;
-        now = next;
+        row.change_count += 1;
+        now += interval;
     }
-    assert_eq!(now - row.last_fetch_ms, MIN_REFRESH.as_millis() as u64);
+    assert!(previous < 6 * HOUR, "settled at {previous}");
+    assert!(previous >= MIN_REFRESH.as_millis() as u64);
 }
 
 #[test]
 fn a_page_that_never_changes_converges_upward() {
-    let mut row = LedgerRow {
-        fetch_count: 1,
-        last_fetch_ms: T0,
-        ..LedgerRow::default()
-    };
+    // No change ever seen is a rate of zero, so the only thing holding the
+    // interval down is how long we have actually watched the page. That makes
+    // the walk geometric rather than a jump straight to the ceiling, which is
+    // the difference between two fetches an hour apart and real evidence.
+    let mut row = watched(1, 1, 0);
     let mut now = T0 + DAY;
-    for _ in 0..12 {
+    for _ in 0..16 {
         let next = next_due_after(&row, false, now);
+        row.observed_secs = row.observed_secs_after(now);
         row.last_fetch_ms = now;
         row.fetch_count += 1;
         now = next;
@@ -81,27 +106,120 @@ fn a_page_that_never_changes_converges_upward() {
 }
 
 #[test]
+fn the_estimator_finds_a_change_period_it_was_not_told() {
+    // The one that matters. A page really changes every `period`, we only ever
+    // learn changed or not changed, and the interval has to end up near the
+    // period rather than at either clamp. `K_Q16` is a half, so the target is
+    // half the period, and the band is wide because six or seven visits is not
+    // a lot of evidence.
+    for period in [2 * HOUR, DAY, 7 * DAY, 30 * DAY] {
+        let mut row = watched(1, 1, 0);
+        let mut now = T0 + period;
+        let mut last_change = T0;
+        // Long enough for the observation window to stop being the binding
+        // constraint at every period in the list.
+        for _ in 0..40 {
+            let changed = now - last_change >= period;
+            if changed {
+                last_change = now;
+                row.change_count += 1;
+            }
+            let interval = refresh_interval_ms(&row, changed, now);
+            row.observed_secs = row.observed_secs_after(now);
+            row.last_fetch_ms = now;
+            row.fetch_count += 1;
+            now += interval;
+        }
+        let settled = now - row.last_fetch_ms;
+        assert!(
+            settled > period / 4 && settled < period,
+            "a {period} ms page settled at {settled} ms"
+        );
+    }
+}
+
+#[test]
+fn a_page_that_changes_faster_than_we_can_follow_gets_sampled() {
+    // Doc 09.4's non monotonic part. A page changing every minute cannot be
+    // kept fresh at any budget, so the policy gives up on tracking it. What
+    // that has to buy is a bounded number of fetches, and a minute long change
+    // period over thirty days is 43200 changes.
+    let mut row = watched(1, 1, 0);
+    let mut now = T0 + 60 * 1000;
+    let mut fetches = 0;
+    while now < T0 + 30 * DAY {
+        let interval = refresh_interval_ms(&row, true, now);
+        row.observed_secs = row.observed_secs_after(now);
+        row.last_fetch_ms = now;
+        row.fetch_count += 1;
+        row.change_count += 1;
+        now += interval;
+        fetches += 1;
+    }
+    // The floor would allow 8640 in that window. What holds it to a fraction
+    // of that is the churn ceiling, and what stops it reaching the daily sample
+    // doc 09.4 asks for is that a page changing every minute and a page
+    // changing every hour look identical when you only look every hour. See the
+    // module docs.
+    assert!(fetches < 800, "spent {fetches} fetches on a hopeless page");
+}
+
+#[test]
+fn a_revalidator_buys_a_shorter_interval() {
+    // A 304 is about 500 bytes against a page fetch of a hundred times that,
+    // so a page that offers one is worth checking twice as often.
+    let bare = watched(4, 3, 4 * DAY);
+    let with_etag = LedgerRow {
+        etag_ref: 7,
+        ..bare
+    };
+    let now = T0 + DAY;
+    assert_eq!(
+        refresh_interval_ms(&with_etag, true, now),
+        refresh_interval_ms(&bare, true, now) / 2
+    );
+}
+
+#[test]
+fn nothing_is_extrapolated_past_the_evidence_for_it() {
+    // Two looks an hour apart with no change is not grounds for a six month
+    // interval, however confident the arithmetic is.
+    let row = watched(1, 1, 0);
+    assert_eq!(refresh_interval_ms(&row, false, T0 + HOUR), 2 * HOUR);
+}
+
+#[test]
+fn a_304_counts_as_evidence_the_page_did_not_change() {
+    // The subtle one. A conditional request that comes back 304 is an
+    // observation, and a backend that only counted 200s would learn nothing
+    // from the cheapest answer the web gives us.
+    let row = watched(3, 1, 3 * DAY);
+    let now = T0 + DAY;
+    assert!(refresh_interval_ms(&row, false, now) > refresh_interval_ms(&row, true, now));
+}
+
+#[test]
 fn the_refresh_interval_is_never_outside_its_clamps() {
     // The clamp is load bearing. Without a floor, a page whose extracted text
     // includes a timestamp changes on every fetch and turns into a hot loop
     // against one origin.
     for gap in [0, 1, 1000, DAY, 400 * DAY, u64::MAX / 4] {
-        let row = LedgerRow {
-            fetch_count: 3,
-            last_fetch_ms: T0,
-            ..LedgerRow::default()
-        };
-        for changed in [true, false] {
-            let due = next_due_after(&row, changed, T0 + gap);
-            let interval = due - (T0 + gap);
-            assert!(
-                interval >= MIN_REFRESH.as_millis() as u64,
-                "gap {gap} changed {changed} gave {interval}"
-            );
-            assert!(
-                interval <= MAX_REFRESH.as_millis() as u64,
-                "gap {gap} changed {changed} gave {interval}"
-            );
+        for (fetch_count, change_count) in [(0, 0), (1, 1), (3, 1), (3, 3), (u32::MAX, u32::MAX)] {
+            let row = LedgerRow {
+                observed_secs: u32::MAX,
+                ..watched(fetch_count, change_count, 0)
+            };
+            for changed in [true, false] {
+                let interval = refresh_interval_ms(&row, changed, T0 + gap);
+                assert!(
+                    interval >= MIN_REFRESH.as_millis() as u64,
+                    "gap {gap} changed {changed} gave {interval}"
+                );
+                assert!(
+                    interval <= MAX_REFRESH.as_millis() as u64,
+                    "gap {gap} changed {changed} gave {interval}"
+                );
+            }
         }
     }
 }
