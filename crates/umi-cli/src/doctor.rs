@@ -12,11 +12,13 @@
 //! broken thing does not hide the other nine.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::Error;
+use crate::addresses::{self, Published};
+use crate::{Error, rdns};
 
 /// How a check came out.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -97,6 +99,7 @@ pub fn doctor(options: &Options) -> Result<Vec<Check>, Error> {
         memory(),
         crawl_identity(options.identity.as_deref()),
     ];
+    checks.extend(crawl_addresses(options.offline));
     if options.offline {
         checks.push(Check::new("inbound sample", "--offline", Verdict::Skip));
         checks.push(Check::new("clock skew", "--offline", Verdict::Skip));
@@ -146,6 +149,104 @@ fn crawl_identity(keyid: Option<&str>) -> Check {
             Verdict::Skip,
         ),
     }
+}
+
+/// Doc 07.1's forward confirmable reverse DNS, asked about this box.
+///
+/// One line per address the box sends from. An address that is not in the
+/// published list is skipped rather than judged, because a volunteer's laptop
+/// has whatever PTR record their ISP gave it and doc 07.1 asks nothing of it.
+/// The check is only strict about addresses we published as ours, which is
+/// exactly where a wrong answer costs something: a site operator running the
+/// verification every operator knows how to run and getting the wrong result.
+fn crawl_addresses(offline: bool) -> Vec<Check> {
+    const NAME: &str = "crawl addresses";
+    if offline {
+        return vec![Check::new(NAME, "--offline", Verdict::Skip)];
+    }
+    let published = match Published::shipped() {
+        Ok(published) => published,
+        Err(why) => {
+            return vec![Check::new(
+                NAME,
+                format!("the published list will not parse: {why}"),
+                Verdict::Bad,
+            )];
+        }
+    };
+    let mine: Vec<IpAddr> = [rdns::V4_PROBE, rdns::V6_PROBE]
+        .iter()
+        .filter_map(|target| rdns::source_address(target))
+        .collect();
+    if mine.is_empty() {
+        return vec![Check::new(
+            NAME,
+            "this box has no route to the internet",
+            Verdict::Skip,
+        )];
+    }
+
+    let resolver = rdns::Resolver::public();
+    mine.into_iter()
+        .map(|addr| match published.find(addr) {
+            None => Check::new(
+                NAME,
+                format!(
+                    "{addr} is not in {}, nothing is required of it",
+                    addresses::URL
+                ),
+                Verdict::Skip,
+            ),
+            Some(entry) => {
+                let expected = entry.name.clone();
+                match rdns::confirm(&resolver, addr, addresses::DOMAIN) {
+                    rdns::Confirmation::Confirmed(name) => {
+                        let wrong = expected.is_some_and(|want| want != name);
+                        Check::new(
+                            NAME,
+                            format!("{addr} confirms as {name}"),
+                            if wrong { Verdict::Warn } else { Verdict::Ok },
+                        )
+                    }
+                    rdns::Confirmation::Foreign(name) => Check::new(
+                        NAME,
+                        format!("{addr} reverses to {name}, which is not ours"),
+                        Verdict::Bad,
+                    ),
+                    rdns::Confirmation::NoReturn(name, found) => Check::new(
+                        NAME,
+                        format!(
+                            "{addr} reverses to {name}, which resolves to {}",
+                            list(&found)
+                        ),
+                        Verdict::Bad,
+                    ),
+                    rdns::Confirmation::NoName => Check::new(
+                        NAME,
+                        format!("{addr} is published and has no PTR record"),
+                        Verdict::Bad,
+                    ),
+                    rdns::Confirmation::Failed(cause) => Check::new(
+                        NAME,
+                        format!("{addr} could not be checked: {cause}"),
+                        Verdict::Warn,
+                    ),
+                }
+            }
+        })
+        .collect()
+}
+
+/// Addresses for a report line, or the fact that there were none.
+fn list(addrs: &[IpAddr]) -> String {
+    if addrs.is_empty() {
+        return "nothing".to_owned();
+    }
+    addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn toolchain() -> Check {
