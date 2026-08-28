@@ -209,6 +209,37 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc -p umi-fetch --features emulation --no-deps
 
+  # Doc 05.6's T3. Ubuntu only and one job, which is a smaller commitment than
+  # the emulation matrix above for a reason: T3 links no TLS stack of its own,
+  # so there is no symbol collision to catch on a platform we did not compile
+  # on, and the whole of the policy is pure functions that behave the same
+  # everywhere. What this job is actually for is that the module only compiles
+  # under a feature nobody else turns on, so without it a rename in
+  # chromiumoxide would land on somebody's laptop months later.
+  #
+  # No Chrome is installed and none is needed. The tests here never launch a
+  # browser, on purpose, and the pool is exercised by the render bench and by a
+  # real crawl on the fleet.
+  render:
+    name: render feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p umi-fetch --all-targets --features render -- -D warnings
+      - run: cargo test -p umi-fetch --features render
+      # Both rungs at once is what the fleet builds, and the thing worth
+      # proving is that BoringSSL and chromiumoxide's tree link together.
+      - run: cargo test -p umi-fetch --features emulation,render
+      # Same reason as the emulation job: these doc comments exist only in this
+      # build, so the rustdoc job cannot see them.
+      - env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p umi-fetch --features render --no-deps
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest

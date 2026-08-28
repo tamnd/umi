@@ -382,7 +382,7 @@ fn redirect_target(url: &Url, head: &HeaderMap, status: u16) -> Option<Url> {
 
 /// What one status means, before the body has been read.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Verdict {
+pub(crate) enum Verdict {
     /// A success. Read the body, it is the page.
     Page,
     /// A 410, which is the one status that means never again.
@@ -395,7 +395,7 @@ enum Verdict {
 }
 
 /// What a status means, once it is not a redirect and not a 304.
-fn classify(status: u16, head: &HeaderMap) -> Verdict {
+pub(crate) fn classify(status: u16, head: &HeaderMap) -> Verdict {
     if (200..300).contains(&status) {
         return Verdict::Page;
     }
@@ -450,7 +450,7 @@ fn declared_length(head: &HeaderMap) -> Option<u64> {
 }
 
 /// The conditional headers this response earns us next time.
-fn revalidator(head: &HeaderMap) -> Revalidator {
+pub(crate) fn revalidator(head: &HeaderMap) -> Revalidator {
     Revalidator {
         etag: header(head, "etag"),
         last_modified_ms: header(head, "last-modified")

@@ -16,12 +16,20 @@ workspace = true
 name = "sign"
 harness = false
 
+# Doc 05.6's per page cost, which needs a real browser and so cannot be part of
+# a default `cargo bench`. `required-features` is what keeps it out.
+[[bench]]
+name = "render"
+harness = false
+required-features = ["render"]
+
 [dependencies]
 umi-types = { workspace = true }
 
 base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+chromiumoxide = { workspace = true, optional = true }
 # Doc 07.2's request signatures are Ed25519, the same scheme doc 12.5 uses for
 # manifests and doc 04 uses for receipts. One signature scheme in the tree.
 ed25519-dalek = { workspace = true }
@@ -35,6 +43,7 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+tracing = { workspace = true }
 url = { workspace = true }
 wreq = { workspace = true, optional = true }
 wreq-util = { workspace = true, optional = true }
@@ -63,3 +72,9 @@ tokio-rustls = { workspace = true }
 # BoringSSL, which shares symbol prefixes with openssl-sys, and a tree holding
 # both either fails to link or links and segfaults.
 emulation = ["dep:wreq", "dep:wreq-util"]
+# Doc 05.6's T3. Off by default because it is useless without a Chrome or
+# Chromium binary on the box, and a fetcher that fails to start on a machine
+# with no browser would be a worse default than one that simply has no T3.
+# Nothing here links a second TLS stack, so this feature and `emulation` can be
+# on together and the fleet turns both on.
+render = ["dep:chromiumoxide"]

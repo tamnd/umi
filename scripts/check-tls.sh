@@ -60,6 +60,35 @@ for crate in openssl openssl-sys native-tls; do
 	fi
 done
 
+# T3 brings chromiumoxide, which brings reqwest, and a reqwest that arrived with
+# a TLS feature turned on would put a second stack in the tree without anybody
+# meaning to. The crate only wants one for its `fetcher` feature, which
+# downloads a Chromium build and which we leave off, so this is the check that
+# the reason we left it off is still the reason it is off.
+echo "render build, no second tls stack"
+render=$(cargo tree -p umi-fetch --features render --edges normal --prefix none --format '{p}')
+for crate in openssl openssl-sys native-tls btls btls-sys boring boring-sys; do
+	if hits=$(printf '%s\n' "$render" | grep -E "^${crate} v" || true); [ -n "$hits" ]; then
+		printf '  %s is in the render tree, which should be rustls only\n' "$crate"
+		fail=1
+	fi
+done
+
+# Both features at once is what the fleet runs, so it is what has to link. T2
+# needs BoringSSL and T3 must not add anything to it.
+echo "emulation and render together, boringssl and nothing else"
+both=$(cargo tree -p umi-fetch --features emulation,render --edges normal --prefix none --format '{p}')
+if [ "$(printf '%s\n' "$both" | grep -cE '^btls v' || true)" -eq 0 ]; then
+	printf '  the fleet build has no btls, so T2 is not BoringSSL\n'
+	fail=1
+fi
+for crate in openssl openssl-sys native-tls; do
+	if hits=$(printf '%s\n' "$both" | grep -E "^${crate} v" || true); [ -n "$hits" ]; then
+		printf '  %s is in the fleet tree, which cannot link with boringssl\n' "$crate"
+		fail=1
+	fi
+done
+
 if [ "$fail" -ne 0 ]; then
 	echo
 	echo "gate 2.2 failed, see docs/spec/05-fetch-tiers.md section 5.5"

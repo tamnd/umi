@@ -45,10 +45,11 @@ pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
     let parsed = Url::parse(url).map_err(|_| Error::BadUrl(url.to_owned()))?;
 
     // Honest rather than silently doing something else. T2 is behind a cargo
-    // feature and T3 and T4 are not written, so pretending a `--tier 3`
-    // request was served would make this command useless for the exact
-    // question it exists to answer.
-    let highest = Ladder::highest();
+    // feature, T3 needs a browser this command does not start and T4 is not
+    // written, so pretending a `--tier 3` request was served would make this
+    // command useless for the exact question it exists to answer.
+    let fetcher = Ladder::with_config(FetchConfig::default())?;
+    let highest = fetcher.highest();
     if let Some(byte) = tier
         && byte > highest.as_u8()
     {
@@ -66,7 +67,6 @@ pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
         .enable_all()
         .build()
         .map_err(Error::Io)?;
-    let fetcher = Ladder::with_config(FetchConfig::default())?;
     let outcome = runtime.block_on(fetcher.fetch(parsed.as_str(), None, asked))?;
 
     match outcome {

@@ -86,6 +86,9 @@ pub mod webbotauth;
 #[cfg(feature = "emulation")]
 mod emulated;
 
+#[cfg(feature = "render")]
+pub mod rendered;
+
 use engine::Engine;
 
 pub use outcome::{Failure, Hop, Outcome, OutcomeCode, Page, RetryAfter, Stage, Version};
@@ -95,6 +98,9 @@ pub use webbotauth::{Directory, Jwk, SignatureError, Signer};
 
 #[cfg(feature = "emulation")]
 pub use emulated::{ECHO_URL, EXPECTED_JA4, PLATFORM, PROFILE};
+
+#[cfg(feature = "render")]
+pub use rendered::{Counts, RenderConfig, Renderer};
 
 /// The user agent from `docs/spec/07-politeness-and-identity.md` section 7.1.
 ///
@@ -365,13 +371,18 @@ impl Emulated {
 /// [`Ladder::highest`] is how an operator finds out before that happens, and
 /// `umi crawl` logs it at startup.
 ///
-/// T3 and T4 do not exist yet, and `TierPolicy::CEILING` is `Tier::Emulated`,
-/// so nothing leases above T2 today. When they arrive they land here.
+/// T3 is here when the build has the `render` feature and a browser actually
+/// started, which is two conditions rather than one: a box with no Chrome
+/// installed compiles T3 in and still has no T3. T4 does not exist yet, and
+/// `TierPolicy::CEILING` is `Tier::Emulated`, so nothing leases above T2 today.
 #[derive(Clone, Debug)]
 pub struct Ladder {
     plain: Fetcher,
     #[cfg(feature = "emulation")]
     emulated: Emulated,
+    /// `None` on a box that has no browser, which is most of them.
+    #[cfg(feature = "render")]
+    rendered: Option<Renderer>,
 }
 
 impl Ladder {
@@ -410,17 +421,74 @@ impl Ladder {
         Ok(Self {
             #[cfg(feature = "emulation")]
             emulated: Emulated::with_signer(config.clone(), signer.clone())?,
+            #[cfg(feature = "render")]
+            rendered: None,
             plain: Fetcher::with_signer(config, signer)?,
         })
     }
 
+    /// Build the whole ladder, T3 included, and start a browser for it.
+    ///
+    /// Separate from [`Ladder::with_signer`] and async because this one is not
+    /// free: it spawns a Chromium process that holds a gigabyte or more once
+    /// its tabs are warm. A caller that wants T3 asks for it here, and doc
+    /// 05.6's zero tab cap on a box like server1 is the way to say no.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Client`] when a tier's TLS backend will not initialise or
+    /// when the browser will not start. Not having a browser is an error here
+    /// rather than a silent `None`, because a caller reached this constructor
+    /// on purpose and would otherwise run a whole crawl at T2 without knowing.
+    #[cfg(feature = "render")]
+    pub async fn with_rendered(
+        config: FetchConfig,
+        signer: Option<Arc<Signer>>,
+        render: RenderConfig,
+    ) -> Result<Self> {
+        let mut ladder = Self::with_signer(config.clone(), signer.clone())?;
+        ladder.rendered = Some(Renderer::launch(config, render, signer).await?);
+        Ok(ladder)
+    }
+
     /// The highest rung this build actually has.
+    ///
+    /// Takes `&self` because T3 is not a compile time fact. The feature can be
+    /// on and the browser can be absent, and an operator reading a startup log
+    /// wants to know what this process can do rather than what its build could
+    /// have done.
     #[must_use]
-    pub const fn highest() -> Tier {
+    pub fn highest(&self) -> Tier {
+        #[cfg(feature = "render")]
+        if self.rendered.is_some() {
+            return Tier::Rendered;
+        }
         if cfg!(feature = "emulation") {
             Tier::Emulated
         } else {
             Tier::Plain
+        }
+    }
+
+    /// The browser pool, when this process has one.
+    ///
+    /// This is where doc 05.6's per page cost comes from, through
+    /// [`Renderer::counts`].
+    #[cfg(feature = "render")]
+    #[must_use]
+    pub const fn rendered(&self) -> Option<&Renderer> {
+        self.rendered.as_ref()
+    }
+
+    /// Close the browser, if there is one.
+    ///
+    /// Dropping the ladder also kills Chromium, because the child is spawned
+    /// with `kill_on_drop`, but it leaves the profile directory behind. A
+    /// fetcher shutting down cleanly should call this.
+    pub async fn shutdown(self) {
+        #[cfg(feature = "render")]
+        if let Some(rendered) = self.rendered {
+            rendered.shutdown().await;
         }
     }
 
@@ -445,6 +513,16 @@ impl Ladder {
         revalidate: Option<&Revalidator>,
         tier: Tier,
     ) -> Result<Outcome> {
+        // T3 first, so that a lease for it gets a browser when there is one and
+        // falls through to T2 and then T1 when there is not. Doc 05.4's rule
+        // about a missing rung is the same at every height: serve the page from
+        // the rung below rather than error, and let the block count say so.
+        #[cfg(feature = "render")]
+        if matches!(tier, Tier::Rendered | Tier::Supervised)
+            && let Some(rendered) = &self.rendered
+        {
+            return rendered.fetch(url, revalidate).await;
+        }
         match tier {
             #[cfg(feature = "emulation")]
             Tier::Emulated | Tier::Rendered | Tier::Supervised => {
