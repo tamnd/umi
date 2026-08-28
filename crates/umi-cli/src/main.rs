@@ -458,7 +458,9 @@ fn finish(result: Result<crawl::Summary, Error>) -> Result<(), Error> {
     );
     match summary.stopped {
         crawl::Stop::Budget => Err(Error::Budget),
-        crawl::Stop::Idle => Ok(()),
+        // An interrupt is exit 0 with the rest, because the operator asked it
+        // to stop and it stopped, having written everything it had.
+        crawl::Stop::Idle | crawl::Stop::Signal => Ok(()),
     }
 }
 
@@ -581,9 +583,7 @@ fn not_built(command: &Command) -> Error {
         Command::Manifest { .. } => {
             "reading a manifest chain back is milestone 2, and umi verify checks one today"
         }
-        Command::Watch { .. } | Command::Block { .. } | Command::Scope { .. } => {
-            "milestone 2 builds this"
-        }
+        Command::Block { .. } | Command::Scope { .. } => "milestone 2 builds this",
         Command::State { .. } | Command::Checkpoint { .. } | Command::Sql { .. } => {
             "milestone 3 builds this"
         }

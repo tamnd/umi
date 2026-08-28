@@ -222,6 +222,13 @@ jobs:
             echo "umi resume exited 0 but the crawl loop is not built"
             exit 1
           fi
+          # A watch is a resume that does not stop, so it has to reach the
+          # same loop and refuse the same directory. Exiting 0 here would
+          # mean it had quietly gone back to being the unbuilt stub.
+          if ./target/debug/umi watch /tmp/not-a-crawl; then
+            echo "umi watch exited 0 on something that is not a crawl directory"
+            exit 1
+          fi
       - name: The commands that are built behave
         run: |
           set -e
