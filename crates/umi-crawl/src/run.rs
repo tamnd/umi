@@ -888,6 +888,13 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         // its links. Depth is the page's plus one, and the ceiling is applied
         // here rather than at admit time so that a page at the limit does not
         // cost a batch of candidates that all get rejected.
+        //
+        // The filter is `is_page` and nothing else. A link's own `rel=nofollow`
+        // is deliberately not consulted, which doc 11.4 states and the extract
+        // crate's module docs state again: it is a 2005 comment spam measure,
+        // it has not meant anything about crawlability for a long time, and the
+        // sites that stamp it on every outbound link are the ones with the most
+        // outbound links worth having.
         let limit = self.config.depth_limit();
         let followable: Vec<&str> = extracted
             .as_ref()
@@ -897,7 +904,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 e.links
                     .links
                     .iter()
-                    .filter(|l| !l.rel.has(umi_extract::Rel::NOFOLLOW))
+                    .filter(|l| l.is_page())
                     .map(|l| l.url.as_str())
                     .collect()
             })

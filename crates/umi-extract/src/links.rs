@@ -183,6 +183,38 @@ pub struct Link {
     pub rel: Rel,
 }
 
+impl Link {
+    /// Whether this link names a page, as opposed to something the page needs
+    /// in order to render itself.
+    ///
+    /// Doc 10.5's `links` column keeps every link a page carries, including its
+    /// stylesheets and its icons, because that column is what the page said and
+    /// a crawler's opinion does not change it. The frontier wants a narrower
+    /// set, and this is where the two part company.
+    ///
+    /// An anchor names a page, always. So does a sitemap and so does a feed:
+    /// neither is a page itself, but both are lists of pages, and dropping them
+    /// would lose the cheapest discovery a site offers. A `<link>` element is
+    /// the one that has to be asked, because the head holds the site's own
+    /// navigation and its build output in the same element. `canonical`, `next`,
+    /// `prev` and `alternate` name pages. `stylesheet`, `icon`, `preload`,
+    /// `modulepreload`, `manifest` and `dns-prefetch` name parts, and following
+    /// those is how a crawl of five pages fetches two favicons and a bundle.
+    #[must_use]
+    pub const fn is_page(&self) -> bool {
+        match self.kind {
+            LinkKind::Body | LinkKind::Nav | LinkKind::Redirect => true,
+            LinkKind::Sitemap | LinkKind::Feed => true,
+            LinkKind::Link => {
+                self.rel.has(Rel::CANONICAL)
+                    || self.rel.has(Rel::NEXT)
+                    || self.rel.has(Rel::PREV)
+                    || self.rel.has(Rel::ALTERNATE)
+            }
+        }
+    }
+}
+
 /// Every link on a page, and what happened to the ones that are not here.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Links {
@@ -524,6 +556,45 @@ mod tests {
     fn previous_is_spelled_both_ways() {
         assert!(Rel::parse("previous").has(Rel::PREV));
         assert!(Rel::parse("prev").has(Rel::PREV));
+    }
+
+    #[test]
+    fn an_anchor_is_a_page_whatever_its_rel_says() {
+        let link = |kind, rel| Link {
+            url: "https://example.com/a".to_owned(),
+            anchor: String::new(),
+            kind,
+            rel: Rel::parse(rel),
+        };
+        assert!(link(LinkKind::Body, "nofollow ugc sponsored").is_page());
+        assert!(link(LinkKind::Nav, "").is_page());
+        assert!(link(LinkKind::Sitemap, "sitemap").is_page());
+        assert!(link(LinkKind::Feed, "alternate").is_page());
+    }
+
+    #[test]
+    fn a_head_link_is_a_page_only_when_its_rel_names_one() {
+        let link = |rel| Link {
+            url: "https://example.com/a".to_owned(),
+            anchor: String::new(),
+            kind: LinkKind::Link,
+            rel: Rel::parse(rel),
+        };
+        for rel in ["canonical", "next", "prev", "alternate"] {
+            assert!(link(rel).is_page(), "{rel}");
+        }
+        // The four that turned up in a real crawl of excalidraw.com, plus the
+        // two that travel with them.
+        for rel in [
+            "stylesheet",
+            "icon",
+            "modulepreload",
+            "manifest",
+            "preload",
+            "dns-prefetch",
+        ] {
+            assert!(!link(rel).is_page(), "{rel}");
+        }
     }
 
     #[test]
