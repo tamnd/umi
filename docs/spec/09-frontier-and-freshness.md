@@ -92,6 +92,14 @@ interval = clamp(
 
 `min_interval` is 5 minutes, `max_interval` is 180 days, `churn_ceiling` is one change per 10 minutes. A page above the ceiling drops to a daily sample, because we cannot represent it faithfully and pretending otherwise burns capacity that other pages would use better.
 
+`k` is a half. It is the expected number of changes per visit the interval aims at, so a little under 40 percent of refetches find something new. Larger than that wastes fetches on pages that did not move and smaller leaves the corpus stale.
+
+Two rules bound the estimator on either side of where it has evidence. The interval is never longer than twice the time we have actually watched the page, because two fetches an hour apart with nothing seen to change is not grounds for a six month nap, and the cap falls away on its own once the observation window is longer than the answer. The interval is never shorter than `min_interval` even when every visit found a change, because a page whose extracted text contains a timestamp changes on every fetch by construction.
+
+The estimate is a lower bound rather than a measurement when every observed interval ended in a change, because a page that changes every minute and a page that changes every hour look identical if we only look once an hour. In that case the ceiling only fires when the lower bound alone is enough, which means a page we cannot follow settles an hour or two apart rather than at the daily sample. Sampling faster to tell the two cases apart costs more than the answer is worth. `Last-Modified` is what actually solves it, because it reports the change time rather than the fact of a change.
+
+The arithmetic is fixed point rather than floating point. Doc 08.5 promises a crawl directory can be copied from an x86 machine to an arm one and resumed, `f64::ln` is not required to give the same bits on both, and two coordinators disagreeing about when a page is due is not a difference we are willing to have.
+
 The publisher supplied signals override the estimator when present, and they are always better than it:
 
 `Last-Modified` and `ETag` make revalidation nearly free, so a page with a working revalidator gets a shorter interval than its lambda alone would justify. The cost of being wrong is 500 bytes.

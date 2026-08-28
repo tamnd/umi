@@ -429,6 +429,7 @@ impl State for MemoryState {
                     row.state = UrlState::Fetched;
                     row.status = *status;
                     row.fetch_count = before.fetch_count.saturating_add(1);
+                    row.observed_secs = before.observed_secs_after(outcome.finished_ms);
                     row.last_fetch_ms = outcome.finished_ms;
                     row.content_hash = *content_hash;
                     row.fail_streak = 0;
@@ -451,6 +452,7 @@ impl State for MemoryState {
                     row.state = UrlState::Fetched;
                     row.status = *status;
                     row.fetch_count = before.fetch_count.saturating_add(1);
+                    row.observed_secs = before.observed_secs_after(outcome.finished_ms);
                     row.last_fetch_ms = outcome.finished_ms;
                     row.fail_streak = 0;
                     if let Some(etag) = &revalidate.etag {

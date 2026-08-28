@@ -483,6 +483,15 @@ pub struct LedgerRow {
     pub tier_used: Tier,
     /// Consecutive failures, which drives [`retry_after_ms`](crate::retry_after_ms).
     pub fail_streak: u8,
+    /// How long we have watched this URL for, in seconds, summed over the
+    /// intervals we actually served rather than measured from the first fetch.
+    ///
+    /// This is the denominator of the change rate estimator in
+    /// [`freshness`](crate::freshness) and it is the only field there that is
+    /// not already in doc 08.3. Seconds because four bytes of them is 136
+    /// years, and a sum because a URL that was idle for a month while the crawl
+    /// was stopped was not being watched during it.
+    pub observed_secs: u32,
 }
 
 impl LedgerRow {
@@ -501,6 +510,41 @@ impl LedgerRow {
             next_due_ms: due_ms,
             etag_ref: Self::NO_ETAG,
             ..Self::default()
+        }
+    }
+
+    /// The observation window this row will have once a fetch that finished at
+    /// `now_ms` is applied to it, in milliseconds.
+    ///
+    /// A failed fetch moves `last_fetch_ms` without adding anything here, so
+    /// after a run of failures the window is shorter than the wall clock gap
+    /// the content hash actually spans. That biases the estimate towards
+    /// fetching too often rather than too rarely, and the floor bounds how far
+    /// it can go.
+    #[must_use]
+    pub const fn observed_ms_after(&self, now_ms: u64) -> u64 {
+        // A first fetch has no previous look to measure from, and taking the
+        // difference against a `last_fetch_ms` of zero would charge this row
+        // with every second since 1970.
+        let served = if self.last_fetch_ms == 0 {
+            0
+        } else {
+            now_ms.saturating_sub(self.last_fetch_ms)
+        };
+        (self.observed_secs as u64)
+            .saturating_mul(1000)
+            .saturating_add(served)
+    }
+
+    /// The same window as a seconds counter to store back on the row.
+    #[must_use]
+    pub const fn observed_secs_after(&self, now_ms: u64) -> u32 {
+        let ms = self.observed_ms_after(now_ms);
+        let secs = ms / 1000;
+        if secs > u32::MAX as u64 {
+            u32::MAX
+        } else {
+            secs as u32
         }
     }
 

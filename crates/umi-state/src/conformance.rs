@@ -178,6 +178,7 @@ where
     run!(an_excluded_url_is_never_leased_again);
     run!(a_failed_url_comes_back_only_after_its_backoff);
     run!(a_revalidator_comes_back_on_the_next_lease);
+    run!(a_page_that_changed_comes_back_sooner_than_one_that_did_not);
     run!(a_higher_priority_url_is_leased_first);
     run!(lease_returns_work_in_the_order_the_trait_promises);
     run!(a_host_politeness_timer_holds_the_whole_host);
@@ -658,6 +659,71 @@ async fn a_revalidator_comes_back_on_the_next_lease(state: &dyn State) -> Outcom
         revalidate.etag.as_deref(),
         Some("\"abc\""),
         "the etag came back changed"
+    );
+    Ok(())
+}
+
+async fn a_page_that_changed_comes_back_sooner_than_one_that_did_not(state: &dyn State) -> Outcome {
+    // Doc 09.4's estimator, through the only window the trait gives onto it.
+    // Two urls on two hosts, fetched at the same two times, and the only
+    // difference between them is that one came back 304 and the other came back
+    // with different bytes. A backend that ignored the 304, or that ran its own
+    // refresh rule, would schedule them the same.
+    let urls = [host_url(1), host_url(2)];
+    admit_all(state, &urls).await?;
+    let leases = lease_one(state, T0).await?;
+    ensure_eq!(leases.len(), 2, "both urls should have been leased");
+    let first: Vec<_> = leases
+        .iter()
+        .map(|lease| fetched(lease, T0 + 500, "hello"))
+        .collect();
+    state
+        .complete(&first)
+        .await
+        .map_err(|e| format!("first complete failed: {e}"))?;
+
+    // A day on, which is the fixed interval a single fetch earns, both are due.
+    let day = T0 + DAY + 500;
+    let leases = lease_one(state, day).await?;
+    ensure_eq!(leases.len(), 2, "neither url came due after the first day");
+    let steady = leases
+        .iter()
+        .find(|lease| lease.url.contains("h1."))
+        .ok_or("the unchanged url was not leased")?;
+    let moving = leases
+        .iter()
+        .find(|lease| lease.url.contains("h2."))
+        .ok_or("the changed url was not leased")?;
+    state
+        .complete(&[
+            FetchOutcome {
+                lease: steady.id,
+                key: steady.key,
+                finished_ms: day + 500,
+                tier_used: Tier::Plain,
+                pace: Pace::default(),
+                result: FetchResult::NotModified {
+                    status: 304,
+                    revalidate: Revalidator::default(),
+                },
+            },
+            fetched(moving, day + 500, "goodbye"),
+        ])
+        .await
+        .map_err(|e| format!("second complete failed: {e}"))?;
+
+    // Six hours on, neither is due. Thirteen hours on, only the one that
+    // changed is: two intervals, one of which ended in a change, puts it at
+    // about eleven hours, while nothing seen to change gets the whole
+    // observation window over again.
+    let soon = lease_one(state, day + DAY / 4).await?;
+    ensure!(soon.is_empty(), "a url was refetched within six hours");
+
+    let later = lease_one(state, day + DAY / 2 + 3_600_000).await?;
+    ensure_eq!(later.len(), 1, "expected exactly the changed url");
+    ensure!(
+        later[0].url.contains("h2."),
+        "the url that came back 304 was refetched first"
     );
     Ok(())
 }

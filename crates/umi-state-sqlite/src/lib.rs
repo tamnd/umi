@@ -787,6 +787,7 @@ impl State for SqliteState {
                         row.state = UrlState::Fetched;
                         row.status = *status;
                         row.fetch_count = before.fetch_count.saturating_add(1);
+                        row.observed_secs = before.observed_secs_after(outcome.finished_ms);
                         row.last_fetch_ms = outcome.finished_ms;
                         row.content_hash = *content_hash;
                         row.fail_streak = 0;
@@ -809,6 +810,7 @@ impl State for SqliteState {
                         row.state = UrlState::Fetched;
                         row.status = *status;
                         row.fetch_count = before.fetch_count.saturating_add(1);
+                        row.observed_secs = before.observed_secs_after(outcome.finished_ms);
                         row.last_fetch_ms = outcome.finished_ms;
                         row.fail_streak = 0;
                         if let Some(etag) = &revalidate.etag {
@@ -873,6 +875,7 @@ impl State for SqliteState {
                         i64::from(row.status),
                         i64::from(row.tier_used.as_u8()),
                         i64::from(row.fail_streak),
+                        i64::from(row.observed_secs),
                         &outcome.key.pld.as_bytes()[..],
                         &outcome.key.host.as_bytes()[..],
                         &outcome.key.url.as_bytes()[..],
