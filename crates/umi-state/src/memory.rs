@@ -322,7 +322,7 @@ impl State for MemoryState {
             // lease is not issued, and that only holds if the timer is checked
             // here.
             let host = inner.host_or_default(key);
-            if !host.is_fetchable(req.now_ms) || !host.tier.reachable_by(req.max_tier) {
+            if !host.is_fetchable(req.now_ms) || !host.tier.reachable_by(req.max_tier, req.now_ms) {
                 continue;
             }
             ready.push(Ready {
@@ -426,7 +426,8 @@ impl State for MemoryState {
                 depth: row.depth,
                 priority: row.priority,
                 attempt: row.fetch_count,
-                tier: host.tier.start_at(req.max_tier),
+                tier: host.tier.start_at(req.max_tier, req.now_ms),
+                probe: host.tier.probing(req.now_ms),
                 not_before_ms,
                 expires_ms,
                 // A host that lies about its revalidators gets unconditional

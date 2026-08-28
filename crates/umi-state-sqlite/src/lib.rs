@@ -71,8 +71,8 @@ use rusqlite::{Connection, OptionalExtension, params};
 use umi_state::{
     AdmitReport, CLASSES, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult,
     HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, RefreshClass, Result,
-    Revalidator, SegmentQuery, SegmentRow, State, StateError, StateStats, UrlState, next_due_after,
-    retry_after_ms,
+    Revalidator, SegmentQuery, SegmentRow, State, StateError, StateStats, TierPolicy, UrlState,
+    next_due_after, retry_after_ms,
 };
 use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
 
@@ -474,6 +474,7 @@ struct Chosen {
     delay_ms: u64,
     next_allowed_ms: u64,
     tier: Tier,
+    probe: bool,
     lying_revalidator: bool,
 }
 
@@ -521,12 +522,17 @@ fn pull(
 
         let adaptive: i64 = r.get("adaptive_delay_ms").state()?;
         let crawl: Option<i64> = r.get("crawl_delay_ms").state()?;
-        let preferred =
-            Tier::from_u8(u8::try_from(r.get::<_, i64>("tier_preferred").state()?).unwrap_or(0))
-                .unwrap_or_default();
-        let ceiling =
-            Tier::from_u8(u8::try_from(r.get::<_, i64>("tier_max").state()?).unwrap_or(0))
-                .unwrap_or_default();
+        // The four columns doc 05.8's start tier is a function of, put back
+        // into the type that owns the function. The `WHERE` clause already
+        // decided this host is reachable, using the same rule spelled in SQL;
+        // this decides which rung of it the fetch runs on.
+        let policy = TierPolicy {
+            preferred: row::tier(r, "tier_preferred").state()?,
+            max: row::tier(r, "tier_max").state()?,
+            last_success: row::tier(r, "tier_last_success").state()?,
+            last_probe_down_ms: row::from_ms(r.get("tier_probe_down_ms").state()?),
+            ..TierPolicy::new()
+        };
 
         picks.rows.push(Chosen {
             key,
@@ -541,7 +547,8 @@ fn pull(
             last_mod_ms: row::from_ms(r.get("last_mod_ms").state()?),
             delay_ms: adaptive.max(crawl.unwrap_or(0)).max(0) as u64,
             next_allowed_ms: row::from_ms(r.get("next_allowed_ms").state()?),
-            tier: preferred.min(ceiling).min(req.max_tier),
+            tier: policy.start_at(req.max_tier, req.now_ms),
+            probe: policy.probing(req.now_ms),
             lying_revalidator: r.get::<_, i64>("lying_revalidator").state()? != 0,
         });
     }
@@ -754,6 +761,7 @@ impl State for SqliteState {
                         priority: row.priority,
                         attempt: row.attempt,
                         tier: row.tier,
+                        probe: row.probe,
                         not_before_ms,
                         expires_ms,
                         // A host that lies about its revalidators gets
@@ -782,6 +790,7 @@ impl State for SqliteState {
                         row::to_ms(*next_allowed_ms),
                         i64::from(HostRow::INITIAL_DELAY_MS),
                         i64::from(Tier::default().as_u8()),
+                        i64::from(TierPolicy::CEILING.as_u8()),
                     ])
                     .state()?;
                 }
@@ -1018,6 +1027,7 @@ impl State for SqliteState {
                         i64::from(host.consecutive_failures),
                         i64::from(host.fast_streak),
                         i64::from(Tier::default().as_u8()),
+                        i64::from(TierPolicy::CEILING.as_u8()),
                     ])
                     .state()?;
                 }

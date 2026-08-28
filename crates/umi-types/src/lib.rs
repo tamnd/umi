@@ -248,6 +248,35 @@ impl Tier {
     }
 }
 
+/// What one response said about the tier it was fetched at, from doc 05.8.
+///
+/// Three answers rather than a status code, because the status is not the
+/// signal. A 403 from an origin that does not want us is a dead url, a 403
+/// from a bot manager is a tier problem, and a 200 carrying a challenge page
+/// is a tier problem wearing the costume of a success. Only the last kind of
+/// 200 matters here, so a plain success and a plain failure both come out as
+/// [`TierSignal::Success`] or as nothing at all.
+///
+/// This lives here because `umi-fetch` decides which one a response is and
+/// `umi-state` decides what the host's ladder does about it, and the two do
+/// not depend on each other.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum TierSignal {
+    /// A real page came back at the tier we used. Resets the block count, and
+    /// confirms a cheaper tier if this fetch was probing one.
+    Success,
+    /// The origin, or something in front of it, refused us in a way a
+    /// different tier might get past. A vendor marker on a 403, 429 or 503, an
+    /// interstitial in the body of one, or a 200 whose body is an interstitial
+    /// and nothing else.
+    Blocked,
+    /// The page came back, and it was a client rendered shell rather than a
+    /// page. Distinct from [`TierSignal::Blocked`] because the answer is a
+    /// browser and not a better fingerprint, and browsers are the scarcest
+    /// thing in the fleet.
+    Shell,
+}
+
 impl fmt::Display for Tier {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {

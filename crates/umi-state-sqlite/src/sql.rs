@@ -84,7 +84,9 @@ SELECT ledger.pld                              AS pld,
        hosts.crawl_delay_ms                    AS crawl_delay_ms,
        COALESCE(hosts.next_allowed_ms, 0)      AS next_allowed_ms,
        COALESCE(hosts.tier_preferred, 1)       AS tier_preferred,
-       COALESCE(hosts.tier_max, 1)             AS tier_max,
+       COALESCE(hosts.tier_max, 2)             AS tier_max,
+       COALESCE(hosts.tier_last_success, 1)    AS tier_last_success,
+       COALESCE(hosts.tier_probe_down_ms, 0)   AS tier_probe_down_ms,
        COALESCE(hosts.lying_revalidator, 0)    AS lying_revalidator
   FROM ledger
   LEFT JOIN hosts ON hosts.host = ledger.host
@@ -105,6 +107,13 @@ SELECT ledger.pld                              AS pld,
 /// a host whose preferred tier sits above its own ceiling is served at the
 /// ceiling. It is `TierPolicy::reachable_by` written in SQL, which is the point.
 ///
+/// The `CASE` in front of it is doc 05.8's de-escalation probe. A host that has
+/// escalated away from a tier it used to answer on is offered that tier again
+/// once a week, and it has to happen here rather than in a sweep: a host whose
+/// preferred tier is above what any fetcher in the fleet can run drops out of
+/// this query entirely, and a host that is not in the query is a host nothing
+/// will ever probe. Written as a condition, the probe brings it back by itself.
+///
 /// The class clause is first because it is the leading column of `ledger_ready`
 /// and doc 09.5's budget is enforced by asking for one class at a time. See
 /// [`crate::schema`] version 6 for why the class is a column at all.
@@ -117,7 +126,12 @@ macro_rules! lease_conditions {
    AND COALESCE(hosts.blocked, 0) = 0
    AND COALESCE(hosts.refusing, 0) = 0
    AND COALESCE(hosts.next_allowed_ms, 0) <= ?1
-   AND MIN(COALESCE(hosts.tier_preferred, 1), COALESCE(hosts.tier_max, 1)) <= ?2"
+   AND MIN(CASE WHEN COALESCE(hosts.tier_preferred, 1)
+                     > COALESCE(hosts.tier_last_success, 1)
+                 AND COALESCE(hosts.tier_probe_down_ms, 0) + 604800000 <= ?1
+                THEN COALESCE(hosts.tier_last_success, 1)
+                ELSE COALESCE(hosts.tier_preferred, 1)
+           END, COALESCE(hosts.tier_max, 2)) <= ?2"
     };
 }
 
@@ -193,7 +207,7 @@ INSERT INTO hosts (
     tier_preferred, tier_max, tier_last_success, tier_blocks,
     tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
     sitemaps, fetches, failures, consecutive_failures, blocked, refusing
-) VALUES (?1, ?2, ?4, ?3, ?5, ?5, ?5, 0, 0, 0, 0, 0, '', 0, 0, 0, 0, 0)
+) VALUES (?1, ?2, ?4, ?3, ?5, ?6, ?5, 0, 0, 0, 0, 0, '', 0, 0, 0, 0, 0)
 ON CONFLICT(host) DO UPDATE SET next_allowed_ms = ?3";
 
 /// The eight columns doc 07.6's rate limiter reads, and no more.
@@ -228,7 +242,7 @@ INSERT INTO hosts (
     tier_probe_down_ms, render_required, weak_revalidator, lying_revalidator,
     sitemaps, fetches, failures, consecutive_failures, fast_streak,
     blocked, refusing
-) VALUES (?1, ?2, ?3, ?4, ?9, ?9, ?9, 0, 0, 0, 0, 0, '', ?5, ?6, ?7, ?8, 0, 0)
+) VALUES (?1, ?2, ?3, ?4, ?9, ?10, ?9, 0, 0, 0, 0, 0, '', ?5, ?6, ?7, ?8, 0, 0)
 ON CONFLICT(host) DO UPDATE SET
     adaptive_delay_ms    = ?3,
     next_allowed_ms      = ?4,
