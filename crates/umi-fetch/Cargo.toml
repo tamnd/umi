@@ -26,6 +26,25 @@ url = { workspace = true }
 wreq = { workspace = true, optional = true }
 wreq-util = { workspace = true, optional = true }
 
+# Gate 2.2's other half, and Linux only for a reason that is worth writing
+# down. The default tree already links aws-lc-sys, which rustls uses and which
+# is a BoringSSL fork, and it renames its own BoringSSL symbols so that nothing
+# else can collide with them. `btls` does the same rename only when asked, so
+# we ask.
+#
+# We can only ask on Linux. The build script does the rename with `objcopy`,
+# skips it on macOS and Windows, and applies the matching `link_name` overrides
+# to the generated bindings regardless, so a macOS build with the feature on
+# fails at link time looking for symbols nothing renamed. That is a bug in the
+# crate rather than a decision, and a target section is the way to route around
+# it without giving up the protection on the platform the fleet runs.
+[target.'cfg(target_os = "linux")'.dependencies]
+wreq = { workspace = true, optional = true, features = ["prefix-symbols"] }
+
+[dev-dependencies]
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+
 [features]
 # Doc 05.5's T2. Off by default, and it has to stay off by default: wreq links
 # BoringSSL, which shares symbol prefixes with openssl-sys, and a tree holding
