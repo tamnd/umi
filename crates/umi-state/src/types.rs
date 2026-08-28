@@ -268,11 +268,29 @@ pub struct Lease {
     /// politeness timer. Usually now, but a batch covering one host carries
     /// staggered times.
     pub not_before_ms: u64,
+    /// The gap this host wants between requests, from doc 07.6.
+    ///
+    /// The batch is already staggered by it, so a fetcher working through one
+    /// does not need this. What needs it is anything that sends a second
+    /// request off its own bat, such as doc 05.3's audit of a 304, because
+    /// the politeness rule is per host and does not care whose idea the
+    /// request was.
+    pub delay_ms: u32,
     /// When the coordinator stops waiting.
     pub expires_ms: u64,
     /// What to put in `If-None-Match` and `If-Modified-Since`, when we have
     /// fetched this URL before and the host is not a known liar about it.
     pub revalidate: Option<Revalidator>,
+    /// The content hash of the last body we kept for this URL, if there is
+    /// one.
+    ///
+    /// Doc 05.3's first trap is an origin that ignores the validator and
+    /// sends a full body containing the content we already had, and the only
+    /// way to notice is to have the old hash in hand when the new one arrives.
+    /// It rides on the lease because the ledger row is already being read to
+    /// make one, and the alternative is a lookup per fetch to answer a
+    /// question that is almost always no.
+    pub content_hash: Option<[u8; 8]>,
 }
 
 /// What happened to one leased URL.
@@ -698,9 +716,15 @@ pub struct TierPolicy {
     pub last_probe_down_ms: u64,
     /// T1 returned a shell and T3 did not.
     pub render_required: bool,
-    /// The origin sends a `Last-Modified` that moves without the content
-    /// moving, so it is not worth conditioning on.
-    pub weak_revalidator: bool,
+    /// How many times this host has ignored a validator we sent and answered
+    /// with a full body that turned out to be the content we already had.
+    ///
+    /// A count rather than a flag because doc 05.3 wants three observations
+    /// before it believes it. One is a page that genuinely changed back, or a
+    /// stale ETag of ours, or a cache node that had not caught up, and
+    /// condemning a whole host on one url is how a crawler stops sending
+    /// conditional requests to a site that was only having a bad minute.
+    pub weak_hits: u16,
     /// The origin sends a revalidator and then ignores it, so conditional
     /// requests cost a round trip and save nothing.
     pub lying_revalidator: bool,
@@ -725,6 +749,10 @@ impl TierPolicy {
     /// The gap once the ladder above has run out, which is a daily probe.
     pub const BACKOFF_FLOOR_MS: u64 = 24 * 60 * 60 * 1000;
 
+    /// Observations of an ignored validator before T0 is dropped for a host.
+    /// Doc 05.3 says three.
+    pub const WEAK_HITS_TO_DROP: u16 = 3;
+
     /// Consecutive blocks that mean the host is refusing us outright.
     ///
     /// Doc 05.8 says 30 consecutive days at the ceiling. The first five blocks
@@ -744,9 +772,57 @@ impl TierPolicy {
             consecutive_blocks: 0,
             last_probe_down_ms: 0,
             render_required: false,
-            weak_revalidator: false,
+            weak_hits: 0,
             lying_revalidator: false,
         }
+    }
+
+    /// Whether a conditional request to this host is worth the round trip.
+    ///
+    /// False for the two origins doc 05.3 calls traps: one that ignores the
+    /// validator and sends the body anyway, so the request saves nothing, and
+    /// one that answers 304 when the content has in fact changed, so the
+    /// request costs us the page. Both are learned rather than configured, and
+    /// the store reads this when it builds a lease, so a fetcher never has to
+    /// know about either.
+    #[must_use]
+    pub const fn conditional(&self) -> bool {
+        !self.weak_revalidator() && !self.lying_revalidator
+    }
+
+    /// Whether the host has ignored our validators often enough to believe it.
+    #[must_use]
+    pub const fn weak_revalidator(&self) -> bool {
+        self.weak_hits >= Self::WEAK_HITS_TO_DROP
+    }
+
+    /// Record that a conditional request came back as a full body carrying
+    /// content we already had, and say whether anything moved.
+    ///
+    /// Saturating rather than wrapping, and it stops counting once the flag is
+    /// set, so a host that has been dropped from T0 does not spend the rest of
+    /// its life incrementing a counter nothing reads.
+    pub const fn saw_full_body(&mut self) -> bool {
+        if self.weak_revalidator() {
+            return false;
+        }
+        self.weak_hits += 1;
+        true
+    }
+
+    /// Record that a 304 from this host was contradicted by an unconditional
+    /// fetch, and say whether anything moved.
+    ///
+    /// One observation is enough, where a weak revalidator needs three. A host
+    /// that says nothing changed when something did is not a host that saves
+    /// us anything, it is a host that hides pages from the corpus, and the
+    /// wrong way to be wrong about it is to keep believing it.
+    pub const fn saw_lie(&mut self) -> bool {
+        if self.lying_revalidator {
+            return false;
+        }
+        self.lying_revalidator = true;
+        true
     }
 
     /// Whether the next fetch of this host is a probe at the cheaper tier.

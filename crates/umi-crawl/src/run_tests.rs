@@ -26,6 +26,14 @@ use crate::scope::Scope;
 
 const T0: u64 = 1_760_000_000_000;
 
+/// Long enough that a url is due again whatever doc 09 made of its history.
+///
+/// The refresh interval grows as a page is seen not to change, and a test
+/// about revalidation is a test about a page that does not change, so stepping
+/// the clock by the initial interval works twice and then quietly stops
+/// leasing anything. This is [`umi_state::MAX_REFRESH`] plus a day.
+const PAST_MAX_REFRESH: u64 = 181 * 24 * 60 * 60 * 1000;
+
 /// A fetcher that answers from a map and remembers what it was asked.
 #[derive(Default)]
 struct Canned {
@@ -170,6 +178,78 @@ impl Fetch for Flip {
     }
 }
 
+/// An origin with an opinion about conditional requests.
+///
+/// Doc 05.3 is three behaviours that look identical from the fetcher's side
+/// and differ only in what a second request would have returned, so a map of
+/// canned answers cannot express any of them. This serves one url according to
+/// [`Mode`] and records whether each request for it carried a validator, which
+/// is the other half of what the tests need to see.
+struct Cache {
+    inner: Canned,
+    url: String,
+    mode: Mode,
+    body: String,
+    conditional: Mutex<Vec<bool>>,
+}
+
+/// How an origin answers a request that carries a validator.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// 304, which is the whole point of T0.
+    Honest,
+    /// The full body again, unchanged. Doc 05.3's first trap.
+    Weak,
+    /// 304, while an unconditional request gets a body that has moved on.
+    /// Doc 05.3's second trap.
+    Lying,
+}
+
+impl Cache {
+    fn new(url: &str, mode: Mode, body: &str, inner: Canned) -> Self {
+        Self {
+            inner,
+            url: url.to_owned(),
+            mode,
+            body: body.to_owned(),
+            conditional: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Whether each request for the watched url carried a validator, in order.
+    fn conditional(&self) -> Vec<bool> {
+        self.conditional.lock().expect("not poisoned").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Fetch for Cache {
+    async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+    ) -> Result<Outcome, FetchError> {
+        if url != self.url {
+            return self.inner.fetch(url, revalidate).await;
+        }
+        let sent = revalidate.is_some_and(|r| !r.is_empty());
+        let first = {
+            let mut log = self.conditional.lock().expect("not poisoned");
+            let first = log.is_empty();
+            log.push(sent);
+            first
+        };
+        Ok(match (self.mode, sent) {
+            (Mode::Honest | Mode::Lying, true) => not_modified(),
+            // A lying origin has to serve the real page once before it can lie
+            // about it, because the lie is a claim that the page has not
+            // changed since the copy we hold.
+            (Mode::Lying, false) if !first => tagged(url, &page("Moved on", &[])),
+            _ => tagged(url, &self.body),
+        })
+    }
+}
+
 /// What doc 05.8 calls a block signal, as the fetcher reports one.
 fn blocked() -> Outcome {
     Outcome::Failed {
@@ -204,6 +284,32 @@ fn ok_page(url: &str, body: &str) -> Outcome {
         revalidate: Revalidator::default(),
         elapsed: Duration::from_millis(40),
     }))
+}
+
+/// A 200 carrying an `ETag`, which is what a page has to send before there is
+/// anything for T0 to revalidate against.
+fn tagged(url: &str, body: &str) -> Outcome {
+    let Outcome::Ok(mut page) = ok_page(url, body) else {
+        unreachable!("ok_page returns Ok")
+    };
+    page.revalidate = Revalidator {
+        etag: Some("\"v1\"".to_owned()),
+        last_modified_ms: Some(T0),
+    };
+    Outcome::Ok(page)
+}
+
+/// A 304, as an origin that honours a validator answers one.
+fn not_modified() -> Outcome {
+    Outcome::NotModified {
+        revalidate: Revalidator {
+            etag: Some("\"v1\"".to_owned()),
+            last_modified_ms: Some(T0),
+        },
+        headers_kept: vec![("cache-control".to_owned(), "max-age=60".to_owned())],
+        headers_digest: [7u8; 32],
+        elapsed: Duration::from_millis(9),
+    }
 }
 
 /// Rows in a vector, which is what a test wants and what `umi crawl --dry-run`
@@ -251,6 +357,10 @@ fn config() -> CrawlConfig {
         budget: Budget::DEFAULT,
         rate: umi_frontier::Rate::default(),
         max_domains: 64,
+        // Off by default in tests. The audit fires a second request and a
+        // canned fetcher has no way to tell the two apart, so the tests that
+        // want it turn it on themselves.
+        audit_every: 0,
     }
 }
 
@@ -1246,4 +1356,257 @@ async fn a_learned_tier_outlives_the_process() {
     assert_eq!(leases.len(), 1);
     assert_eq!(leases[0].tier, Tier::Emulated);
     assert!(!leases[0].probe, "a fresh escalation is not a probe");
+}
+
+#[tokio::test]
+async fn a_304_moves_the_schedule_and_writes_no_row() {
+    // Doc 05.3 is explicit that a 304 writes no row. At steady state most of
+    // what the crawler does is revalidate, so a 304 that produced a row would
+    // eventually make the published corpus mostly empty rows, and every one of
+    // them would be a second copy of a url that already has a real one.
+    let url = "https://example.com/a";
+    let state = seeded(&[url]).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Cache::new(
+        url,
+        Mode::Honest,
+        &page("A", &[]),
+        Canned::new().robots("https://example.com", "User-agent: *\nAllow: /\n"),
+    ));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        Arc::clone(&state),
+        Arc::clone(&clock),
+        config(),
+    );
+    let sink = Collected::default();
+
+    let first = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(first.fetched, 1);
+    assert_eq!(first.rows, 1);
+
+    // Past doc 09's initial refresh interval, which is what puts the url back
+    // in front of the scheduler at all.
+    clock.advance(PAST_MAX_REFRESH);
+    let second = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(second.leased, 1);
+    assert_eq!(second.not_modified, 1, "the second fetch was not a 304");
+    assert_eq!(second.rows, 0, "a 304 wrote a page row");
+    assert_eq!(second.fetched, 0);
+    assert_eq!(second.failed, 0);
+    assert_eq!(sink.rows().len(), 1, "the sink was given a row for a 304");
+
+    // The validator came off the ledger and went back out, which is the round
+    // trip the tier is worth nothing without.
+    assert_eq!(fetch.conditional(), vec![false, true]);
+
+    // And the schedule moved, so the 304 was a fetch as far as the frontier is
+    // concerned even though it left nothing behind. Without this the url comes
+    // straight back and the crawler revalidates it in a loop.
+    let stats = state.stats().await.expect("stats");
+    assert_eq!(stats.urls_fetched, 1);
+    assert_eq!(stats.urls_pending, 0);
+    let req = umi_state::LeaseRequest::new(FetcherId::LOCAL, clock.now_ms() + 60_000, 4);
+    assert!(
+        state.lease(&req).await.expect("lease").is_empty(),
+        "a 304 left the url due again"
+    );
+}
+
+#[tokio::test]
+async fn three_full_bodies_for_a_conditional_request_drop_t0() {
+    // Doc 05.3's first trap. The origin is not lying, it just ignores the
+    // validator, and the cost of that is a full body every refresh for a page
+    // that never changes. Three of them is the point where the crawler stops
+    // paying the extra request headers for nothing.
+    let url = "https://example.com/a";
+    let state = seeded(&[url]).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Cache::new(
+        url,
+        Mode::Weak,
+        &page("A", &[]),
+        Canned::new().robots("https://example.com", "User-agent: *\nAllow: /\n"),
+    ));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        Arc::clone(&state),
+        Arc::clone(&clock),
+        config(),
+    );
+    let sink = Collected::default();
+    let host = umi_types::RowKey::for_url(url, None)
+        .expect("a crawlable url")
+        .host;
+
+    // The first fetch has nothing to revalidate against, so it teaches
+    // nothing. The three after it are the three doc 05.3 counts.
+    for round in 0..4 {
+        crawler.tick(&sink).await.expect("tick");
+        clock.advance(PAST_MAX_REFRESH);
+
+        let policy = state
+            .host(host)
+            .await
+            .expect("host")
+            .expect("a record")
+            .tier;
+        assert_eq!(policy.weak_hits, round, "a fetch was counted twice");
+    }
+
+    let policy = state
+        .host(host)
+        .await
+        .expect("host")
+        .expect("a record")
+        .tier;
+    assert_eq!(policy.weak_hits, umi_state::TierPolicy::WEAK_HITS_TO_DROP);
+    assert!(policy.weak_revalidator());
+    assert!(!policy.conditional(), "T0 survived three full bodies");
+
+    // Every request so far carried a validator except the first, and the next
+    // one does not, which is the whole saving.
+    assert_eq!(fetch.conditional(), vec![false, true, true, true]);
+    crawler.tick(&sink).await.expect("tick");
+    assert_eq!(fetch.conditional().len(), 5);
+    assert!(!fetch.conditional()[4], "T0 was dropped and sent anyway");
+
+    // The count stops at the threshold rather than climbing forever, so a
+    // host that is never revalidated again is not written on every fetch.
+    let policy = state
+        .host(host)
+        .await
+        .expect("host")
+        .expect("a record")
+        .tier;
+    assert_eq!(policy.weak_hits, umi_state::TierPolicy::WEAK_HITS_TO_DROP);
+}
+
+#[tokio::test]
+async fn a_304_contradicted_by_the_body_disables_t0_for_the_host() {
+    // Doc 05.3's second trap, and the one that loses pages rather than money.
+    // An origin behind a misconfigured cache answers 304 forever and the
+    // crawler believes it, so the page is frozen at whatever it said the day
+    // the cache broke. Nothing in the 304 gives this away, which is why the
+    // audit fetches the page again without the validator.
+    let url = "https://example.com/a";
+    let state = seeded(&[url]).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Cache::new(
+        url,
+        Mode::Lying,
+        &page("A", &[]),
+        Canned::new().robots("https://example.com", "User-agent: *\nAllow: /\n"),
+    ));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        Arc::clone(&state),
+        Arc::clone(&clock),
+        CrawlConfig {
+            // Every 304, rather than doc 05.3's one in a hundred. A test that
+            // wanted the sampling to fire on its own would have to crawl a
+            // hundred pages to see one audit.
+            audit_every: 1,
+            ..config()
+        },
+    );
+    let sink = Collected::default();
+    let host = umi_types::RowKey::for_url(url, None)
+        .expect("a crawlable url")
+        .host;
+
+    crawler.tick(&sink).await.expect("tick");
+    clock.advance(PAST_MAX_REFRESH);
+
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.learned, 1);
+    // The audit found a body, so the page is a fetch and not a 304. Keeping
+    // the 304 would mean throwing away a body we already paid for and that we
+    // now know is the current one.
+    assert_eq!(report.fetched, 1);
+    assert_eq!(report.not_modified, 0);
+    assert_eq!(report.rows, 1);
+
+    let policy = state
+        .host(host)
+        .await
+        .expect("host")
+        .expect("a record")
+        .tier;
+    assert!(policy.lying_revalidator, "the lie was not recorded");
+    assert!(!policy.conditional(), "T0 survived a caught lie");
+
+    // Three requests: the first fetch, the 304, and the audit that caught it.
+    assert_eq!(fetch.conditional(), vec![false, true, false]);
+
+    // And from here the host is never asked conditionally again, so it cannot
+    // answer 304 again and the page cannot freeze.
+    clock.advance(PAST_MAX_REFRESH);
+    crawler.tick(&sink).await.expect("tick");
+    assert_eq!(fetch.conditional(), vec![false, true, false, false]);
+
+    let rows = sink.rows();
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows[1].text_digest != rows[0].text_digest,
+        "the audit stored the body the 304 was hiding"
+    );
+}
+
+#[tokio::test]
+async fn a_validator_outlives_the_process() {
+    // The saving T0 exists for is only real if the etag is still there after a
+    // restart. A crawler that revalidates only within one process run pays for
+    // a full body on every url the first time it sees it again, which on a
+    // daemon that is restarted for a deploy is most of them.
+    let dir = tempfile::TempDir::new().expect("a temp directory");
+    let path = dir.path().join("state.umistate");
+    let url = "https://example.com/a";
+    let body = page("A", &[]);
+
+    {
+        let state: Arc<dyn State> =
+            Arc::new(umi_state_sqlite::SqliteState::open(&path).expect("a new store"));
+        let mut seed = Candidate::new(url, T0).expect("a crawlable url");
+        seed.discovery = umi_state::Discovery::Seed;
+        state.admit(&[seed]).await.expect("admit");
+
+        let fetch = Arc::new(Cache::new(
+            url,
+            Mode::Honest,
+            &body,
+            Canned::new().robots("https://example.com", "User-agent: *\nAllow: /\n"),
+        ));
+        let crawler = Crawler::new(
+            fetch,
+            Arc::clone(&state),
+            Arc::new(FixedClock::at(T0)),
+            config(),
+        );
+        assert_eq!(
+            crawler
+                .tick(&Collected::default())
+                .await
+                .expect("tick")
+                .fetched,
+            1
+        );
+    }
+
+    let state: Arc<dyn State> =
+        Arc::new(umi_state_sqlite::SqliteState::open(&path).expect("the same store again"));
+    let later = T0 + PAST_MAX_REFRESH;
+    let clock = Arc::new(FixedClock::at(later));
+    let fetch = Arc::new(Cache::new(
+        url,
+        Mode::Honest,
+        &body,
+        Canned::new().robots("https://example.com", "User-agent: *\nAllow: /\n"),
+    ));
+    let crawler = Crawler::new(Arc::clone(&fetch), Arc::clone(&state), clock, config());
+
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.not_modified, 1, "the etag did not survive the store");
+    assert_eq!(report.rows, 0);
+    assert_eq!(fetch.conditional(), vec![true]);
 }

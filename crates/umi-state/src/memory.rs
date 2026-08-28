@@ -429,12 +429,14 @@ impl State for MemoryState {
                 tier: host.tier.start_at(req.max_tier, req.now_ms),
                 probe: host.tier.probing(req.now_ms),
                 not_before_ms,
+                delay_ms: u32::try_from(delay).unwrap_or(u32::MAX),
                 expires_ms,
-                // A host that lies about its revalidators gets unconditional
-                // requests, per doc 05.8. Sending one it will ignore costs a
-                // round trip and saves nothing.
-                revalidate: (!revalidate.is_empty() && !host.tier.lying_revalidator)
+                // A host that lies about its revalidators, or ignores them,
+                // gets unconditional requests, per doc 05.3. Sending one it
+                // will not honour costs a round trip and saves nothing.
+                revalidate: (!revalidate.is_empty() && host.tier.conditional())
                     .then_some(revalidate),
+                content_hash: (row.content_hash != [0u8; 8]).then_some(row.content_hash),
             });
         }
 

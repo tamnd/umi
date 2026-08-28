@@ -504,6 +504,9 @@ fn config(in_flight: usize, hosts: usize) -> CrawlConfig {
         // 512 over 64 domains and measure the domain cap rather than the
         // window, which is the same trap the batch size above avoids.
         max_domains: hosts,
+        // The canned fetcher never answers 304, so this changes nothing, but
+        // the benchmark is a measurement of the loop and not of the sampler.
+        audit_every: 0,
     }
 }
 
