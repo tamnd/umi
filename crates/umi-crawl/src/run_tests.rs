@@ -24,7 +24,7 @@ use crate::page::PageRow;
 use crate::run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
 use crate::scope::Scope;
 
-const T0: u64 = 1_760_000_000_000;
+pub(crate) const T0: u64 = 1_760_000_000_000;
 
 /// Long enough that a url is due again whatever doc 09 made of its history.
 ///
@@ -36,40 +36,40 @@ const PAST_MAX_REFRESH: u64 = 181 * 24 * 60 * 60 * 1000;
 
 /// A fetcher that answers from a map and remembers what it was asked.
 #[derive(Default)]
-struct Canned {
+pub(crate) struct Canned {
     pages: HashMap<String, Outcome>,
     asked: Mutex<Vec<String>>,
 }
 
 impl Canned {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
     /// Serve `body` at `url` with a 200.
-    fn html(mut self, url: &str, body: &str) -> Self {
+    pub(crate) fn html(mut self, url: &str, body: &str) -> Self {
         self.pages.insert(url.to_owned(), ok_page(url, body));
         self
     }
 
     /// Serve a robots.txt at an origin.
-    fn robots(mut self, origin: &str, body: &str) -> Self {
+    pub(crate) fn robots(mut self, origin: &str, body: &str) -> Self {
         let url = format!("{origin}/robots.txt");
         self.pages.insert(url.clone(), ok_page(&url, body));
         self
     }
 
     /// Serve a specific outcome at a URL.
-    fn outcome(mut self, url: &str, outcome: Outcome) -> Self {
+    pub(crate) fn outcome(mut self, url: &str, outcome: Outcome) -> Self {
         self.pages.insert(url.to_owned(), outcome);
         self
     }
 
-    fn asked(&self) -> Vec<String> {
+    pub(crate) fn asked(&self) -> Vec<String> {
         self.asked.lock().expect("not poisoned").clone()
     }
 
-    fn asked_for(&self, url: &str) -> bool {
+    pub(crate) fn asked_for(&self, url: &str) -> bool {
         self.asked().iter().any(|seen| seen == url)
     }
 }
@@ -272,7 +272,7 @@ fn interstitial() -> String {
         .to_owned()
 }
 
-fn ok_page(url: &str, body: &str) -> Outcome {
+pub(crate) fn ok_page(url: &str, body: &str) -> Outcome {
     let bytes = Bytes::from(body.as_bytes().to_vec());
     Outcome::Ok(Box::new(Page {
         final_url: url.to_owned(),
@@ -394,7 +394,10 @@ async fn seeded(urls: &[&str]) -> Arc<dyn State> {
     state
 }
 
-fn crawler(fetch: Canned, state: Arc<dyn State>) -> Crawler<Arc<Canned>, Arc<FixedClock>> {
+pub(crate) fn crawler(
+    fetch: Canned,
+    state: Arc<dyn State>,
+) -> Crawler<Arc<Canned>, Arc<FixedClock>> {
     with_scope(fetch, state, Scope::general())
 }
 

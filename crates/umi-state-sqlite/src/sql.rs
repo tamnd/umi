@@ -288,6 +288,47 @@ UPDATE ledger SET
     lease_expires  = NULL
  WHERE pld = ?16 AND host = ?17 AND url_key = ?18";
 
+/// Doc 09.4's publisher signal: a sitemap says this page moved after we last
+/// looked at it, so it is due now.
+///
+/// Everything about this is a `WHERE` clause, because every condition is a case
+/// where the answer is to do nothing. `?5` is the publisher's date and it has to
+/// be later than our last fetch, or a sitemap that lists the whole site would
+/// refetch the whole site on every poll. `?4` is now and it has to be earlier
+/// than the due time already on the row, since this can bring a visit forward
+/// and never push one back. `lease_id IS NULL` because a url somebody is
+/// fetching this second does not need rescheduling. The state test is the
+/// scheduler's own, so a gone or excluded row is left alone, and a pending row
+/// falls out on the due time anyway because it has never been fetched.
+///
+/// `refresh_class` moves with `next_due_ms` and has to, because doc 09.5's
+/// index is on the class and a row filed under the wrong one is a row the
+/// budget for its real class never offers. The boundaries come in as `?6` to
+/// `?9` rather than being written into the statement so that
+/// [`RefreshClass::of`](umi_state::RefreshClass::of) stays the only place they
+/// are decided. The first arm is that function's own first line: a row nobody
+/// has fetched is discovery whatever its interval works out to.
+pub const REFRESH_LEDGER: &str = concat!(
+    "
+UPDATE ledger SET
+    next_due_ms   = ?4,
+    refresh_class = CASE
+        WHEN fetch_count = 0 THEN 5
+        WHEN ?4 - last_fetch_ms <  ?6 THEN 0
+        WHEN ?4 - last_fetch_ms <  ?7 THEN 1
+        WHEN ?4 - last_fetch_ms <  ?8 THEN 2
+        WHEN ?4 - last_fetch_ms <  ?9 THEN 3
+        ELSE 4
+    END
+ WHERE pld = ?1 AND host = ?2 AND url_key = ?3
+   AND ",
+    schedulable!(),
+    "
+   AND lease_id IS NULL
+   AND last_fetch_ms < ?5
+   AND next_due_ms > ?4"
+);
+
 /// Give a url back without recording anything about it.
 ///
 /// `next_due_ms` and `fail_streak` are deliberately untouched. A fetcher going

@@ -34,6 +34,7 @@ pub mod robots;
 pub mod run;
 pub mod scope;
 pub mod sink;
+pub mod sitemap;
 
 #[cfg(test)]
 mod run_tests;
@@ -41,6 +42,8 @@ mod run_tests;
 mod scope_tests;
 #[cfg(test)]
 mod sink_tests;
+#[cfg(test)]
+mod sitemap_tests;
 #[cfg(test)]
 mod tests;
 
@@ -54,3 +57,4 @@ pub use scope::{
     Budget, ContentFilter, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,
 };
 pub use sink::{Sealed, SegmentInfo, SegmentSink};
+pub use sitemap::{SitemapLimits, SitemapReport};

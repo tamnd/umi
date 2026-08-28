@@ -54,6 +54,7 @@ use umi_types::{CanonError, RowKey, UrlKey, canonicalize};
 
 pub mod date;
 pub mod feed;
+mod gzip;
 mod lines;
 mod run;
 pub mod sitemap;

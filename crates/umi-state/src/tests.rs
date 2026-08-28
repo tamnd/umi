@@ -64,6 +64,58 @@ fn a_first_fetch_is_looked_at_again_the_next_day() {
 }
 
 #[test]
+fn a_first_fetch_with_a_date_on_it_uses_the_date_instead() {
+    // Doc 09.4's publisher signal on the one fetch the estimator has nothing
+    // to say about. A page whose `Last-Modified` was a day ago has given us
+    // one interval, a day, so the rate is one change a day and the interval
+    // that expects half a change is half a day.
+    let row = LedgerRow::default();
+    let lastmod = T0 - DAY;
+    assert_eq!(next_due_dated(&row, false, T0, Some(lastmod)), T0 + DAY / 2);
+    // A page that has not moved in a year is not looked at in half a year,
+    // because the ceiling is 180 days.
+    let stale = T0 - 365 * DAY;
+    assert_eq!(
+        refresh_interval_dated(&row, false, T0, Some(stale)),
+        MAX_REFRESH.as_millis() as u64
+    );
+    // And one that moved a second ago does not get a five second interval,
+    // because the floor is five minutes.
+    let just_now = T0 - 1000;
+    assert_eq!(
+        refresh_interval_dated(&row, false, T0, Some(just_now)),
+        MIN_REFRESH.as_millis() as u64
+    );
+    // A date in the future is a site with a broken clock or a hopeful CMS.
+    // Treated as now, which lands on the floor rather than on an interval of
+    // zero or one that wrapped.
+    assert_eq!(
+        refresh_interval_dated(&row, false, T0, Some(T0 + DAY)),
+        MIN_REFRESH.as_millis() as u64
+    );
+    // No date is the old answer, unchanged.
+    assert_eq!(refresh_interval_dated(&row, false, T0, None), DAY);
+    assert_eq!(
+        initial_refresh_ms(None, T0),
+        INITIAL_REFRESH.as_millis() as u64
+    );
+}
+
+#[test]
+fn a_date_only_counts_on_the_fetch_that_has_no_history() {
+    // Once the estimator has observations of its own it is measuring what the
+    // page does rather than what the page says, and a `Last-Modified` header
+    // is already in the row as evidence the origin revalidates. Feeding it in
+    // twice would halve intervals on the strength of one header.
+    let row = watched(4, 2, 4 * DAY);
+    let now = T0 + 4 * DAY;
+    assert_eq!(
+        refresh_interval_dated(&row, false, now, Some(now - 60_000)),
+        refresh_interval_ms(&row, false, now)
+    );
+}
+
+#[test]
 fn a_page_that_keeps_changing_converges_downward() {
     // Fetch it, find it changed every time, and the interval walks down rather
     // than hunting around. It does not reach the floor: a page that changes on
@@ -259,10 +311,11 @@ fn an_admit_report_accounts_for_the_whole_batch() {
         held: 3,
         excluded: 2,
         shard_misses: 40,
+        refreshed: 7,
     };
-    // shard_misses counts domains, not urls, so it is deliberately not part of
-    // the sum. Folding it in would make the one number an operator watches
-    // change the arithmetic they check it with.
+    // shard_misses counts domains, not urls, and refreshed counts a subset of
+    // seen, so neither is part of the sum. Folding either in would make the one
+    // number an operator watches change the arithmetic they check it with.
     assert_eq!(report.total(), 100);
 }
 

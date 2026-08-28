@@ -184,6 +184,8 @@ pub struct Options {
     pub seed: Option<String>,
     /// Any program that prints URLs, repeatable.
     pub seeder: Vec<String>,
+    /// Follow the seed origins' sitemaps before the first tick, doc 13.6.
+    pub sitemaps: bool,
     /// Where the directory goes. Defaults to `./<scope name>`.
     pub out: Option<String>,
     /// Doc 12's pipeline, or nothing when `--publish` was not given.
@@ -915,9 +917,30 @@ fn run(
 
         let seeded = seed(&*state, &scope, options, started_ms, settings.delay_ms).await?;
         log.line(&format!(
-            "seeded {seeded} urls into {}",
+            "seeded {} urls into {}",
+            seeded.urls,
             layout.state.display()
         ))?;
+
+        // Doc 13.6, and the difference between starting a site at its front
+        // page and starting it with everything the site says it has. Before
+        // `resume`, so that the domains these URLs are on are scheduled with
+        // the rest rather than waiting for the loop to notice them.
+        if options.sitemaps {
+            for origin in &seeded.origins {
+                let found = crawler
+                    .seed_from_sitemaps(origin, umi_crawl::SitemapLimits::seeding())
+                    .await
+                    .map_err(|e| Error::Crawl(e.to_string()))?;
+                if found.files == 0 {
+                    continue;
+                }
+                log.line(&format!(
+                    "{origin} sitemaps: {} files, {} urls, {} admitted",
+                    found.files, found.urls, found.admitted
+                ))?;
+            }
+        }
 
         // Doc 09.8. The seeds went straight into the store, and the domain rate
         // limits are in memory, so this is where a fresh crawl and a resumed
@@ -1309,7 +1332,7 @@ async fn seed(
     options: &Options,
     now_ms: u64,
     delay_ms: u32,
-) -> Result<u64, Error> {
+) -> Result<Seeded, Error> {
     let mut urls: Vec<String> = Vec::new();
     if let Some(url) = seed_url(&options.target) {
         urls.push(url);
@@ -1339,7 +1362,7 @@ async fn seed(
         })
         .collect();
     if candidates.is_empty() {
-        return Ok(0);
+        return Ok(Seeded::default());
     }
     let admitted = state
         .admit(&candidates)
@@ -1366,7 +1389,43 @@ async fn seed(
         .await
         .map_err(|e| Error::State(e.to_string()))?;
 
-    Ok(u64::from(admitted.admitted))
+    Ok(Seeded {
+        urls: u64::from(admitted.admitted),
+        origins: origins(&urls),
+    })
+}
+
+/// What the seeding step produced.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+struct Seeded {
+    /// URLs admitted.
+    urls: u64,
+    /// The distinct origins they are on, which is what doc 13.6's sitemap pass
+    /// runs against. Origins rather than hosts, because a sitemap lives at a
+    /// scheme and a port as much as at a name.
+    origins: Vec<String>,
+}
+
+/// The distinct origins of a seed list, in a stable order.
+///
+/// Sorted and deduplicated rather than kept in seed order, so that two runs of
+/// the same crawl fetch the same sitemaps in the same order and a log from one
+/// can be read against a log from the other.
+fn origins(urls: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = urls
+        .iter()
+        .filter_map(|url| {
+            let parsed = url::Url::parse(url).ok()?;
+            let host = parsed.host_str()?;
+            Some(match parsed.port() {
+                Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+                None => format!("{}://{host}", parsed.scheme()),
+            })
+        })
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// The sources doc 13.6 lists, in the order the flags were given.
@@ -1683,6 +1742,7 @@ impl Default for Options {
             tier_max: 3,
             seed: None,
             seeder: Vec::new(),
+            sitemaps: true,
             out: None,
             publish: None,
         }

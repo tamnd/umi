@@ -3065,6 +3065,7 @@ dependencies = [
  "umi-file",
  "umi-frontier",
  "umi-robots",
+ "umi-seed",
  "umi-state",
  "umi-state-sqlite",
  "umi-types",
@@ -3176,6 +3177,7 @@ dependencies = [
 name = "umi-seed"
 version = "0.0.1"
 dependencies = [
+ "flate2",
  "quick-xml",
  "tempfile",
  "thiserror",

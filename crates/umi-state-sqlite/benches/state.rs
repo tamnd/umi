@@ -419,6 +419,7 @@ fn candidate(url: &str) -> Candidate<'_> {
         priority: Priority::DEFAULT,
         discovered_ms: T0,
         discovery: Discovery::Trusted,
+        lastmod_ms: None,
     }
 }
 

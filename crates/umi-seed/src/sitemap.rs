@@ -117,8 +117,26 @@ impl Sitemap {
     }
 
     /// Read one, with limits the caller chose.
+    ///
+    /// Gzip is unwrapped first when the bytes are a gzip member, because a
+    /// `sitemap.xml.gz` is how most large sites serve theirs and no HTTP client
+    /// unwraps that for us: the compression is the resource rather than the
+    /// transfer encoding. [`Caps::max_bytes`] then bounds what comes out of the
+    /// decoder rather than what went into it, which is what makes a document
+    /// that inflates to forty gigabytes cost the same as one that does not.
     #[must_use]
     pub fn parse_with(bytes: &[u8], caps: &Caps) -> Self {
+        if crate::gzip::is_gzip(bytes) {
+            let (inflated, truncated) = crate::gzip::inflate(bytes, caps.max_bytes);
+            let mut out = Self::read(&inflated, caps);
+            out.truncated |= truncated;
+            return out;
+        }
+        Self::read(bytes, caps)
+    }
+
+    /// The parse itself, on bytes that are already plain.
+    fn read(bytes: &[u8], caps: &Caps) -> Self {
         let mut out = Self::default();
         let bytes = if bytes.len() > caps.max_bytes {
             out.truncated = true;

@@ -291,6 +291,85 @@ fn deep_nesting_does_not_grow_a_stack() {
     assert!(out.is_empty());
 }
 
+/// gzip `body`, which is what a `.xml.gz` sitemap arrives as.
+fn gzipped(body: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(body.as_bytes()).expect("write");
+    encoder.finish().expect("finish")
+}
+
+#[test]
+fn a_gzipped_sitemap_is_read_like_any_other() {
+    // Most large sites serve `sitemap.xml.gz`, which has a gzip content type
+    // rather than a `Content-Encoding`, so no HTTP client unwraps it for us.
+    let doc = urlset(
+        "<url><loc>https://example.com/a</loc><lastmod>2026-08-28</lastmod></url>\
+         <url><loc>https://example.com/b</loc></url>",
+    );
+    let out = Sitemap::parse(&gzipped(&doc));
+    assert_eq!(
+        urls(&out),
+        ["https://example.com/a", "https://example.com/b"]
+    );
+    assert_eq!(out.urls[0].lastmod_ms, Some(1_787_875_200_000));
+    assert!(!out.truncated && !out.malformed);
+}
+
+#[test]
+fn the_plain_text_form_survives_being_gzipped_too() {
+    let doc = "https://example.com/a\nhttps://example.com/b\n";
+    let out = Sitemap::parse(&gzipped(doc));
+    assert_eq!(
+        urls(&out),
+        ["https://example.com/a", "https://example.com/b"]
+    );
+}
+
+#[test]
+fn a_gzip_bomb_costs_the_byte_cap_and_not_the_machine() {
+    // Distinct URLs compress about eighteen to one, and a file of repeats goes
+    // orders of magnitude past that. The ratio is not the point either way. The
+    // defence is that the cap counts what comes out of the decoder rather than
+    // what went into it, so a compressed document and a plain one buy the same
+    // amount of memory.
+    let doc = urlset(&many(200_000));
+    let bomb = gzipped(&doc);
+    assert!(
+        bomb.len() < doc.len() / 10,
+        "the test is only meaningful if it compresses"
+    );
+    let caps = Caps {
+        max_bytes: 64 * 1024,
+        ..Caps::default()
+    };
+    let out = Sitemap::parse_with(&bomb, &caps);
+    assert!(out.truncated);
+    assert!(!out.urls.is_empty(), "the prefix is still worth reading");
+    assert!(
+        out.urls.len() < 2000,
+        "{} urls got past the cap",
+        out.urls.len()
+    );
+    assert!(
+        !out.malformed,
+        "cutting the stream ourselves is not the file being broken"
+    );
+}
+
+#[test]
+fn a_truncated_gzip_keeps_what_it_managed_to_inflate() {
+    // A fetch that hit its body cap leaves exactly this: a valid gzip stream
+    // with the end missing. The decoder fails at the cut and the URLs before
+    // it are still good.
+    let doc = urlset(&many(400));
+    let full = gzipped(&doc);
+    let cut = &full[..full.len() / 2];
+    let out = Sitemap::parse(cut);
+    assert!(!out.urls.is_empty());
+    assert!(out.urls.len() < 400);
+}
+
 #[test]
 fn junk_that_is_not_a_sitemap_gives_nothing_rather_than_a_panic() {
     for doc in [

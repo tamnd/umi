@@ -45,8 +45,11 @@ use crate::{
 /// millisecond timestamp.
 const T0: u64 = 1_700_000_000_000;
 
+/// Milliseconds in an hour, for the cases that move inside one refresh window.
+const HOUR: u64 = 60 * 60 * 1000;
+
 /// Milliseconds in a day, for the far future cases.
-const DAY: u64 = 24 * 60 * 60 * 1000;
+const DAY: u64 = 24 * HOUR;
 
 type Outcome = Result<(), String>;
 
@@ -163,6 +166,7 @@ where
     run!(admit_accounts_for_every_candidate_exactly_once);
     run!(admitting_the_same_batch_twice_admits_nothing_the_second_time);
     run!(a_duplicate_inside_one_batch_is_admitted_once);
+    run!(a_publisher_date_brings_a_known_url_forward);
     run!(an_unverified_discovery_is_held_rather_than_admitted);
     run!(only_admitted_urls_are_ever_leased);
     run!(lease_never_returns_more_than_was_asked_for);
@@ -234,6 +238,7 @@ fn candidate<'a>(url: &'a str, priority: Priority) -> Candidate<'a> {
         priority,
         discovered_ms: T0,
         discovery: Discovery::Trusted,
+        lastmod_ms: None,
     }
 }
 
@@ -358,6 +363,59 @@ async fn a_duplicate_inside_one_batch_is_admitted_once(state: &dyn State) -> Out
     ensure_eq!(report.admitted, 1, "a repeat inside one batch was admitted");
     ensure_eq!(report.seen, 2, "the repeats were not counted as seen");
     ensure_eq!(report.total(), 3, "dispositions do not sum to the batch");
+    Ok(())
+}
+
+async fn a_publisher_date_brings_a_known_url_forward(state: &dyn State) -> Outcome {
+    // Doc 13.6's reason for keeping `lastmod` rather than throwing it away.
+    // Fetch a url, so it is scheduled a day out, then admit it again with a
+    // date on it later than that fetch. The site has just said the page moved,
+    // which beats anything the estimator worked out, so it is due now.
+    let url = host_url(1);
+    admit_all(state, std::slice::from_ref(&url)).await?;
+    let leases = lease_one(state, T0).await?;
+    let lease = leases.first().ok_or("the url was not leased")?;
+    let done = fetched(lease, T0 + 500, "hello");
+    state
+        .complete(&[done])
+        .await
+        .map_err(|e| format!("complete failed: {e}"))?;
+
+    let hour = T0 + HOUR;
+    ensure!(
+        lease_one(state, hour).await?.is_empty(),
+        "a url fetched an hour ago is not due yet"
+    );
+
+    // A date before the fetch is the ordinary case on a sitemap that lists a
+    // whole site, and treating it as news would refetch everything on every
+    // poll.
+    let batch = vec![Candidate {
+        discovered_ms: hour,
+        lastmod_ms: Some(T0 - DAY),
+        ..candidate(&url, Priority::DEFAULT)
+    }];
+    let stale = state.admit(&batch).await.map_err(|e| e.to_string())?;
+    ensure_eq!(stale.seen, 1, "a known url was not reported as seen");
+    ensure_eq!(stale.refreshed, 0, "an old date moved the schedule");
+    ensure_eq!(stale.total(), 1, "refreshed leaked into the dispositions");
+    ensure!(
+        lease_one(state, hour).await?.is_empty(),
+        "an old date brought the url forward"
+    );
+
+    // A date after it is the site telling us our copy is stale.
+    let batch = vec![Candidate {
+        discovered_ms: hour,
+        lastmod_ms: Some(T0 + 600),
+        ..candidate(&url, Priority::DEFAULT)
+    }];
+    let fresh = state.admit(&batch).await.map_err(|e| e.to_string())?;
+    ensure_eq!(fresh.seen, 1, "a known url was not reported as seen");
+    ensure_eq!(fresh.refreshed, 1, "a newer date did not move the schedule");
+    ensure_eq!(fresh.total(), 1, "refreshed leaked into the dispositions");
+    let leases = lease_one(state, hour).await?;
+    ensure_eq!(leases.len(), 1, "the url did not come due after the date");
     Ok(())
 }
 

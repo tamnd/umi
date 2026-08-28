@@ -181,8 +181,38 @@ fn main() {
             per_s / ADMISSION
         );
     }
+    // The form a big site actually serves. A `sitemap.xml.gz` is a compressed
+    // resource rather than a transfer encoding, so no HTTP client unwraps it and
+    // the inflate is ours. The throughput is of the document that comes out,
+    // because that is the work, and the file on the wire is a fifth the size.
+    let plain = sitemap_doc(full, true);
+    let squeezed = gzipped(plain.as_bytes());
+    let bare = time(repeat, || {
+        umi_seed::Sitemap::parse(plain.as_bytes()).all().count()
+    });
+    let best = time(repeat, || umi_seed::Sitemap::parse(&squeezed).all().count());
+    let per_s = full as f64 / best;
+    println!(
+        "  {:<24} {per_s:>12.0} {:>12.1} {:>15.1}x",
+        "sitemap, gzipped",
+        plain.len() as f64 / 1e6 / best,
+        per_s / ADMISSION
+    );
+    println!(
+        "  gzip is {:.1}x smaller on the wire and the inflate adds {:.0}% to the parse.",
+        plain.len() as f64 / squeezed.len() as f64,
+        100.0 * (best / bare - 1.0)
+    );
     println!("  a full sitemap is a few MB and one request, so anything here that");
     println!("  beats admission means the fetch is the cost and the parse is not.");
+}
+
+/// The same document as a gzip member, which is how it arrives.
+fn gzipped(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).expect("write");
+    encoder.finish().expect("finish")
 }
 
 /// A `<urlset>` with `count` URLs in it, with or without the date.

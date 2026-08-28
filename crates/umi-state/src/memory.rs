@@ -27,7 +27,7 @@ use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Ulid, UrlKey, U
 use crate::{
     AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult, HostRow,
     Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Quotas, RefreshClass, Result,
-    Revalidator, SegmentQuery, SegmentRow, State, StateStats, UrlState, next_due_after,
+    Revalidator, SegmentQuery, SegmentRow, State, StateStats, UrlState, next_due_dated,
     retry_after_ms,
 };
 
@@ -152,6 +152,47 @@ impl Inner {
         }
     }
 
+    /// Doc 09.4's publisher signal, applied to a URL we already have.
+    ///
+    /// A sitemap that says a page changed after our last fetch of it is the
+    /// site telling us our copy is stale, and that beats anything the change
+    /// rate estimator worked out for itself. So the next visit moves to now.
+    /// Returns whether it moved, which is the only number that says whether a
+    /// poll was worth making.
+    ///
+    /// Three cases do nothing, and each of them matters. A date at or before
+    /// our last fetch is the ordinary case on a sitemap that lists the whole
+    /// site, which is most of them, and treating it as news would refetch
+    /// every URL on every poll. A row that is already due sooner is left alone
+    /// rather than pushed later, since this can only ever bring a visit
+    /// forward. A row under lease, excluded or gone is not rescheduled at all,
+    /// because in the first case somebody is fetching it right now and in the
+    /// other two the answer is not about freshness. The states left are the
+    /// scheduler's own, so a pending row is allowed through here and then falls
+    /// out on the due time, having never been fetched and so already being due.
+    fn bring_forward(&mut self, candidate: &Candidate<'_>) -> bool {
+        let Some(lastmod_ms) = candidate.lastmod_ms else {
+            return false;
+        };
+        let Some(entry) = self.ledger.get_mut(&candidate.key) else {
+            return false;
+        };
+        if entry.lease.is_some()
+            || !matches!(
+                entry.row.state,
+                UrlState::Pending | UrlState::Fetched | UrlState::Failed
+            )
+        {
+            return false;
+        }
+        if lastmod_ms <= entry.row.last_fetch_ms || entry.row.next_due_ms <= candidate.discovered_ms
+        {
+            return false;
+        }
+        entry.row.next_due_ms = candidate.discovered_ms;
+        true
+    }
+
     fn intern_etag(&mut self, etag: &str) -> u32 {
         if let Some(index) = self.etag_index.get(etag) {
             return *index;
@@ -228,6 +269,9 @@ impl State for MemoryState {
             // occurrence puts it in the set.
             if !inner.seen.insert(candidate.key.url) {
                 report.seen += 1;
+                if inner.bring_forward(candidate) {
+                    report.refreshed += 1;
+                }
                 continue;
             }
 
@@ -512,7 +556,16 @@ impl State for MemoryState {
                         None => LedgerRow::NO_ETAG,
                     };
                     row.last_mod_ms = revalidate.last_modified_ms.unwrap_or(0);
-                    row.next_due_ms = next_due_after(&before, changed, outcome.finished_ms);
+                    // The header off this fetch rather than off `before`, and
+                    // that is the point of it: on a first fetch there is no
+                    // history to estimate from, and `Last-Modified` is the one
+                    // thing we now know about when the page moves.
+                    row.next_due_ms = next_due_dated(
+                        &before,
+                        changed,
+                        outcome.finished_ms,
+                        revalidate.last_modified_ms,
+                    );
                 }
                 FetchResult::NotModified { status, revalidate } => {
                     // The content did not move, so `content_hash` and
@@ -531,7 +584,12 @@ impl State for MemoryState {
                     if let Some(last_mod_ms) = revalidate.last_modified_ms {
                         row.last_mod_ms = last_mod_ms;
                     }
-                    row.next_due_ms = next_due_after(&before, false, outcome.finished_ms);
+                    row.next_due_ms = next_due_dated(
+                        &before,
+                        false,
+                        outcome.finished_ms,
+                        revalidate.last_modified_ms,
+                    );
                 }
                 FetchResult::Failed { status, kind: _ } => {
                     row.state = UrlState::Failed;

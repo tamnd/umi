@@ -113,7 +113,18 @@ const EVIDENCE_FACTOR: u64 = 2;
 /// interval that was actually served.
 #[must_use]
 pub fn next_due_after(row: &LedgerRow, changed: bool, now_ms: u64) -> u64 {
-    now_ms.saturating_add(refresh_interval_ms(row, changed, now_ms))
+    next_due_dated(row, changed, now_ms, None)
+}
+
+/// The same, for a caller that also has the publisher's own date for the page.
+///
+/// `lastmod_ms` is a `Last-Modified` header off this fetch, or a sitemap
+/// `lastmod` for the same URL. It is used on the first fetch and nowhere else,
+/// because from the second one on we have watched the page ourselves and a
+/// measurement beats a claim.
+#[must_use]
+pub fn next_due_dated(row: &LedgerRow, changed: bool, now_ms: u64, lastmod_ms: Option<u64>) -> u64 {
+    now_ms.saturating_add(refresh_interval_dated(row, changed, now_ms, lastmod_ms))
 }
 
 /// The interval [`next_due_after`] is about to add, on its own.
@@ -123,12 +134,24 @@ pub fn next_due_after(row: &LedgerRow, changed: bool, now_ms: u64) -> u64 {
 /// clock.
 #[must_use]
 pub fn refresh_interval_ms(row: &LedgerRow, changed: bool, now_ms: u64) -> u64 {
+    refresh_interval_dated(row, changed, now_ms, None)
+}
+
+/// The interval [`next_due_dated`] is about to add, on its own.
+#[must_use]
+pub fn refresh_interval_dated(
+    row: &LedgerRow,
+    changed: bool,
+    now_ms: u64,
+    lastmod_ms: Option<u64>,
+) -> u64 {
     // A first fetch has nothing to compare against. `changed` is true for it by
     // construction, since the stored hash was zero, and treating that as
     // evidence would put every page on Earth on a twelve hour cycle after one
-    // look at it.
+    // look at it. What it does have, sometimes, is the publisher's own date for
+    // the page, and that is worth more than the constant it replaces.
     if row.fetch_count == 0 || row.last_fetch_ms == 0 || now_ms <= row.last_fetch_ms {
-        return INITIAL_REFRESH.as_millis() as u64;
+        return initial_refresh_ms(lastmod_ms, now_ms);
     }
 
     // Everything below counts intervals, not fetches. The first fetch opened
@@ -222,6 +245,46 @@ const fn ln_ratio_q16(num: u64, den: u64) -> u64 {
     }
 
     (((whole << 16) | fraction) * LN2_Q16) >> 16
+}
+
+/// The first refresh interval for a URL a publisher has given us a date for.
+///
+/// The signal is a `Last-Modified` header on the first fetch, or a sitemap
+/// `lastmod` for the same URL, which doc 13.6 calls a prior for a URL the
+/// estimator has never fetched. Without one every new URL gets
+/// [`INITIAL_REFRESH`], which is a guess that is wrong in both directions at
+/// once. A news article published four minutes ago and an about page last
+/// touched in 2011 both get a day, and the site told us which was which in the
+/// response to the only request we have made.
+///
+/// The model is the one the rest of this file already uses, with one
+/// observation in it. We know a change happened at `lastmod_ms` and that
+/// nothing the publisher considers a change has happened since, so the age of
+/// the page is the one interval we have, the rate estimate is one over that
+/// age, and the interval that expects [`K_Q16`] changes is `k` times it. A page
+/// that changed a day ago is looked at in half a day. A page that changed two
+/// years ago is looked at in a year, which the ceiling then brings back to six
+/// months.
+///
+/// That is a weaker claim than the estimator makes off our own fetches, and it
+/// should be: the publisher is telling us about the last change and not about
+/// the rate. It is still far better than a constant, and it costs one
+/// multiplication at admission time.
+///
+/// A date in the future is treated as now. Generators stamp tomorrow's date on
+/// today's file constantly, clocks disagree, and both readings mean the same
+/// thing here, which is that the page is fresh.
+#[must_use]
+pub fn initial_refresh_ms(lastmod_ms: Option<u64>, now_ms: u64) -> u64 {
+    let Some(lastmod_ms) = lastmod_ms else {
+        return INITIAL_REFRESH.as_millis() as u64;
+    };
+    let age_ms = now_ms.saturating_sub(lastmod_ms);
+    let interval_ms = age_ms.saturating_mul(K_Q16) >> 16;
+    interval_ms.clamp(
+        MIN_REFRESH.as_millis() as u64,
+        MAX_REFRESH.as_millis() as u64,
+    )
 }
 
 /// What a URL is being crawled for, from the table in doc 09.5.
