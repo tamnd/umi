@@ -432,6 +432,80 @@ fn the_sql_class_boundaries_are_the_rust_ones() {
     );
 }
 
+#[tokio::test]
+async fn the_stored_class_is_rewritten_on_every_completion() {
+    // Doc 09.5 says whatever writes the schedule writes the class in the same
+    // statement, and this backend keeps the class in a column so the lease scan
+    // can walk one index per class rather than computing a class per row. A
+    // column is a copy, and a copy that is written once and then left is the
+    // failure worth a test: the row would be scheduled forever out of the class
+    // it was in on its first fetch, and the evidence that moved it would be
+    // sitting in the same row, unread.
+    let (_dir, state) = on_disk();
+    let url = "https://example.com/news";
+    admit_one(&state, url).await;
+    assert_eq!(stored_class(&state), RefreshClass::Discovery);
+
+    // A page that turns over on every visit. Eight rounds crosses two
+    // boundaries, which is what makes this a test of the write rather than of
+    // the first value happening to be right.
+    let mut seen = Vec::new();
+    let mut now = T0;
+    for round in 0..8 {
+        let ask = LeaseRequest::new(FetcherId::LOCAL, now, 1);
+        let leases = state.lease(&ask).await.expect("lease");
+        assert_eq!(leases.len(), 1, "nothing came due in round {round}");
+        state
+            .complete(&[FetchOutcome {
+                lease: leases[0].id,
+                key: leases[0].key,
+                finished_ms: now + 500,
+                tier_used: Tier::Plain,
+                pace: Pace::default(),
+                result: FetchResult::Fetched {
+                    status: 200,
+                    // Different on every round, which is the whole input: the
+                    // page changed, so the estimator has to shorten.
+                    content_hash: [round, 0, 0, 0, 0, 0, 0, 0],
+                    revalidate: Revalidator::default(),
+                },
+            }])
+            .await
+            .expect("complete");
+        let class = stored_class(&state);
+        if seen.last() != Some(&class) {
+            seen.push(class);
+        }
+        now = due_at(&state);
+    }
+    assert_eq!(
+        seen,
+        vec![RefreshClass::Daily, RefreshClass::Hourly],
+        "the stored class did not follow the schedule the same completions wrote"
+    );
+}
+
+/// The class column on the one row the test above admits.
+fn stored_class(state: &SqliteState) -> RefreshClass {
+    let byte: i64 = state
+        .lock()
+        .conn
+        .query_row("SELECT refresh_class FROM ledger", [], |row| row.get(0))
+        .expect("one ledger row");
+    RefreshClass::from_u8(u8::try_from(byte).expect("a class byte")).expect("a known class")
+}
+
+/// The due time column on the same row, so the test can be at the instant the
+/// estimator picked rather than guessing at one.
+fn due_at(state: &SqliteState) -> u64 {
+    let ms: i64 = state
+        .lock()
+        .conn
+        .query_row("SELECT next_due_ms FROM ledger", [], |row| row.get(0))
+        .expect("one ledger row");
+    u64::try_from(ms).expect("a due time")
+}
+
 #[test]
 fn the_sql_host_defaults_are_the_rust_ones() {
     // A host nobody has fetched yet has no record, so the lease query has to

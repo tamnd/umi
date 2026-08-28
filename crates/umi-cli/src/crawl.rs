@@ -1521,27 +1521,30 @@ impl Frontier {
     }
 }
 
-/// The ctrl-c switch, as something the loop can both test and wait on.
+/// The stop switch, as something the loop can both test and wait on.
 ///
-/// A watch runs for days, and the way it ends is somebody pressing ctrl-c, so
-/// what happens then is part of the design rather than an afterthought. The
-/// default handler kills the process wherever it happens to be, and the rows
-/// fetched since the last seal are in a segment whose footer nobody has written
-/// yet. So the first interrupt sets this, the loop sees it at the top of its
-/// next pass, and it leaves through the same path a budget leaves through,
-/// which seals the segment and converts it.
+/// A watch runs for days, and the way it ends is somebody stopping it, so what
+/// happens then is part of the design rather than an afterthought. The default
+/// handler kills the process wherever it happens to be, and the rows fetched
+/// since the last seal are in a segment whose footer nobody has written yet. So
+/// the first signal sets this, the loop sees it at the top of its next pass,
+/// and it leaves through the same path a budget leaves through, which seals the
+/// segment and converts it.
 ///
 /// The second interrupt is the escape hatch, because the first one still waits
 /// for the fetches in flight and a slow origin can hold those for a timeout.
 /// 130 is the shell's number for a process ended by SIGINT, and it is not in
-/// doc 14.9 because doc 14.9 is about codes umi chooses.
+/// doc 14.9 because doc 14.9 is about codes umi chooses. Only ctrl-c is taken
+/// for that one. A supervisor that wants a stop to be over escalates to SIGKILL
+/// rather than sending its terminate twice, and nothing can be done about that
+/// one anyway.
 fn interrupt() -> tokio::sync::watch::Receiver<bool> {
     let (tx, rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         // An error here is a platform that will not give us the signal. Then
         // there is nothing to report and nothing to wait for, and the sender
         // dropping is how the loop finds that out.
-        if tokio::signal::ctrl_c().await.is_err() {
+        if first_stop().await.is_err() {
             return;
         }
         eprintln!("umi: stopping after the fetches in flight, interrupt again to quit now");
@@ -1551,6 +1554,33 @@ fn interrupt() -> tokio::sync::watch::Receiver<bool> {
         }
     });
     rx
+}
+
+/// Whichever stop signal arrives first.
+///
+/// Doc 14.6. ctrl-c is how a person stops a watch and SIGTERM is how everything
+/// else does: systemd, docker, kubernetes and a plain `kill` all send that one
+/// and none of them send an interrupt. A command meant to run for a fortnight
+/// spends almost all of its life under one of those, so taking the default
+/// handler for SIGTERM would lose the open segment on every ordinary restart,
+/// which is the one thing this whole path exists to prevent.
+#[cfg(unix)]
+async fn first_stop() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result,
+        // `None` is the stream closing, which cannot happen while the handler
+        // is alive, and waiting forever is the right answer if it somehow does.
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+/// Whichever stop signal arrives first, where there is only one of them.
+#[cfg(not(unix))]
+async fn first_stop() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 /// How long to wait after an idle tick, which is the whole cost of a watch.

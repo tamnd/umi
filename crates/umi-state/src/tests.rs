@@ -158,6 +158,93 @@ fn a_page_that_never_changes_converges_upward() {
 }
 
 #[test]
+fn a_class_follows_the_interval_as_the_evidence_arrives() {
+    // Doc 09.5. The classes are how the scheduler spends a batch, so a class
+    // that is written once and left there would keep a page that turns over
+    // every hour on a daily budget forever, and the evidence that it turns over
+    // hourly would never be acted on.
+    //
+    // A row nobody has fetched is discovery whatever schedule it carries, and
+    // that is not the interval speaking: a url is due the moment it is
+    // admitted, so by interval alone every new url in the crawl would be filed
+    // as realtime and would take the realtime budget away from the pages that
+    // earned it.
+    let admitted = LedgerRow {
+        next_due_ms: T0,
+        ..LedgerRow::default()
+    };
+    assert_eq!(RefreshClass::of_row(&admitted), RefreshClass::Discovery);
+
+    // One fetch earns a day, which is daily, and the row has left discovery for
+    // good. Discovery is the class of having no history and history does not go
+    // away.
+    let mut now = T0;
+    let mut row = watched(1, 1, 0);
+    row.next_due_ms = next_due_after(&LedgerRow::default(), true, now);
+    assert_eq!(RefreshClass::of_row(&row), RefreshClass::Daily);
+
+    // Then it changes on every visit. The interval walks down and the class has
+    // to walk down with it, one boundary at a time rather than in a jump. Eight
+    // visits is two boundaries. The row has no revalidator on it, which is the
+    // slow case: an origin that sends an ETag buys a shorter interval for the
+    // same evidence and crosses the same two boundaries sooner.
+    let mut seen = vec![RefreshClass::of_row(&row)];
+    for _ in 0..8 {
+        now = row.next_due_ms;
+        let before = row;
+        row.observed_secs = before.observed_secs_after(now);
+        row.last_fetch_ms = now;
+        row.fetch_count += 1;
+        row.change_count += 1;
+        row.next_due_ms = next_due_after(&before, true, now);
+        let class = RefreshClass::of_row(&row);
+        if *seen.last().unwrap_or(&class) != class {
+            seen.push(class);
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![RefreshClass::Daily, RefreshClass::Hourly],
+        "the class did not follow the interval down"
+    );
+
+    // And back up, on a page that never changes. A class that only ever went
+    // down would leave the whole long tail of the web on the hourly budget,
+    // which is most of the web on the smallest share of the crawl.
+    //
+    // From the class the first fetch earned rather than from the churny row
+    // above, and that is not to make it easy. Nine recorded changes are nine
+    // pieces of evidence that the page moves, and the estimator does not forget
+    // them, so a page that goes quiet after a year of daily edits climbs slowly
+    // on purpose. Where it starts from is the boring case, and the boring case
+    // is most of the crawl.
+    let mut row = watched(1, 1, 0);
+    row.next_due_ms = next_due_after(&LedgerRow::default(), true, T0);
+    let mut seen = vec![RefreshClass::of_row(&row)];
+    for _ in 0..16 {
+        now = row.next_due_ms;
+        let before = row;
+        row.observed_secs = before.observed_secs_after(now);
+        row.last_fetch_ms = now;
+        row.fetch_count += 1;
+        row.next_due_ms = next_due_after(&before, false, now);
+        let class = RefreshClass::of_row(&row);
+        if *seen.last().unwrap_or(&class) != class {
+            seen.push(class);
+        }
+    }
+    assert_eq!(
+        seen,
+        vec![
+            RefreshClass::Daily,
+            RefreshClass::Weekly,
+            RefreshClass::Dormant
+        ],
+        "the class did not follow the interval back up"
+    );
+}
+
+#[test]
 fn the_estimator_finds_a_change_period_it_was_not_told() {
     // The one that matters. A page really changes every `period`, we only ever
     // learn changed or not changed, and the interval has to end up near the
