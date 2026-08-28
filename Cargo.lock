@@ -3298,6 +3298,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "toml",
+ "tracing",
  "umi-dedup",
  "umi-extract",
  "umi-fetch",

@@ -117,6 +117,16 @@ pub const TABS: usize = 8;
 /// How many pages one tab serves before it is recycled, doc 05.6.
 pub const PAGES_PER_TAB: u32 = 50;
 
+/// What a document costs before the quiet period starts.
+///
+/// Only used to seed [`Renderer::rate`] before anything has been rendered,
+/// because doc 05.9's budget has to have a number on the first tick and the
+/// pool has no measurement yet. A second is a round number that is not
+/// optimistic: the load only figure in the T3 bench is 504 ms on server2 and
+/// 578 ms on server3, and the pool converges on its own mean within a few
+/// pages anyway.
+pub const LOAD: Duration = Duration::from_secs(1);
+
 /// How long one tab lives before it is recycled, doc 05.6.
 ///
 /// Both limits are here because they catch different leaks. A tab that serves
@@ -380,6 +390,27 @@ impl Counts {
         Duration::from_nanos(self.nanos / self.pages)
     }
 
+    /// Doc 05.9's `browser_pool_capacity`, in pages a second.
+    ///
+    /// Tabs over mean render time, which is the formula in the spec. It runs a
+    /// little high, because the mean is the render alone and a page also
+    /// spends time waiting for a tab: the T3 bench measures 1.8 pages a second
+    /// on server2 where this says 2.3. Left as the spec has it rather than
+    /// corrected by a fudge factor, because the other half of doc 05.9's `min`
+    /// is well under both numbers and the correction would never be the
+    /// binding one.
+    ///
+    /// `tabs` is the pool's cap. Zero tabs or no measurement is zero capacity,
+    /// which the budget reads as no rendering.
+    #[must_use]
+    pub fn capacity(&self, tabs: usize) -> f64 {
+        let mean = self.mean_render().as_secs_f64();
+        if tabs == 0 || mean <= 0.0 {
+            return 0.0;
+        }
+        tabs as f64 / mean
+    }
+
     /// Mean subresource bytes per rendered page.
     #[must_use]
     pub const fn mean_bytes(&self) -> u64 {
@@ -610,6 +641,23 @@ impl Renderer {
     /// that goes wrong once the navigation has started is an [`Outcome`].
     pub async fn fetch(&self, url: &str, revalidate: Option<&Revalidator>) -> Result<Outcome> {
         self.inner.fetch(url, revalidate).await
+    }
+
+    /// How many pages a second this pool can render, doc 05.9.
+    ///
+    /// Measured once anything has been rendered and estimated before that, and
+    /// the estimate is deliberately the pessimistic one: a budget that starts
+    /// too high sends work to a browser that cannot take it, and the pages
+    /// that get deferred as a result are the ones the crawl most wanted.
+    #[must_use]
+    pub fn rate(&self) -> f64 {
+        let counts = self.counts();
+        let tabs = self.inner.render.tabs;
+        if counts.pages == 0 {
+            let seed = self.inner.render.quiet + LOAD;
+            return tabs as f64 / seed.as_secs_f64();
+        }
+        counts.capacity(tabs)
     }
 
     /// Close the browser and take its profile directory with it.

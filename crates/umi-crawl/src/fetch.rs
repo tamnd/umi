@@ -51,6 +51,16 @@ pub trait Fetch: Send + Sync {
         revalidate: Option<&Revalidator>,
         tier: Tier,
     ) -> Result<Outcome, FetchError>;
+
+    /// How many pages a second this fetcher can render, doc 05.9.
+    ///
+    /// `None`, the default, is a fetcher with no browser, and the loop reads it
+    /// as no rendering rather than as unlimited rendering. Asked every tick
+    /// rather than configured once, because the pool measures itself and the
+    /// spec's own estimate for it is out by about a factor of two.
+    fn render_capacity(&self) -> Option<f64> {
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -62,6 +72,10 @@ impl Fetch for Ladder {
         tier: Tier,
     ) -> Result<Outcome, FetchError> {
         Self::fetch(self, url, revalidate, tier).await
+    }
+
+    fn render_capacity(&self) -> Option<f64> {
+        self.render_rate()
     }
 }
 
@@ -92,5 +106,9 @@ impl<T: Fetch + ?Sized> Fetch for std::sync::Arc<T> {
         tier: Tier,
     ) -> Result<Outcome, FetchError> {
         (**self).fetch(url, revalidate, tier).await
+    }
+
+    fn render_capacity(&self) -> Option<f64> {
+        (**self).render_capacity()
     }
 }

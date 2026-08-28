@@ -44,14 +44,25 @@ use futures_util::stream::FuturesUnordered;
 use umi_extract::extract;
 use umi_fetch::Outcome;
 use umi_frontier::{Ask, Config as FrontierConfig, Frontier, Rate};
-use umi_state::{Budget, Discovery, FetchOutcome, FetchResult, Pace, State, StateError};
+use umi_state::{
+    Budget, Discovery, FetchOutcome, FetchResult, LeaseId, NackReason, Pace, State, StateError,
+};
 use umi_types::{FetcherId, Revalidator, Tier, TierSignal, Verification};
 
 use crate::clock::Clock;
 use crate::fetch::Fetch;
 use crate::page::{Crawled, PageRow};
+use crate::render::{RenderBudget, RenderPolicy, Slot};
 use crate::robots::RobotsCache;
 use crate::scope::{LinkPolicy, Scope};
+
+/// How big a tick has to be before its T2 share is worth an alert.
+///
+/// Doc 05.9's line is 15 percent of volume, and on a tick of twelve leases that
+/// is two pages. The floor is here so that the alert means what it says: a
+/// vendor changed a default rule, rather than a small crawl visiting a couple
+/// of sites that have always wanted T2.
+const ALERT_FLOOR: usize = 100;
 
 /// Where finished rows go.
 ///
@@ -137,6 +148,11 @@ pub struct CrawlConfig {
     /// fetch is the only thing that catches it, and one in a hundred costs
     /// about a percent of the saving T0 exists for. Zero turns it off.
     pub audit_every: u32,
+    /// Doc 05.9's ceiling on how much of a crawl may be rendered.
+    ///
+    /// The other half of that budget, the browser pool's own capacity, is
+    /// asked for every tick rather than configured. See [`crate::render`].
+    pub render: RenderPolicy,
 }
 
 impl CrawlConfig {
@@ -193,6 +209,7 @@ impl Default for CrawlConfig {
             max_domains: FrontierConfig::default().max_domains,
             // Doc 05.3's 1 percent.
             audit_every: 100,
+            render: RenderPolicy::default(),
         }
     }
 }
@@ -235,6 +252,17 @@ pub struct TickReport {
     /// Normally zero. A number that stays high means hosts are escalating and
     /// de-escalating in turn, which is worth looking at.
     pub learned: usize,
+    /// Leases fetched at T2, for doc 05.9's 15 percent alert.
+    pub emulated: usize,
+    /// Leases fetched at T3 or above.
+    pub rendered: usize,
+    /// Leases the render budget had no room for, per doc 05.9.
+    ///
+    /// These were given back to the frontier without an answer, so they keep
+    /// their due time and their priority and the next tick offers the most
+    /// important of them again. They are not failures and no row exists for
+    /// them, which is why they are counted apart from everything else.
+    pub deferred: usize,
 }
 
 impl TickReport {
@@ -252,6 +280,7 @@ pub struct Crawler<F, C> {
     frontier: Frontier<Arc<dyn State>>,
     clock: C,
     robots: RobotsCache,
+    render: RenderBudget,
     config: CrawlConfig,
 }
 
@@ -260,13 +289,21 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     #[must_use]
     pub fn new(fetch: F, state: Arc<dyn State>, clock: C, config: CrawlConfig) -> Self {
         let frontier = Frontier::new(state, config.frontier());
+        let render = RenderBudget::new(config.render);
         Self {
             fetch,
             frontier,
             clock,
             robots: RobotsCache::new(),
+            render,
             config,
         }
+    }
+
+    /// Doc 05.9's render budget, so a caller can report what it is doing.
+    #[must_use]
+    pub const fn render(&self) -> &RenderBudget {
+        &self.render
     }
 
     /// The fetcher, so a caller can measure what it did.
@@ -395,6 +432,11 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             self.frontier.resume().await?;
         }
 
+        // Every tick, because the pool's measurement of itself moves as it
+        // renders and because a browser can come and go under a long running
+        // daemon. It is a load of eight atomics and a division.
+        self.render.observe(self.fetch.render_capacity());
+
         let now_ms = self.clock.now_ms();
         // Through the scheduler and not straight to the store. The store hands
         // out work per host; doc 09.3's cap is per pay level domain, and the
@@ -435,15 +477,19 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         let mut outcomes = Vec::with_capacity(report.leased);
         let mut candidates: Vec<(String, u8)> = Vec::new();
         let mut signals: Vec<Learned> = Vec::new();
+        let mut deferred: Vec<LeaseId> = Vec::new();
 
         // Fill the window, then top it up as each one lands, which is what
         // keeps every slot busy rather than waiting on the slowest of a chunk.
-        for lease in queue.by_ref().take(self.config.in_flight) {
-            pending.push(self.one(lease));
+        for _ in 0..self.config.in_flight {
+            let Some((lease, at)) = self.gate(&mut queue, &mut deferred, &mut report) else {
+                break;
+            };
+            pending.push(self.one(lease, at));
         }
         while let Some(done) = pending.next().await {
-            if let Some(lease) = queue.next() {
-                pending.push(self.one(lease));
+            if let Some((lease, at)) = self.gate(&mut queue, &mut deferred, &mut report) {
+                pending.push(self.one(lease, at));
             }
             let Fetched {
                 row,
@@ -505,6 +551,27 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         }
         self.state().complete(&outcomes).await?;
 
+        // After the completions rather than before, so that a store that
+        // refuses the release still keeps the answers of everything this tick
+        // did fetch. A deferred lease that is never released expires on its own
+        // and comes back anyway, a lease time later.
+        //
+        // `Refused` and not `Expired`, because that is what happened: doc 08.3
+        // says `Refused` is a fetcher declining work it cannot do, the URL is
+        // rescheduled at the due time it already had, and `fail_streak` is
+        // untouched. A page the fleet has no browser for has not failed.
+        //
+        // The frontier charged the domain for these when it leased them and
+        // the charge is not given back. That is deliberate and it is the safe
+        // direction: doc 09.3's cap is a promise to the operator about how
+        // often we turn up, and the alternative is a crawl that defers a lot
+        // of rendering and spends the returned budget on that domain instead.
+        report.deferred = deferred.len();
+        if !deferred.is_empty() {
+            self.state().release(&deferred, NackReason::Refused).await?;
+        }
+        self.alert(&report);
+
         // After the completions, because both write the host record and the
         // completion is the one that owns doc 07.6's pacing columns. Reading
         // first would mean writing back a politeness timer from before this
@@ -512,6 +579,74 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         report.learned = self.relearn(&signals, now_ms).await?;
         report.links_admitted = self.admit(&candidates, now_ms).await?;
         Ok(report)
+    }
+
+    /// The next lease this tick can actually run, and the earliest moment it
+    /// may start.
+    ///
+    /// Everything below T3 comes straight back with its politeness time. A T3
+    /// lease has to get past doc 05.9's budget first, and one that cannot is
+    /// taken off the queue, collected for release and skipped, so a tick that
+    /// leased more rendering than the fleet has browser for still fills its
+    /// window with the work it can do.
+    ///
+    /// Skipping rather than waiting is the whole point. The budget is global,
+    /// so a tick that blocked on it would hold in flight slots open for pages
+    /// that a different tick will be better placed to run.
+    fn gate(
+        &self,
+        queue: &mut impl Iterator<Item = umi_state::Lease>,
+        deferred: &mut Vec<LeaseId>,
+        report: &mut TickReport,
+    ) -> Option<(umi_state::Lease, u64)> {
+        for lease in queue.by_ref() {
+            let due = lease.not_before_ms;
+            if lease.tier < Tier::Rendered {
+                if lease.tier == Tier::Emulated {
+                    report.emulated += 1;
+                }
+                return Some((lease, due));
+            }
+            match self.render.take(self.clock.now_ms()) {
+                // A fleet with no browser at all serves the rung it does have,
+                // for the reason on `Slot::NoBrowser`. It is not counted as a
+                // render, because nothing rendered.
+                Slot::NoBrowser => return Some((lease, due)),
+                Slot::At(at) => {
+                    report.rendered += 1;
+                    // The later of the two waits. Politeness is owed to the
+                    // origin and the budget is owed to the browser, and a page
+                    // that satisfies one of them early has not satisfied the
+                    // other.
+                    return Some((lease, due.max(at)));
+                }
+                Slot::Defer => deferred.push(lease.id),
+            }
+        }
+        None
+    }
+
+    /// Doc 05.9's T2 alert.
+    ///
+    /// An alert and not a throttle, because a T2 share this high usually means
+    /// a vendor changed a default rule rather than that anything here is wrong,
+    /// and the useful response is a person looking at it. Nothing is throttled
+    /// and nothing is deferred.
+    fn alert(&self, report: &TickReport) {
+        if report.leased < ALERT_FLOOR {
+            return;
+        }
+        let share = report.emulated as f64 / report.leased as f64;
+        let ceiling = self.config.render.max_emulated;
+        if share > ceiling {
+            tracing::warn!(
+                emulated = report.emulated,
+                leased = report.leased,
+                share = format!("{:.1}%", share * 100.0),
+                ceiling = format!("{:.1}%", ceiling * 100.0),
+                "T2 is over doc 05.9's share, which usually means a vendor changed a rule"
+            );
+        }
     }
 
     /// Move the tier ladders of the hosts this tick learned something about.
@@ -574,7 +709,10 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     }
 
     /// One lease, from robots check to row.
-    async fn one(&self, lease: umi_state::Lease) -> Fetched {
+    ///
+    /// `start_ms` is when it may go out, which is its politeness time and, for
+    /// a rendered page, the render slot doc 05.9's budget gave it.
+    async fn one(&self, lease: umi_state::Lease, start_ms: u64) -> Fetched {
         // Doc 07.6, and the whole reason `not_before_ms` exists. The state
         // layer already spaced the leases of a batch by each host's politeness
         // delay, and until this line the loop threw that away and sent the
@@ -584,7 +722,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         //
         // Before the robots check rather than after, since robots.txt is a
         // request to the same host and counts the same way.
-        self.clock.sleep_until_ms(lease.not_before_ms).await;
+        self.clock.sleep_until_ms(start_ms).await;
 
         let now = || self.clock.now_ms();
         let Some(origin) = origin_of(&lease.url) else {

@@ -30,12 +30,15 @@ pub mod clock;
 pub mod digest;
 pub mod fetch;
 pub mod page;
+pub mod render;
 pub mod robots;
 pub mod run;
 pub mod scope;
 pub mod sink;
 pub mod sitemap;
 
+#[cfg(test)]
+mod render_tests;
 #[cfg(test)]
 mod run_tests;
 #[cfg(test)]
@@ -51,6 +54,7 @@ pub use clock::{Clock, FixedClock, SystemClock};
 pub use digest::extract_digest;
 pub use fetch::Fetch;
 pub use page::{Crawled, PageBuilder, PageRow, Snippet, SnippetKind};
+pub use render::{RenderBudget, RenderPolicy, Slot};
 pub use robots::RobotsCache;
 pub use run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
 pub use scope::{

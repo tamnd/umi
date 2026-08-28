@@ -31,6 +31,7 @@ use std::time::Duration;
 use umi_crawl::clock::FixedClock;
 use umi_crawl::fetch::Fetch;
 use umi_crawl::page::PageRow;
+use umi_crawl::render::RenderPolicy;
 use umi_crawl::robots::{Entry, TTL_MS};
 use umi_crawl::run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
 use umi_fetch::outcome::{Page, Version};
@@ -508,6 +509,7 @@ fn config(in_flight: usize, hosts: usize) -> CrawlConfig {
         // The canned fetcher never answers 304, so this changes nothing, but
         // the benchmark is a measurement of the loop and not of the sampler.
         audit_every: 0,
+        render: RenderPolicy::default(),
     }
 }
 

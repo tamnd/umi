@@ -21,6 +21,7 @@ use umi_types::{FetcherId, Revalidator, Tier};
 use crate::clock::{Clock, FixedClock};
 use crate::fetch::Fetch;
 use crate::page::PageRow;
+use crate::render::RenderPolicy;
 use crate::run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
 use crate::scope::Scope;
 
@@ -39,6 +40,10 @@ const PAST_MAX_REFRESH: u64 = 181 * 24 * 60 * 60 * 1000;
 pub(crate) struct Canned {
     pages: HashMap<String, Outcome>,
     asked: Mutex<Vec<String>>,
+    /// What this fetcher claims its browser pool can do, in pages a second.
+    /// `None` is a fetcher with no browser, which is every test but the ones
+    /// about doc 05.9's budget.
+    render: Option<f64>,
 }
 
 impl Canned {
@@ -56,6 +61,12 @@ impl Canned {
     pub(crate) fn robots(mut self, origin: &str, body: &str) -> Self {
         let url = format!("{origin}/robots.txt");
         self.pages.insert(url.clone(), ok_page(&url, body));
+        self
+    }
+
+    /// Claim a browser pool of `rate` pages a second, for doc 05.9's budget.
+    pub(crate) const fn renders(mut self, rate: f64) -> Self {
+        self.render = Some(rate);
         self
     }
 
@@ -91,6 +102,10 @@ impl Fetch for Canned {
             status: Some(404),
             retry_after: None,
         }))
+    }
+
+    fn render_capacity(&self) -> Option<f64> {
+        self.render
     }
 }
 
@@ -376,6 +391,7 @@ fn config() -> CrawlConfig {
         // canned fetcher has no way to tell the two apart, so the tests that
         // want it turn it on themselves.
         audit_every: 0,
+        render: RenderPolicy::default(),
     }
 }
 
@@ -1718,4 +1734,196 @@ async fn a_validator_outlives_the_process() {
     assert_eq!(report.not_modified, 1, "the etag did not survive the store");
     assert_eq!(report.rows, 0);
     assert_eq!(fetch.conditional(), vec![true]);
+}
+
+/// Put every host of these urls where doc 05.8 would put one that serves a
+/// client rendered shell: escalated to a browser and settled there.
+///
+/// `last_success` matches `preferred` so the ladder is not due one of doc
+/// 05.8's probes back down, which would lease at T1 and make these tests about
+/// something else.
+async fn wants_rendering(state: &Arc<dyn State>, urls: &[&str]) {
+    let mut hosts = Vec::new();
+    for url in urls {
+        let key = umi_types::RowKey::for_url(url, None).expect("a crawlable url");
+        let mut host = umi_state::HostRow::new(key.host, key.pld);
+        host.tier.preferred = Tier::Rendered;
+        host.tier.last_success = Tier::Rendered;
+        host.tier.max = Tier::Rendered;
+        hosts.push(host);
+    }
+    state.put_host(&hosts).await.expect("put_host");
+}
+
+/// A crawler that will run T3 and knows what its browser can do.
+fn with_browser(
+    fetch: Canned,
+    state: Arc<dyn State>,
+    clock: &Arc<FixedClock>,
+) -> Crawler<Arc<Canned>, Arc<FixedClock>> {
+    Crawler::new(
+        Arc::new(fetch),
+        state,
+        Arc::clone(clock),
+        CrawlConfig {
+            max_tier: Tier::Rendered,
+            // Everything gated before anything is fetched, so the budget's
+            // answers do not depend on which fetch finished first.
+            in_flight: 64,
+            ..config()
+        },
+    )
+}
+
+#[tokio::test]
+async fn rendering_past_the_budget_is_deferred_and_not_fetched() {
+    // Doc 05.9. Eight hosts have escalated to a browser and the browser can do
+    // one page a second, which with the default five second window is six of
+    // them. The other two do not fail, are not fetched at a cheaper tier and do
+    // not become rows. They go back where they came from.
+    let urls: Vec<String> = (0..8).map(|n| format!("https://s{n}.example/a")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    wants_rendering(&state, &refs).await;
+
+    let mut fetch = Canned::new().renders(1.0);
+    for (n, url) in urls.iter().enumerate() {
+        fetch = fetch
+            .robots(
+                &format!("https://s{n}.example"),
+                "User-agent: *\nAllow: /\n",
+            )
+            .html(url, &page("A", &[]));
+    }
+
+    let clock = Arc::new(FixedClock::at(T0));
+    let crawler = with_browser(fetch, Arc::clone(&state), &clock);
+    let sink = Collected::default();
+
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.leased, 8);
+    assert_eq!(
+        report.rendered, 6,
+        "the budget let the wrong number through"
+    );
+    assert_eq!(report.deferred, 2);
+    assert_eq!(report.fetched, 6);
+    assert_eq!(report.rows, 6, "a deferred page produced a row");
+    assert_eq!(sink.rows().len(), 6);
+    assert_eq!(crawler.render().granted(), 6);
+    assert_eq!(crawler.render().deferred(), 2);
+
+    // And the two are still there, at the due time they always had, rather
+    // than waiting out a lease or a failure backoff. That is the deferred
+    // queue: the frontier already orders by priority and already survives a
+    // restart, so it is a better queue than one held here would be.
+    let again = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(again.leased, 2, "the deferred pages did not come back");
+    assert_eq!(again.rendered, 2);
+    assert_eq!(again.deferred, 0);
+}
+
+#[tokio::test]
+async fn a_fleet_with_no_browser_at_all_fetches_the_page_anyway() {
+    // The failure this is really about is a spin. A deferred lease keeps its
+    // due time, so if a machine with no browser deferred every page that wants
+    // one, the next tick would lease the same pages, defer them again, and do
+    // that for the week until doc 05.8 probes the host back down. Meanwhile
+    // nothing else gets leased.
+    //
+    // So a missing browser behaves like a missing T2: the page goes out at the
+    // rung the ladder has. The answer is probably a shell, which is a worse row
+    // than a rendered one and a much better outcome than a crawl that stopped.
+    let url = "https://example.com/a";
+    let state = seeded(&[url]).await;
+    wants_rendering(&state, &[url]).await;
+
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html(url, &page("A", &[]));
+    let clock = Arc::new(FixedClock::at(T0));
+    let crawler = with_browser(fetch, Arc::clone(&state), &clock);
+    let sink = Collected::default();
+
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.leased, 1);
+    assert_eq!(report.deferred, 0, "there is no queue worth waiting in");
+    assert_eq!(report.rendered, 0, "nothing rendered, because nothing can");
+    assert_eq!(report.rows, 1);
+    assert!(
+        crawler.fetcher().asked().contains(&url.to_owned()),
+        "the page never went out"
+    );
+    assert_eq!(crawler.render().deferred(), 0);
+    assert_eq!(crawler.render().granted(), 0);
+
+    // And the tick after it has nothing left, rather than the same page again.
+    let again = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(again.leased, 0, "the same page came back around");
+}
+
+#[tokio::test]
+async fn a_page_deferred_for_a_busy_browser_is_not_a_failure() {
+    // The other half of the deferral: a url that came back as failed would take
+    // a backoff and count against the host, and nothing about a busy browser is
+    // the host's doing.
+    let urls: Vec<String> = (0..2).map(|n| format!("https://s{n}.example/a")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    wants_rendering(&state, &refs).await;
+
+    let mut fetch = Canned::new().renders(1.0);
+    for url in &refs {
+        let origin = url.trim_end_matches("/a");
+        fetch = fetch
+            .robots(origin, "User-agent: *\nAllow: /\n")
+            .html(url, &page("A", &[]));
+    }
+    let clock = Arc::new(FixedClock::at(T0));
+    let crawler = with_browser(fetch, Arc::clone(&state), &clock);
+    let sink = Collected::default();
+
+    // One slot a second and a five second wait, so the second page is inside
+    // the wait and both go through. Making the second one defer needs a tick
+    // wider than the wait, which the budget test covers directly.
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.leased, 2);
+    assert_eq!(report.rendered, 2);
+    for url in &refs {
+        let host = umi_types::RowKey::for_url(url, None)
+            .expect("a crawlable url")
+            .host;
+        let row = state.host(host).await.expect("host").expect("a record");
+        assert_eq!(row.consecutive_failures, 0);
+        assert_eq!(row.tier.preferred, Tier::Rendered, "the ladder moved");
+    }
+}
+
+#[tokio::test]
+async fn the_budget_only_holds_back_the_tier_it_is_for() {
+    // A crawl with no browser at all still runs, at full speed, and the budget
+    // is not in the path of a T1 page. This is the case that matters for the
+    // 250 pages a second gate: doc 05.9 rations one percent of the crawl and
+    // must cost the other 99 percent nothing.
+    let urls: Vec<String> = (0..4).map(|n| format!("https://s{n}.example/a")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+
+    let mut fetch = Canned::new();
+    for (n, url) in urls.iter().enumerate() {
+        fetch = fetch
+            .robots(
+                &format!("https://s{n}.example"),
+                "User-agent: *\nAllow: /\n",
+            )
+            .html(url, &page("A", &[]));
+    }
+
+    let clock = Arc::new(FixedClock::at(T0));
+    let crawler = with_browser(fetch, Arc::clone(&state), &clock);
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.fetched, 4);
+    assert_eq!(report.deferred, 0);
+    assert_eq!(report.rendered, 0);
+    assert_eq!(report.emulated, 0);
 }
