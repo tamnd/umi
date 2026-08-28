@@ -736,7 +736,12 @@ pub struct EvictReport {
     pub evicted: u32,
     /// Asked for but not resident, which is not an error.
     pub not_resident: u32,
-    /// Kept because the domain still has leases in flight.
+    /// Kept rather than dropped.
+    ///
+    /// Two reasons end up here. A domain with leases in flight is kept because
+    /// evicting it would strand the completions. And a backend with no cold
+    /// tier keeps everything, because there is nowhere to have put the shard
+    /// and the local copy is the only copy.
     pub in_use: u32,
     /// Bytes written to cold storage in the process.
     pub bytes_written: u64,

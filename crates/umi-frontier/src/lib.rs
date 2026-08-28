@@ -300,9 +300,9 @@ impl<S: State> Frontier<S> {
             })
             .collect();
 
-        // Every domain we admit to becomes schedulable, which is what keeps
-        // the loop working against a backend that does not shard and so has
-        // nothing to report through `resident`.
+        // Every domain we admit to becomes schedulable here rather than at the
+        // next `resume`, so a seed is leasable on the tick after it lands
+        // instead of on the next restart.
         {
             let mut gate = self.gate();
             for key in &keys {
@@ -362,10 +362,10 @@ impl<S: State> Frontier<S> {
     /// running one. Calling it again on a live frontier is safe and is what
     /// [`evict`](Self::evict) does.
     ///
-    /// A backend that does not shard reports nothing through
-    /// [`State::resident`], and taking that as "no domains" would empty the
-    /// schedule, so an empty answer leaves the gate alone. The frontier learns
-    /// those domains from [`discover`](Self::discover) instead.
+    /// An empty answer leaves the gate alone rather than emptying it. A store
+    /// with nothing in it has nothing to schedule either way, so the two
+    /// readings agree on the only case that reaches here, and leaving the gate
+    /// alone is the safe one to be wrong about.
     ///
     /// Returns how many domains are being scheduled afterwards.
     ///
@@ -408,8 +408,8 @@ impl<S: State> Frontier<S> {
         let resident = self.state.resident().await?;
         let mut gate = self.gate();
         if resident.is_empty() {
-            // Either nothing is resident or the backend does not shard. Both
-            // want the same thing: forget what was asked for and keep the rest.
+            // The store came back empty, so there is nothing left to schedule
+            // and forgetting what was asked for is the whole job.
             for pld in plds {
                 gate.forget(*pld);
             }

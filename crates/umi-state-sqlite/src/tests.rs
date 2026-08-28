@@ -363,6 +363,36 @@ async fn the_lease_query_walks_the_index() {
     );
 }
 
+#[tokio::test]
+async fn listing_the_domains_seeks_between_them_instead_of_reading_the_urls() {
+    // Same trap as the lease query and the same reason a correctness test misses
+    // it. `SELECT DISTINCT pld FROM ledger` returns the identical answer and
+    // reads every url to get there, which costs whatever the crawl has grown to
+    // rather than whatever it is spread over. The plan is the only place the
+    // difference shows up before it is a problem in production.
+    let (_dir, state) = on_disk();
+    let guard = state.lock();
+    let mut stmt = guard
+        .conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {}", sql::SELECT_RESIDENT))
+        .expect("the resident query parses");
+    let plan: Vec<String> = stmt
+        .query_map([], |row| row.get::<_, String>("detail"))
+        .expect("a plan")
+        .collect::<rusqlite::Result<_>>()
+        .expect("a plan");
+    let plan = plan.join("\n");
+
+    assert!(
+        plan.contains("SEARCH ledger USING PRIMARY KEY (pld>?)"),
+        "listing the domains is not seeking past each one:\n{plan}"
+    );
+    assert!(
+        !plan.contains("SCAN ledger"),
+        "listing the domains is reading the whole ledger:\n{plan}"
+    );
+}
+
 #[test]
 fn the_index_and_the_query_agree_on_what_is_schedulable() {
     // Both are built from the same macro, so this cannot fail as written. It is

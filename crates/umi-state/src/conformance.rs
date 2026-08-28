@@ -201,6 +201,7 @@ where
     run!(warming_a_domain_the_store_has_never_seen_is_not_an_error);
     run!(evicting_a_domain_that_is_not_resident_is_not_an_error);
     run!(resident_is_sorted_and_free_of_duplicates);
+    run!(a_domain_the_store_holds_a_url_for_is_local);
     run!(stats_account_for_what_was_admitted);
     run!(checkpoint_sequence_is_monotonic);
     run!(a_checkpoint_names_the_canonicalisation_its_keys_are_under);
@@ -1330,6 +1331,31 @@ async fn resident_is_sorted_and_free_of_duplicates(state: &dyn State) -> Outcome
         resident.windows(2).all(|pair| pair[0] < pair[1]),
         "resident is not sorted, or repeats a domain: {resident:?}"
     );
+    Ok(())
+}
+
+async fn a_domain_the_store_holds_a_url_for_is_local(state: &dyn State) -> Outcome {
+    // Doc 09.8 rebuilds the domain rate limits from `resident` when a
+    // coordinator comes back up. A store that admits a URL and then does not
+    // count its domain as local reads as an empty schedule after a restart, and
+    // the crawl resumes into leasing nothing at all, which is not a failure any
+    // caller can see from the outside.
+    let urls: Vec<String> = (0..4)
+        .map(|n| format!("https://local{n}.example/a"))
+        .collect();
+    admit_all(state, &urls).await?;
+
+    let resident = state
+        .resident()
+        .await
+        .map_err(|e| format!("resident failed: {e}"))?;
+    for url in &urls {
+        let pld = key(url).pld;
+        ensure!(
+            resident.contains(&pld),
+            "{url} was admitted and its domain is not local: {resident:?}"
+        );
+    }
     Ok(())
 }
 

@@ -17,6 +17,8 @@
 //!                branch calls it
 //! put_segment    durable, about 1000 a day         part 5
 //! segments       partial index, not a table scan   part 5
+//! resident       doc 09.8 rebuilds the domain      part 6
+//!                schedule from it at startup
 //! ```
 //!
 //! Part 4 is the one worth explaining. The crawl loop calls `stats` on every
@@ -95,12 +97,13 @@ fn main() {
         completing(&state, repeat).await;
         counting(&state, urls, repeat).await;
         segments(&state, history, repeat).await;
+        residency(repeat).await;
     });
 
     let bytes = std::fs::metadata(dir.path().join("state.umistate"))
         .map(|m| m.len())
         .unwrap_or(0);
-    println!("part 6: the file, doc 01 targets under 20 bytes a known url");
+    println!("part 7: the file, doc 01 targets under 20 bytes a known url");
     println!(
         "  {} urls, {} segment records, {:.1} MiB on disk, {:.1} B/url\n",
         urls,
@@ -355,6 +358,53 @@ fn at_rate(what: &str, each: f64) {
         each * 1e6,
         250.0 * each * 100.0
     );
+}
+
+/// Part 6. Doc 09.8's restart, which rebuilds the domain rate limits from
+/// [`State::resident`].
+///
+/// The thing being measured is the shape of the cost rather than the cost. A
+/// crawl gets deeper over its life without getting much wider, so an answer
+/// priced per url gets slower forever while an answer priced per domain settles.
+/// Both shapes below hold the same number of urls, so if the two rows are far
+/// apart the query is reading urls, and if they are close it is seeking between
+/// domains the way it is meant to.
+async fn residency(repeat: usize) {
+    println!("part 6: resident, doc 09.8's restart rebuilds the schedule from this");
+    println!(
+        "  {:<24} {:>12} {:>14} {:>16}",
+        "", "domains", "ms per call", "us per domain"
+    );
+
+    // 100000 urls each way. Wide is a crawl that has just been seeded from a
+    // domain list and gone one hop; deep is the same crawl a month later.
+    for (label, domains, per_domain) in [("wide", 50_000usize, 2usize), ("deep", 50, 2000)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let state = SqliteState::open(dir.path().join("state.umistate")).expect("a store");
+        let all: Vec<String> = (0..domains * per_domain)
+            .map(|n| format!("https://www.d{}.example/p/{n}", n % domains))
+            .collect();
+        for batch in all.chunks(BATCH) {
+            let candidates: Vec<Candidate<'_>> = batch.iter().map(|u| candidate(u)).collect();
+            state.admit(&candidates).await.expect("admit");
+        }
+
+        let mut best = f64::MAX;
+        let mut found = 0;
+        for _ in 0..repeat {
+            let start = Instant::now();
+            let resident = state.resident().await.expect("resident");
+            best = best.min(start.elapsed().as_secs_f64());
+            found = resident.len();
+        }
+        assert_eq!(found, domains, "every admitted domain is local");
+        println!(
+            "  {label:<24} {found:>12} {:>14.2} {:>16.2}",
+            best * 1000.0,
+            best * 1e6 / found as f64
+        );
+    }
+    println!();
 }
 
 fn url(n: usize) -> String {
