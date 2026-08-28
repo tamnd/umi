@@ -128,6 +128,66 @@ impl Fetch for Timed {
     }
 }
 
+/// A fetcher that blocks one URL until it is told to stop.
+///
+/// Doc 05.8's de-escalation cannot be written against a map of canned answers,
+/// because the whole of it is an origin that behaved one way and then behaved
+/// another. This serves a block for `url` until [`Flip::relent`] is called and
+/// leaves everything else, robots.txt included, to the inner fetcher.
+struct Flip {
+    inner: Canned,
+    url: String,
+    blocking: std::sync::atomic::AtomicBool,
+}
+
+impl Flip {
+    fn new(url: &str, inner: Canned) -> Self {
+        Self {
+            inner,
+            url: url.to_owned(),
+            blocking: std::sync::atomic::AtomicBool::new(true),
+        }
+    }
+
+    /// Serve the real page from now on.
+    fn relent(&self) {
+        self.blocking
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[async_trait::async_trait]
+impl Fetch for Flip {
+    async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+    ) -> Result<Outcome, FetchError> {
+        if url == self.url && self.blocking.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(blocked());
+        }
+        self.inner.fetch(url, revalidate).await
+    }
+}
+
+/// What doc 05.8 calls a block signal, as the fetcher reports one.
+fn blocked() -> Outcome {
+    Outcome::Failed {
+        failure: umi_fetch::Failure::Blocked,
+        status: Some(403),
+        retry_after: None,
+    }
+}
+
+/// A challenge page: a 200, a vendor marker and almost no text.
+fn interstitial() -> String {
+    "<html><head><title>Just a moment...</title></head><body>\
+     <div id='cf-browser-verification'></div>\
+     <p>Checking your browser before accessing example.com.</p>\
+     </body></html>"
+        .to_owned()
+}
+
 fn ok_page(url: &str, body: &str) -> Outcome {
     let bytes = Bytes::from(body.as_bytes().to_vec());
     Outcome::Ok(Box::new(Page {
@@ -260,6 +320,8 @@ async fn drain<F: Fetch>(
         total.disallowed += report.disallowed;
         total.links_seen += report.links_seen;
         total.links_admitted += report.links_admitted;
+        total.challenged += report.challenged;
+        total.learned += report.learned;
         clock.advance(2000);
     }
     panic!("the crawl did not drain in 64 ticks: {total:?}");
@@ -1037,4 +1099,151 @@ async fn a_page_that_came_back_quickly_counts_towards_the_fast_floor() {
         umi_state::HostRow::DEFAULT_FLOOR_MS,
         "one fast answer does not earn the lower floor"
     );
+}
+
+#[tokio::test]
+async fn a_challenge_page_is_not_counted_as_a_fetch() {
+    // Doc 05.8's first rule, and the one that is easy to get wrong quietly. A
+    // challenge page is a 200 with a body on it, so every part of the loop
+    // downstream of the fetcher is happy to treat it as a page, and a crawl
+    // that stores a few million of them looks like a crawl that is working.
+    let state = seeded(&["https://example.com/a"]).await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/a", &interstitial());
+    let crawler = crawler(fetch, Arc::clone(&state));
+    let sink = Collected::default();
+
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.challenged, 1);
+    assert_eq!(report.fetched, 0, "a wall is not a page");
+    assert_eq!(report.rows, 0);
+    assert!(sink.rows().is_empty(), "a challenge page reached the sink");
+
+    // And the host heard about it. One block is enough to move the ladder,
+    // because waiting for a second one means fetching a second wall.
+    assert_eq!(report.learned, 1);
+    let host = umi_types::RowKey::for_url("https://example.com/a", None)
+        .expect("a crawlable url")
+        .host;
+    let row = state.host(host).await.expect("host").expect("a record");
+    assert_eq!(row.tier.preferred, Tier::Emulated);
+    assert_eq!(row.tier.consecutive_blocks, 1);
+}
+
+#[tokio::test]
+async fn an_origin_that_stops_blocking_is_probed_back_down() {
+    // The other half of the ladder, and the half that costs money if it is
+    // missing: an origin that blocked us once in a bad week is otherwise on
+    // the expensive tier forever.
+    let state = seeded(&["https://example.com/a"]).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Flip::new(
+        "https://example.com/a",
+        Canned::new()
+            .robots("https://example.com", "User-agent: *\nAllow: /\n")
+            .html("https://example.com/a", &page("A", &[])),
+    ));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        Arc::clone(&state),
+        Arc::clone(&clock),
+        config(),
+    );
+    let sink = Collected::default();
+
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.learned, 1);
+
+    let host = umi_types::RowKey::for_url("https://example.com/a", None)
+        .expect("a crawlable url")
+        .host;
+    let row = state.host(host).await.expect("host").expect("a record");
+    assert_eq!(row.tier.preferred, Tier::Emulated);
+    assert_eq!(
+        row.next_allowed_ms,
+        T0 + umi_state::TierPolicy::BACKOFF_MS[0],
+        "a block backs the host off, not just the url"
+    );
+
+    // This fetcher runs T1 and the host now wants T2, so there is nothing here
+    // for it. That is the state a host would be stuck in forever if the probe
+    // were a sweep over hosts nobody leases.
+    clock.advance(2 * umi_state::TierPolicy::BACKOFF_MS[0]);
+    let idle = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(idle.leased, 0, "a T2 host was offered to a T1 fetcher");
+
+    // A week later the origin has stopped blocking and the probe finds out.
+    fetch.relent();
+    clock.advance(umi_state::TierPolicy::PROBE_EVERY_MS);
+    let probe = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(probe.leased, 1, "the weekly probe never came");
+    assert_eq!(probe.fetched, 1);
+    assert_eq!(probe.learned, 1);
+
+    let row = state.host(host).await.expect("host").expect("a record");
+    assert_eq!(row.tier.preferred, Tier::Plain, "the host stayed escalated");
+    assert_eq!(row.tier.consecutive_blocks, 0);
+
+    // Two rows and not one. An honest 403 is an answer and keeps its row, and
+    // only the 200 that was really a wall is thrown away.
+    let rows = sink.rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].outcome, umi_types::OutcomeCode::Blocked);
+    assert_eq!(rows[1].outcome, umi_types::OutcomeCode::Ok);
+}
+
+#[tokio::test]
+async fn a_learned_tier_outlives_the_process() {
+    // Learning a host takes a blocked fetch to find out, so a ladder that is
+    // rebuilt from nothing on every start is a ladder that is paid for again
+    // every start. This is the sqlite backend rather than the memory one for
+    // exactly that reason.
+    let dir = tempfile::TempDir::new().expect("a temp directory");
+    let path = dir.path().join("state.umistate");
+    let url = "https://example.com/a";
+    let host = umi_types::RowKey::for_url(url, None)
+        .expect("a crawlable url")
+        .host;
+
+    {
+        let state: Arc<dyn State> =
+            Arc::new(umi_state_sqlite::SqliteState::open(&path).expect("a new store"));
+        let mut seed = Candidate::new(url, T0).expect("a crawlable url");
+        seed.discovery = umi_state::Discovery::Seed;
+        state.admit(&[seed]).await.expect("admit");
+
+        let fetch = Canned::new()
+            .robots("https://example.com", "User-agent: *\nAllow: /\n")
+            .outcome(url, blocked());
+        let crawler = crawler(fetch, Arc::clone(&state));
+        let report = crawler.tick(&Collected::default()).await.expect("tick");
+        assert_eq!(report.learned, 1);
+    }
+
+    let state = umi_state_sqlite::SqliteState::open(&path).expect("the same store again");
+    let row = state.host(host).await.expect("host").expect("a record");
+    assert_eq!(row.tier.preferred, Tier::Emulated);
+    assert_eq!(row.tier.max, umi_state::TierPolicy::CEILING);
+    assert_eq!(row.tier.consecutive_blocks, 1);
+
+    // Persisting the number is not the point. Acting on it is, and the store
+    // is what acts on it: the same url is invisible to a T1 fetcher and there
+    // for a T2 one, on a process that never saw the block.
+    let later = T0 + 10 * umi_state::TierPolicy::BACKOFF_MS[0];
+    let plain = umi_state::LeaseRequest::new(FetcherId::LOCAL, later, 4);
+    assert!(
+        state.lease(&plain).await.expect("lease").is_empty(),
+        "an escalated host was offered to a T1 fetcher after a restart"
+    );
+
+    let browser = umi_state::LeaseRequest {
+        max_tier: Tier::Emulated,
+        ..plain
+    };
+    let leases = state.lease(&browser).await.expect("lease");
+    assert_eq!(leases.len(), 1);
+    assert_eq!(leases[0].tier, Tier::Emulated);
+    assert!(!leases[0].probe, "a fresh escalation is not a probe");
 }

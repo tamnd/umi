@@ -78,7 +78,7 @@ pub fn from_ms(ms: i64) -> u64 {
     u64::try_from(ms).unwrap_or(0)
 }
 
-fn tier(row: &Row<'_>, column: &str) -> rusqlite::Result<Tier> {
+pub(crate) fn tier(row: &Row<'_>, column: &str) -> rusqlite::Result<Tier> {
     let raw: i64 = row.get(column)?;
     u8::try_from(raw)
         .ok()

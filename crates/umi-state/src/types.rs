@@ -10,7 +10,7 @@
 
 use std::time::Duration;
 
-use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
+use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, TierSignal, Ulid, UrlKeyFull};
 
 use crate::freshness::Budget;
 use crate::pace::Pace;
@@ -255,6 +255,15 @@ pub struct Lease {
     /// The tier to start at, from the host's policy in doc 05.8. Never above
     /// the request's `max_tier`.
     pub tier: Tier,
+    /// Whether this lease is doc 05.8's weekly probe at a cheaper tier.
+    ///
+    /// The caller needs it because a success at `tier` means two different
+    /// things: on an ordinary lease it confirms what we already believed, and
+    /// on a probe it is the evidence that brings an escalated host back down.
+    /// Without the flag the loop would have to read the host record after
+    /// every fetch to find out which it was, and that is a lookup per page to
+    /// answer a question whose answer is no for essentially every page.
+    pub probe: bool,
     /// The earliest the fetcher may send the request, from the host's
     /// politeness timer. Usually now, but a batch covering one host carries
     /// staggered times.
@@ -671,7 +680,7 @@ pub struct RobotsRef {
 }
 
 /// The per host tier ladder state from doc 05.8.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TierPolicy {
     /// Where a fetch starts.
     pub preferred: Tier,
@@ -698,13 +707,39 @@ pub struct TierPolicy {
 }
 
 impl TierPolicy {
+    /// Where the ladder stops for a host nobody has learned anything about.
+    ///
+    /// Doc 05.8: T2 for the public crawl. T3 needs evidence, which is a body
+    /// that turned out to be an application shell, and T4 needs an allowlist
+    /// entry and is never reached by learning.
+    pub const CEILING: Tier = Tier::Emulated;
+
+    /// How long an escalated host waits before it is offered its cheaper tier
+    /// again. Doc 05.8 says every 7 days.
+    pub const PROBE_EVERY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+    /// The gap after each consecutive block, in milliseconds. Doc 05.8: one
+    /// minute, five, twenty five, two hours, twelve hours, then daily.
+    pub const BACKOFF_MS: [u64; 5] = [60_000, 300_000, 1_500_000, 7_200_000, 43_200_000];
+
+    /// The gap once the ladder above has run out, which is a daily probe.
+    pub const BACKOFF_FLOOR_MS: u64 = 24 * 60 * 60 * 1000;
+
+    /// Consecutive blocks that mean the host is refusing us outright.
+    ///
+    /// Doc 05.8 says 30 consecutive days at the ceiling. The first five blocks
+    /// cover about fifteen hours between them and every one after that is a
+    /// daily probe, so 35 is thirty days of them, give or take the half day
+    /// the ladder spends getting there.
+    pub const REFUSING_AFTER_BLOCKS: u16 = 35;
+
     /// The ladder a host starts on: plain, escalating no further than
     /// emulated without evidence.
     #[must_use]
     pub const fn new() -> Self {
         Self {
             preferred: Tier::Plain,
-            max: Tier::Emulated,
+            max: Self::CEILING,
             last_success: Tier::Plain,
             consecutive_blocks: 0,
             last_probe_down_ms: 0,
@@ -714,18 +749,137 @@ impl TierPolicy {
         }
     }
 
+    /// Whether the next fetch of this host is a probe at the cheaper tier.
+    ///
+    /// De-escalation is the half of doc 05.8 that gets forgotten, and this is
+    /// where it happens. A host that needed a browser during an incident and
+    /// gets one forever afterwards is how a browser pool fills up with pages
+    /// that would answer a plain GET, so the decay has to be automatic and it
+    /// has to happen without anybody deciding to run it.
+    ///
+    /// Expressed as a question the scheduler asks rather than as a sweep over
+    /// the host table, because a sweep needs an index, a cursor and something
+    /// to run it, and this needs a comparison. A host nothing ever leases
+    /// never probes, and a host nothing ever leases is not costing us a
+    /// browser either.
+    #[must_use]
+    pub fn probing(&self, now_ms: u64) -> bool {
+        self.preferred > self.last_success
+            && now_ms >= self.last_probe_down_ms.saturating_add(Self::PROBE_EVERY_MS)
+    }
+
+    /// The tier to start a fetch at, before the fetcher's own ceiling.
+    #[must_use]
+    pub fn wants(&self, now_ms: u64) -> Tier {
+        let start = if self.probing(now_ms) {
+            self.last_success
+        } else {
+            self.preferred
+        };
+        start.min(self.max)
+    }
+
     /// The tier to start a fetch at, given what the fetcher can run.
     #[must_use]
-    pub fn start_at(&self, fetcher_max: Tier) -> Tier {
-        self.preferred.min(self.max).min(fetcher_max)
+    pub fn start_at(&self, fetcher_max: Tier, now_ms: u64) -> Tier {
+        self.wants(now_ms).min(fetcher_max)
     }
 
     /// Whether this host is worth offering to a fetcher limited to
     /// `fetcher_max`. A host that only answers above what the fetcher can do
     /// is a wasted lease.
     #[must_use]
-    pub fn reachable_by(&self, fetcher_max: Tier) -> bool {
-        self.preferred.min(self.max) <= fetcher_max
+    pub fn reachable_by(&self, fetcher_max: Tier, now_ms: u64) -> bool {
+        self.wants(now_ms) <= fetcher_max
+    }
+
+    /// How long to leave this host alone after the blocks it has had.
+    ///
+    /// Zero when it is not blocking us, which is the answer for almost every
+    /// host almost all of the time.
+    #[must_use]
+    pub fn backoff_ms(&self) -> u64 {
+        match self.consecutive_blocks {
+            0 => 0,
+            n => Self::BACKOFF_MS
+                .get(usize::from(n) - 1)
+                .copied()
+                .unwrap_or(Self::BACKOFF_FLOOR_MS),
+        }
+    }
+
+    /// Whether the host has spent long enough refusing us to be dropped from
+    /// the frontier. Doc 05.8, and it is only ever true at the ceiling.
+    #[must_use]
+    pub fn refusing(&self) -> bool {
+        self.consecutive_blocks >= Self::REFUSING_AFTER_BLOCKS && self.preferred >= self.max
+    }
+
+    /// Learn from one answer, and say whether anything moved.
+    ///
+    /// `tier_used` is the tier the fetch actually ran at, which is not always
+    /// [`preferred`](Self::preferred): it is the probe tier when this fetch
+    /// was probing, and it is the fetcher's ceiling when the fetcher cannot
+    /// run what the host wants.
+    ///
+    /// The return value is what keeps this off the hot path. A host answering
+    /// normally at the tier it always answers at learns nothing, returns
+    /// false, and is never written back, so the ladder costs a healthy crawl
+    /// nothing at all.
+    pub fn observe(&mut self, signal: TierSignal, tier_used: Tier, now_ms: u64) -> bool {
+        let before = *self;
+        match signal {
+            TierSignal::Success => {
+                self.consecutive_blocks = 0;
+                self.last_success = tier_used;
+                // A fetch that succeeded below what the host is set to is the
+                // probe coming back clean, so the host comes down to it. This
+                // is the whole of de-escalation and it is two lines, which is
+                // probably why it gets left out.
+                if tier_used < self.preferred {
+                    self.preferred = tier_used;
+                    self.last_probe_down_ms = now_ms;
+                }
+            }
+            TierSignal::Blocked => {
+                self.consecutive_blocks = self.consecutive_blocks.saturating_add(1);
+                // Whether it went up or was already at the ceiling, the clock
+                // on the next probe starts again here. Otherwise a host that
+                // has been blocking for eight days would be probed on every
+                // fetch rather than once a week.
+                self.last_probe_down_ms = now_ms;
+                if let Some(up) = self.preferred.escalate() {
+                    self.preferred = up.min(self.max);
+                }
+            }
+            // Doc 05.8 asks for the ceiling to rise to T3 only once a T3 fetch
+            // has produced meaningfully more text than T1 did. There is no T3
+            // fetcher yet, so waiting for that confirmation would mean the
+            // flag is set, the ceiling never moves, and nothing is ever
+            // rendered. The ceiling rises on the shell signal instead, and the
+            // weekly probe above is what stops that being permanent: a host
+            // that only looked like a shell during a redesign is back on T1
+            // inside a week without anybody noticing.
+            TierSignal::Shell => {
+                self.render_required = true;
+                self.preferred = Tier::Rendered;
+                self.max = self.max.max(Tier::Rendered);
+                self.last_probe_down_ms = now_ms;
+            }
+        }
+        *self != before
+    }
+}
+
+impl Default for TierPolicy {
+    /// The same as [`TierPolicy::new`].
+    ///
+    /// Spelled out rather than derived, because the derived one puts the
+    /// ceiling at [`Tier::Plain`], and a ceiling of T1 is a ladder with no
+    /// rungs on it. Doc 05.8 says T2, and a host record built by
+    /// [`HostRow::new`] has to agree with one built by hand.
+    fn default() -> Self {
+        Self::new()
     }
 }
 

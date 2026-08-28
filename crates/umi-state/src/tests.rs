@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::memory::{content_hash, host_row, key_of};
-use umi_types::{FetcherId, PldId, Tier};
+use umi_types::{FetcherId, PldId, Tier, TierSignal};
 
 const T0: u64 = 1_700_000_000_000;
 const HOUR: u64 = 60 * 60 * 1000;
@@ -312,15 +312,103 @@ fn a_hosts_delay_is_the_larger_of_the_two_it_has() {
 #[test]
 fn a_tier_policy_starts_where_all_three_ceilings_allow() {
     let mut policy = TierPolicy::new();
-    assert_eq!(policy.start_at(Tier::Rendered), Tier::Plain);
+    assert_eq!(policy.start_at(Tier::Rendered, T0), Tier::Plain);
     // A host that has escalated is still held down by what the fetcher can
     // actually run, which is what stops a T3 host being handed to a plain HTTP
     // fetcher that will only get a challenge page back.
     policy.preferred = Tier::Rendered;
     policy.max = Tier::Rendered;
-    assert_eq!(policy.start_at(Tier::Plain), Tier::Plain);
-    assert!(!policy.reachable_by(Tier::Plain));
-    assert!(policy.reachable_by(Tier::Rendered));
+    policy.last_probe_down_ms = T0;
+    assert_eq!(policy.start_at(Tier::Plain, T0), Tier::Plain);
+    assert!(!policy.reachable_by(Tier::Plain, T0));
+    assert!(policy.reachable_by(Tier::Rendered, T0));
+}
+
+#[test]
+fn a_host_that_starts_blocking_climbs_the_ladder_and_stops_at_its_ceiling() {
+    let mut policy = TierPolicy::new();
+    assert!(policy.observe(TierSignal::Blocked, Tier::Plain, T0));
+    assert_eq!(policy.preferred, Tier::Emulated);
+    assert_eq!(policy.consecutive_blocks, 1);
+    assert_eq!(policy.backoff_ms(), 60_000);
+
+    // The ceiling is T2 without evidence, so more blocks buy more backoff and
+    // no more tiers. A crawler that answered every block with a browser would
+    // spend its whole browser pool on sites that have said no.
+    assert!(policy.observe(TierSignal::Blocked, Tier::Emulated, T0 + HOUR));
+    assert_eq!(policy.preferred, Tier::Emulated);
+    assert_eq!(policy.backoff_ms(), 300_000);
+    assert!(!policy.refusing());
+
+    // Doc 05.8's thirty days of daily probes.
+    for n in 3..=TierPolicy::REFUSING_AFTER_BLOCKS {
+        policy.observe(TierSignal::Blocked, Tier::Emulated, T0 + DAY * u64::from(n));
+    }
+    assert_eq!(policy.backoff_ms(), TierPolicy::BACKOFF_FLOOR_MS);
+    assert!(policy.refusing());
+}
+
+#[test]
+fn an_escalated_host_is_probed_back_down_and_a_clean_probe_sticks() {
+    let mut policy = TierPolicy::new();
+    policy.observe(TierSignal::Blocked, Tier::Plain, T0);
+    assert_eq!(policy.wants(T0), Tier::Emulated);
+
+    // Six days later it is still T2, because a probe a day would be a probe
+    // that costs as much as the thing it is avoiding.
+    assert!(!policy.probing(T0 + 6 * DAY));
+    assert_eq!(policy.wants(T0 + 6 * DAY), Tier::Emulated);
+
+    // A week later it is offered T1 again, once.
+    let week = T0 + TierPolicy::PROBE_EVERY_MS;
+    assert!(policy.probing(week));
+    assert_eq!(policy.wants(week), Tier::Plain);
+
+    // And the probe comes back clean, so the host stays on T1.
+    assert!(policy.observe(TierSignal::Success, Tier::Plain, week));
+    assert_eq!(policy.preferred, Tier::Plain);
+    assert_eq!(policy.consecutive_blocks, 0);
+    assert!(!policy.probing(week + TierPolicy::PROBE_EVERY_MS));
+}
+
+#[test]
+fn a_probe_that_is_blocked_again_goes_straight_back_up() {
+    let mut policy = TierPolicy::new();
+    policy.observe(TierSignal::Blocked, Tier::Plain, T0);
+    let week = T0 + TierPolicy::PROBE_EVERY_MS;
+    assert_eq!(policy.wants(week), Tier::Plain);
+
+    policy.observe(TierSignal::Blocked, Tier::Plain, week);
+    assert_eq!(policy.wants(week), Tier::Emulated);
+    // And the week starts again from the block, not from the last probe, so
+    // the next one is a week away rather than immediately.
+    assert!(!policy.probing(week + DAY));
+}
+
+#[test]
+fn a_shell_asks_for_a_browser_and_the_weekly_probe_takes_it_back() {
+    let mut policy = TierPolicy::new();
+    assert!(policy.observe(TierSignal::Shell, Tier::Plain, T0));
+    assert!(policy.render_required);
+    assert_eq!(policy.wants(T0), Tier::Rendered);
+
+    // A site that was a shell for a week and is a page again does not keep a
+    // browser to itself, which is the half of doc 05.8 that gets forgotten.
+    let week = T0 + TierPolicy::PROBE_EVERY_MS;
+    assert_eq!(policy.wants(week), Tier::Plain);
+    policy.observe(TierSignal::Success, Tier::Plain, week);
+    assert_eq!(policy.wants(week), Tier::Plain);
+}
+
+#[test]
+fn a_healthy_host_learns_nothing_and_is_never_written_back() {
+    // The return value is what keeps the ladder off the hot path, so it is
+    // worth a test of its own: an ordinary page from an ordinary host must
+    // not report a change, or the crawl loop writes a host record per page.
+    let mut policy = TierPolicy::new();
+    assert!(!policy.observe(TierSignal::Success, Tier::Plain, T0));
+    assert!(!policy.observe(TierSignal::Success, Tier::Plain, T0 + DAY));
+    assert_eq!(policy, TierPolicy::new());
 }
 
 #[test]

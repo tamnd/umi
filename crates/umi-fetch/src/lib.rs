@@ -58,6 +58,7 @@ use http::HeaderMap;
 use tokio::sync::Semaphore;
 use url::Url;
 
+pub mod challenge;
 pub mod date;
 pub mod headers;
 pub mod outcome;
@@ -313,15 +314,17 @@ impl Fetcher {
                 continue;
             }
 
-            if let Some(failure) = classify(status, &head) {
-                return match failure {
-                    None => Outcome::Gone,
-                    Some(failure) => Outcome::Failed {
+            let verdict = classify(status, &head);
+            match verdict {
+                Verdict::Page | Verdict::Suspect(_) => {}
+                Verdict::Gone => return Outcome::Gone,
+                Verdict::Failed(failure) => {
+                    return Outcome::Failed {
                         status: Some(status),
                         failure,
                         retry_after,
-                    },
-                };
+                    };
+                }
             }
 
             // Believing `Content-Length` is how a crawler gets talked into
@@ -346,6 +349,23 @@ impl Fetcher {
                     };
                 }
             };
+
+            // The suspect statuses come back here with their body in hand.
+            // An interstitial makes it a block, which doc 05.8 answers with a
+            // tier, and anything else is the plain failure the status already
+            // said it was.
+            if let Verdict::Suspect(fallback) = verdict {
+                let failure = if challenge::interstitial(&body).is_some() {
+                    Failure::Blocked
+                } else {
+                    fallback
+                };
+                return Outcome::Failed {
+                    status: Some(status),
+                    failure,
+                    retry_after,
+                };
+            }
 
             let head_bytes = &body[..body.len().min(sniff::SNIFF_BYTES)];
             return Outcome::Ok(Box::new(Page {
@@ -452,26 +472,43 @@ fn redirect_target(url: &Url, head: &HeaderMap, status: u16) -> Option<Url> {
         .filter(|target| matches!(target.scheme(), "http" | "https"))
 }
 
+/// What one status means, before the body has been read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    /// A success. Read the body, it is the page.
+    Page,
+    /// A 410, which is the one status that means never again.
+    Gone,
+    /// Settled on the headers alone.
+    Failed(Failure),
+    /// A refusal that might be a bot manager. Read the body to find out, and
+    /// fall back to this failure if it is an ordinary one.
+    Suspect(Failure),
+}
+
 /// What a status means, once it is not a redirect and not a 304.
-///
-/// `None` means the body is worth reading. `Some(None)` is the one status that
-/// means never again. `Some(Some(failure))` is everything else.
-fn classify(status: u16, head: &HeaderMap) -> Option<Option<Failure>> {
+fn classify(status: u16, head: &HeaderMap) -> Verdict {
     if (200..300).contains(&status) {
-        return None;
+        return Verdict::Page;
     }
     let marked = block_marker(head).is_some();
-    let failure = match status {
-        410 => return Some(None),
-        403 | 503 if marked => Failure::Blocked,
-        429 if marked => Failure::Blocked,
-        429 => Failure::RateLimited,
-        400..500 => Failure::NotFound,
-        500..600 => Failure::ServerError,
+    match status {
+        410 => Verdict::Gone,
+        403 | 429 | 503 if marked => Verdict::Failed(Failure::Blocked),
+        // Doc 05.8's four way split. A 403 from an origin that does not want
+        // us is a dead url and a 403 from something in front of it is a tier
+        // problem, and the only thing that tells them apart is the page. The
+        // body of a refusal is small and refusals are rare, so this is a read
+        // we can afford on the three statuses that carry a wall and on no
+        // others.
+        403 => Verdict::Suspect(Failure::NotFound),
+        429 => Verdict::Suspect(Failure::RateLimited),
+        503 => Verdict::Suspect(Failure::ServerError),
+        400..500 => Verdict::Failed(Failure::NotFound),
+        500..600 => Verdict::Failed(Failure::ServerError),
         // 1xx never reaches here and a status above 599 is not HTTP.
-        _ => Failure::Malformed,
-    };
-    Some(Some(failure))
+        _ => Verdict::Failed(Failure::Malformed),
+    }
 }
 
 /// The bot management vendors doc 05.8 names, recognised by the header they

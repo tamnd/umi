@@ -45,7 +45,7 @@ use umi_extract::extract;
 use umi_fetch::Outcome;
 use umi_frontier::{Ask, Config as FrontierConfig, Frontier, Rate};
 use umi_state::{Budget, Discovery, FetchOutcome, FetchResult, Pace, State, StateError};
-use umi_types::{FetcherId, Revalidator, Tier, Verification};
+use umi_types::{FetcherId, Revalidator, Tier, TierSignal, Verification};
 
 use crate::clock::Clock;
 use crate::fetch::Fetch;
@@ -214,6 +214,17 @@ pub struct TickReport {
     pub links_seen: usize,
     /// Links that were new and went to the frontier.
     pub links_admitted: usize,
+    /// Responses that were a wall rather than a page, per doc 05.8.
+    ///
+    /// Counted apart from `failed` because it is the number that says whether
+    /// a crawl is being refused rather than going wrong, and they are not the
+    /// same problem. None of these produced a row.
+    pub challenged: usize,
+    /// Hosts whose tier ladder moved this tick.
+    ///
+    /// Normally zero. A number that stays high means hosts are escalating and
+    /// de-escalating in turn, which is worth looking at.
+    pub learned: usize,
 }
 
 impl TickReport {
@@ -377,6 +388,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         let mut rows = Vec::with_capacity(report.leased);
         let mut outcomes = Vec::with_capacity(report.leased);
         let mut candidates: Vec<(String, u8)> = Vec::new();
+        let mut signals: Vec<Learned> = Vec::new();
 
         // Fill the window, then top it up as each one lands, which is what
         // keeps every slot busy rather than waiting on the slowest of a chunk.
@@ -393,10 +405,29 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 links,
                 links_seen,
                 disallowed,
+                signal,
             } = done;
 
             if disallowed {
                 report.disallowed += 1;
+            }
+            if let Some(learned) = signal {
+                // A block with no row behind it is a challenge page: doc 05.8
+                // says a 200 carrying a wall is not a fetch, so `one` throws
+                // the row away and this is what is left of it. A block that
+                // does have a row is an honest 403 and is counted as a
+                // failure like any other.
+                if learned.signal == TierSignal::Blocked && row.is_none() {
+                    report.challenged += 1;
+                }
+                // The `teaches` check belongs here and not in `relearn`, even
+                // though `relearn` would reach the same answer. `learn` is a
+                // scan of what the tick has collected so far, so folding in a
+                // page that cannot teach anything costs a pass over the batch
+                // per page, and a healthy crawl is nothing but those pages.
+                if learned.teaches() {
+                    learn(&mut signals, learned);
+                }
             }
             if let Some(row) = row {
                 match row.outcome {
@@ -424,8 +455,59 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         }
         self.state().complete(&outcomes).await?;
 
+        // After the completions, because both write the host record and the
+        // completion is the one that owns doc 07.6's pacing columns. Reading
+        // first would mean writing back a politeness timer from before this
+        // tick moved it.
+        report.learned = self.relearn(&signals, now_ms).await?;
         report.links_admitted = self.admit(&candidates, now_ms).await?;
         Ok(report)
+    }
+
+    /// Move the tier ladders of the hosts this tick learned something about.
+    ///
+    /// Doc 05.8 is per host state and it is learned rather than configured, so
+    /// this is where the learning is written down. It is also the one part of
+    /// a tick that touches the host table for a reason other than pacing, and
+    /// the cost of it has to stay near zero on a crawl where nothing is going
+    /// wrong. Two things keep it there: [`Learned::teaches`] drops the answers
+    /// that cannot have changed anything as the tick collects them, so on a
+    /// healthy crawl `signals` is empty and this is a function call, and
+    /// [`TierPolicy::observe`] reports whether it actually moved, so a host
+    /// that is read and found unchanged is not written back.
+    async fn relearn(&self, signals: &[Learned], now_ms: u64) -> Result<usize, CrawlError> {
+        let mut moved = 0;
+        for learned in signals {
+            let Some(mut host) = self.state().host(learned.host).await? else {
+                continue;
+            };
+            let mut changed = host.tier.observe(learned.signal, learned.tier, now_ms);
+
+            if learned.signal == TierSignal::Blocked {
+                // Doc 05.8's exponential backoff. Separate from doc 07.6's
+                // adaptive delay, which the completion has already applied,
+                // and larger: a host that is refusing us is not asking us to
+                // slow down, it is asking us to go away for a while.
+                let until = now_ms.saturating_add(host.tier.backoff_ms());
+                if until > host.next_allowed_ms {
+                    host.next_allowed_ms = until;
+                    changed = true;
+                }
+                // Thirty days of it, and the host leaves the frontier with a
+                // record of why. Never set back here: coming back is a
+                // decision, and doc 05.8 gives it to the monthly probe.
+                if host.tier.refusing() && !host.refusing {
+                    host.refusing = true;
+                    changed = true;
+                }
+            }
+
+            if changed {
+                self.state().put_host(&[host]).await?;
+                moved += 1;
+            }
+        }
+        Ok(moved)
     }
 
     /// One lease, from robots check to row.
@@ -497,6 +579,38 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             _ => None,
         };
 
+        // Doc 05.8's signal, which needs the fetch and the extraction
+        // together. The status alone cannot tell a page from a wall, and the
+        // extraction alone cannot tell a thin page from a shell.
+        let signal = tier_signal(&outcome, extracted.as_ref());
+        let learned = signal.map(|signal| Learned {
+            host: lease.key.host,
+            signal,
+            tier: lease.tier,
+            probe: lease.probe,
+        });
+
+        // A challenge page is not a fetch. It keeps no row, so it is never
+        // published and never counted as content, and it goes back as a
+        // failure so that the host backs off and the url is tried again later
+        // rather than being marked crawled. Doc 05.8 is explicit that a 200
+        // with a challenge in it is not a success, and treating it as one is
+        // how a corpus ends up with a million copies of the same interstitial
+        // and a frontier that believes those pages are done.
+        if signal == Some(TierSignal::Blocked) && matches!(outcome, Outcome::Ok(_)) {
+            let status = match &outcome {
+                Outcome::Ok(page) => Some(page.status),
+                _ => None,
+            };
+            let result = FetchResult::Failed {
+                status,
+                kind: umi_state::FailureKind::Blocked,
+            };
+            let mut out = Fetched::answered(&lease, fetched_at_ms, result).paced(pace);
+            out.signal = learned;
+            return out;
+        }
+
         // The second half, which needed the parse. A page filtered out by
         // language keeps no row and no links, the same as one filtered out by
         // type, because the crawl asked not to have it.
@@ -566,6 +680,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             links,
             links_seen,
             disallowed: false,
+            signal: learned,
         }
     }
 
@@ -640,6 +755,63 @@ struct Fetched {
     links: Vec<(String, u8)>,
     links_seen: usize,
     disallowed: bool,
+    /// What the answer said about the tier it came back on, when it said
+    /// anything. A robots exclusion and a malformed URL say nothing, because
+    /// no request was sent.
+    signal: Option<Learned>,
+}
+
+/// What one tick learned about one host's ladder.
+///
+/// A tick can cover a host several times, so this is folded rather than
+/// collected: one host is one entry, and the worst news wins. A tick that saw
+/// four pages and one challenge from a host learned that the host is
+/// challenging us, and recording that as four successes and a block in some
+/// order would make the answer depend on which fetch finished first.
+struct Learned {
+    host: umi_types::HostId,
+    signal: TierSignal,
+    /// The tier the fetch that produced `signal` ran at.
+    tier: Tier,
+    /// Whether that fetch was doc 05.8's probe at a cheaper tier.
+    probe: bool,
+}
+
+impl Learned {
+    /// How bad the news is, for the fold. Higher wins.
+    const fn weight(signal: TierSignal) -> u8 {
+        match signal {
+            TierSignal::Success => 0,
+            TierSignal::Shell => 1,
+            TierSignal::Blocked => 2,
+        }
+    }
+
+    /// Whether this is worth reading the host record for.
+    ///
+    /// The answer is no for essentially every page of a healthy crawl, and
+    /// that is the point. A success at T0 or T1 on a host that was not being
+    /// probed can only have come from a host whose ladder is already at the
+    /// bottom, because the lease query does not offer a T1 lease for a host
+    /// that wants more than T1. There is nothing to learn from it and nothing
+    /// to write, so it never becomes a lookup.
+    const fn teaches(&self) -> bool {
+        match self.signal {
+            TierSignal::Success => self.probe || self.tier as u8 > Tier::Plain as u8,
+            TierSignal::Blocked | TierSignal::Shell => true,
+        }
+    }
+}
+
+/// Fold one answer into what the tick knows about that host.
+fn learn(signals: &mut Vec<Learned>, learned: Learned) {
+    let Some(seen) = signals.iter_mut().find(|l| l.host == learned.host) else {
+        signals.push(learned);
+        return;
+    };
+    if Learned::weight(learned.signal) > Learned::weight(seen.signal) {
+        *seen = learned;
+    }
 }
 
 impl Fetched {
@@ -685,6 +857,7 @@ impl Fetched {
             links: Vec::new(),
             links_seen: 0,
             disallowed: false,
+            signal: None,
         }
     }
 
@@ -697,6 +870,44 @@ impl Fetched {
     fn paced(mut self, pace: Pace) -> Self {
         self.outcome.pace = pace;
         self
+    }
+}
+
+/// Doc 05.8's four way split, done where the fetch and the extraction meet.
+///
+/// The issue behind this is worth restating: a 403 from an origin, a 403 from
+/// a CDN, a 200 with a challenge page in it and a 200 with a real page in it
+/// are four different things, and only the last one is success. The first two
+/// are already told apart in `umi-fetch`, which reads the vendor headers and
+/// the body of a refusal. The last two are told apart here, because the only
+/// thing that separates them is how much text came out.
+///
+/// `None` means the answer says nothing about the ladder. A 404, a timeout and
+/// a DNS failure are all facts about the url or the network and none of them
+/// is a fact about the tier, and treating them as one would escalate a host to
+/// a browser because its hosting provider had a bad afternoon.
+fn tier_signal(
+    outcome: &Outcome,
+    extracted: Option<&umi_extract::Extracted>,
+) -> Option<TierSignal> {
+    match outcome {
+        Outcome::Failed {
+            failure: umi_fetch::Failure::Blocked,
+            ..
+        } => Some(TierSignal::Blocked),
+        // A 304 held, which means the conditional request got through, which
+        // means the tier we used works.
+        Outcome::NotModified { .. } => Some(TierSignal::Success),
+        Outcome::Ok(page) => {
+            // Bytes rather than characters, which doc 05.8 says. They are the
+            // same number for the interstitials, which are English and ASCII,
+            // and where they differ the byte count is the larger, so a page
+            // that is 200 bytes of one non Latin script is not called a
+            // challenge on a technicality.
+            let text = extracted.map_or(0, |e| e.signals.text_bytes) as usize;
+            umi_fetch::challenge::read_ok(page.body.as_ref(), text).or(Some(TierSignal::Success))
+        }
+        _ => None,
     }
 }
 

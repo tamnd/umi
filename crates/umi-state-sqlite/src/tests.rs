@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use umi_state::{
     Candidate, DAILY_UNDER_MS, Discovery, FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow,
     LeaseRequest, Pace, REALTIME_UNDER_MS, RefreshClass, Revalidator, SegmentRow, State, Stream,
-    WEEKLY_UNDER_MS, conformance,
+    TierPolicy, WEEKLY_UNDER_MS, conformance,
 };
 use umi_types::{Digest, FetcherId, RowKey, Tier, Ulid};
 
@@ -445,19 +445,31 @@ fn the_sql_host_defaults_are_the_rust_ones() {
         )),
         "the default delay in SQL is not doc 07.6's starting delay"
     );
+    let fresh = TierPolicy::new();
     assert!(
         sql.contains(&format!(
             "COALESCE(hosts.tier_preferred, {})",
-            Tier::default().as_u8()
+            fresh.preferred.as_u8()
         )),
         "the default preferred tier in SQL is not the Rust default"
     );
     assert!(
-        sql.contains(&format!(
-            "COALESCE(hosts.tier_max, {})",
-            Tier::default().as_u8()
-        )),
+        sql.contains(&format!("COALESCE(hosts.tier_max, {})", fresh.max.as_u8())),
         "the default tier ceiling in SQL is not the Rust default"
+    );
+    assert!(
+        sql.contains(&format!(
+            "COALESCE(hosts.tier_last_success, {})",
+            fresh.last_success.as_u8()
+        )),
+        "the default last good tier in SQL is not the Rust default"
+    );
+    // Doc 05.8's de-escalation probe is a `CASE` in the lease query and a
+    // comparison in `TierPolicy::probing`, and the two have to be the same
+    // week or an escalated host is probed either constantly or never.
+    assert!(
+        sql.contains(&format!("+ {} <= ?1", TierPolicy::PROBE_EVERY_MS)),
+        "the probe window in SQL is not TierPolicy::PROBE_EVERY_MS"
     );
 }
 
