@@ -25,10 +25,15 @@
 //!
 //! # What is not here
 //!
-//! T3 and T4, Web Bot Auth request signing from doc 07.2, and the escalation
-//! state machine from doc 05.8. This crate deliberately makes no scheduling
-//! decision at all: it reports what happened and doc 09 decides what that
-//! means.
+//! T3 and T4, and the escalation state machine from doc 05.8. This crate
+//! deliberately makes no scheduling decision at all: it reports what happened
+//! and doc 09 decides what that means.
+//!
+//! Doc 07.2's Web Bot Auth request signing is here, in [`webbotauth`], because
+//! the signature covers the request and the request is built here. A `Fetcher`
+//! built with a signer puts three extra headers on every GET at every tier. A
+//! `Fetcher` built without one sends none of them, which is what a volunteer's
+//! build does until doc 06 gives them a fetcher key.
 //!
 //! robots.txt is not consulted here either, and that is doc 04.7's rule rather
 //! than an omission. The robots decision belongs to the coordinator, a
@@ -41,6 +46,12 @@
 //! is monotonic, and anything that needs to be stamped with a date is stamped
 //! by the caller. That is gate 1.2's rule and it is what lets a fetch be
 //! replayed.
+//!
+//! A Web Bot Auth signature carries a `created` and an `expires` in unix
+//! seconds, which is the one thing in this crate that genuinely needs a wall
+//! clock. [`webbotauth::Signer`] takes it as a closure the caller supplies, so
+//! the rule still holds: there is no clock in this crate, there is a place to
+//! put one.
 //!
 //! # rustls only, unless somebody asks
 //!
@@ -70,6 +81,7 @@ pub mod headers;
 pub mod outcome;
 mod plain;
 pub mod sniff;
+pub mod webbotauth;
 
 #[cfg(feature = "emulation")]
 mod emulated;
@@ -79,6 +91,7 @@ use engine::Engine;
 pub use outcome::{Failure, Hop, Outcome, OutcomeCode, Page, RetryAfter, Stage, Version};
 pub use sniff::Media;
 pub use umi_types::{Revalidator, Tier};
+pub use webbotauth::{Directory, Jwk, SignatureError, Signer};
 
 #[cfg(feature = "emulation")]
 pub use emulated::{ECHO_URL, EXPECTED_JA4, PLATFORM, PROFILE};
@@ -195,7 +208,20 @@ impl Fetcher {
     ///
     /// [`FetchError::Client`] when the TLS backend will not initialise.
     pub fn with_config(config: FetchConfig) -> Result<Self> {
-        let transport = plain::Plain::build(&config)?;
+        Self::with_signer(config, None)
+    }
+
+    /// A client that signs every request under doc 07.2.
+    ///
+    /// The signer is shared rather than owned because its nonce counter must
+    /// not be duplicated, and because a fleet holds one crawl identity key and
+    /// not one per tier.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Client`] when the TLS backend will not initialise.
+    pub fn with_signer(config: FetchConfig, signer: Option<Arc<Signer>>) -> Result<Self> {
+        let transport = plain::Plain::build(&config, signer)?;
         Ok(Self {
             inner: Arc::new(Engine::new(transport, config)),
         })
@@ -261,7 +287,16 @@ impl Emulated {
     ///
     /// [`FetchError::Client`] when BoringSSL will not initialise.
     pub fn with_config(config: FetchConfig) -> Result<Self> {
-        let transport = emulated::Browser::build(&config)?;
+        Self::with_signer(config, None)
+    }
+
+    /// A T2 client that signs every request under doc 07.2.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Client`] when BoringSSL will not initialise.
+    pub fn with_signer(config: FetchConfig, signer: Option<Arc<Signer>>) -> Result<Self> {
+        let transport = emulated::Browser::build(&config, signer)?;
         Ok(Self {
             inner: Arc::new(Engine::new(transport, config)),
         })
@@ -358,10 +393,24 @@ impl Ladder {
     ///
     /// [`FetchError::Client`] when any tier's TLS backend will not initialise.
     pub fn with_config(config: FetchConfig) -> Result<Self> {
+        Self::with_signer(config, None)
+    }
+
+    /// Build every tier that is compiled in, signing every request.
+    ///
+    /// One signer for all of them, for the same reason there is one config:
+    /// doc 07.2 says one crawl identity per crawler, and a site operator who
+    /// looked up our key should get the same answer whichever rung answered
+    /// their page.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Client`] when any tier's TLS backend will not initialise.
+    pub fn with_signer(config: FetchConfig, signer: Option<Arc<Signer>>) -> Result<Self> {
         Ok(Self {
             #[cfg(feature = "emulation")]
-            emulated: Emulated::with_config(config.clone())?,
-            plain: Fetcher::with_config(config)?,
+            emulated: Emulated::with_signer(config.clone(), signer.clone())?,
+            plain: Fetcher::with_signer(config, signer)?,
         })
     }
 

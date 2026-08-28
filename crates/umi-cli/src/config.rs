@@ -172,6 +172,7 @@ struct CrawlFile {
     concurrency: Option<u16>,
     tier_max: Option<u8>,
     out: Option<String>,
+    identity_key: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -236,6 +237,11 @@ pub struct Config {
     /// separate from the token because they are different secrets with
     /// different rotation schedules and one of them cannot do the other's job.
     pub key: Option<Sourced<Secret>>,
+    /// Doc 07.2's crawl identity key, which signs outgoing requests under Web
+    /// Bot Auth. A third secret with a third rotation schedule, and separate
+    /// from the publishing key because an origin that verified a request must
+    /// not be able to conclude anything about the key that signs the corpus.
+    pub identity_key: Option<Sourced<Secret>>,
     /// The coordinator `umi fetch` leases from.
     pub coordinator: Sourced<String>,
     /// Pages a second a fetcher offers.
@@ -349,6 +355,14 @@ impl Config {
                 }),
             key: layers
                 .optional_text("UMI_PUBLISH_KEY", |f| f.publish.key.clone())
+                .map(|found| {
+                    Sourced::new(
+                        Secret::from_origin(&found.value, &found.origin),
+                        found.origin,
+                    )
+                }),
+            identity_key: layers
+                .optional_text("UMI_IDENTITY_KEY", |f| f.crawl.identity_key.clone())
                 .map(|found| {
                     Sourced::new(
                         Secret::from_origin(&found.value, &found.origin),

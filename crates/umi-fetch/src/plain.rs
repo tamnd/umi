@@ -5,17 +5,21 @@
 //! client, putting a GET on the wire with our own headers, reading the three
 //! fields of the head, and turning a reqwest error into a [`Failure`].
 
+use std::sync::Arc;
+
 use futures_util::StreamExt;
 use url::Url;
 
 use crate::engine::{BodyStream, Head, Transport, conditional, failure_from_text};
 use crate::outcome::{Failure, Stage, Version};
+use crate::webbotauth::Signer;
 use crate::{ACCEPT, FetchConfig, FetchError, Result, Revalidator, USER_AGENT};
 
 /// The plain client, honest identity and all.
 #[derive(Debug)]
 pub(crate) struct Plain {
     client: reqwest::Client,
+    signer: Option<Arc<Signer>>,
 }
 
 impl Plain {
@@ -25,7 +29,7 @@ impl Plain {
     ///
     /// [`FetchError::Client`] when the TLS backend will not initialise, which
     /// in practice means the platform has no usable certificate store.
-    pub(crate) fn build(config: &FetchConfig) -> Result<Self> {
+    pub(crate) fn build(config: &FetchConfig, signer: Option<Arc<Signer>>) -> Result<Self> {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(config.connect_timeout)
@@ -38,7 +42,7 @@ impl Plain {
             .build()
             .map_err(|e| FetchError::Client(e.to_string()))?;
 
-        Ok(Self { client })
+        Ok(Self { client, signer })
     }
 }
 
@@ -56,6 +60,17 @@ impl Transport for Plain {
             .header(http::header::ACCEPT, ACCEPT);
         for (name, value) in conditional(revalidate) {
             request = request.header(name, value);
+        }
+        // A signing failure is not a reason to skip the fetch. The only way it
+        // can happen is a url with no host, which the engine has already
+        // rejected, and a fetcher that stopped crawling because a signature
+        // would not build would be worse than one that crawls unsigned.
+        if let Some(signer) = &self.signer
+            && let Ok(signed) = signer.sign("GET", url)
+        {
+            for (name, value) in signed.headers() {
+                request = request.header(name, value);
+            }
         }
         request.send().await.map_err(transport_failure)
     }

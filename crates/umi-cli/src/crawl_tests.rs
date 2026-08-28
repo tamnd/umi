@@ -321,7 +321,7 @@ fn the_manifest_day_is_the_day_the_crawl_started() {
 #[test]
 fn resuming_something_that_is_not_a_crawl_says_so() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let error = super::resume(dir.path(), false, None).expect_err("no profile.toml");
+    let error = super::resume(dir.path(), false, None, None).expect_err("no profile.toml");
     assert!(
         format!("{error}").contains("is not a crawl directory"),
         "got {error}"

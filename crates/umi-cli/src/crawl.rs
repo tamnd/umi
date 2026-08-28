@@ -77,6 +77,7 @@ use std::time::Duration;
 use umi_crawl::{
     Clock, CrawlConfig, Crawler, Scope, SegmentInfo, SegmentSink, SystemClock, TickReport,
 };
+use umi_fetch::webbotauth::Signer;
 use umi_fetch::{FetchConfig, Ladder};
 use umi_file::{StreamKind, WriterConfig};
 use umi_publish::manifest::{FileEntry, Manifest, Verification};
@@ -190,6 +191,99 @@ pub struct Options {
     pub out: Option<String>,
     /// Doc 12's pipeline, or nothing when `--publish` was not given.
     pub publish: Option<Publishing>,
+    /// Doc 07.2's crawl identity key, or nothing when none is configured.
+    pub identity: Option<Identity>,
+}
+
+/// The key doc 07.2 signs outgoing requests with.
+///
+/// Its own struct with its own [`fmt::Debug`], for the reason [`Publishing`]
+/// has one: [`Options`] derives `Debug` and a private key that reached a log
+/// line would have to be rotated.
+#[derive(Clone)]
+pub struct Identity {
+    /// The seed, 32 bytes.
+    seed: [u8; 32],
+}
+
+impl Identity {
+    /// Read the key out of doc 14.7's five layers, or nothing when the
+    /// operator has not configured one.
+    ///
+    /// Not configuring one is a supported way to run. An unsigned crawler is
+    /// what umi was before this existed and it still works, it just does not
+    /// get the benefit of the doors Web Bot Auth opens. A key that is
+    /// configured and unreadable is an error, because that is somebody who
+    /// meant to sign and would otherwise find out from a site's logs.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Config`] when the indirection does not resolve, and
+    /// [`Error::Missing`] when what it points at is not 64 hex characters.
+    pub fn resolve(config: &crate::config::Config) -> Result<Option<Self>, Error> {
+        let Some(secret) = &config.identity_key else {
+            return Ok(None);
+        };
+        let text = secret.value.read()?;
+        let mut seed = [0u8; 32];
+        hex::decode_to_slice(text.trim(), &mut seed).map_err(|_| {
+            Error::Missing(
+                "crawl.identity_key must point at 64 hex characters, which is doc 07.2's                  ed25519 seed"
+                    .to_owned(),
+            )
+        })?;
+        Ok(Some(Self { seed }))
+    }
+
+    /// The thumbprint of this key, which is what a site operator looks up in
+    /// the published directory and what `umi doctor` prints.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Identity::signer`].
+    pub fn keyid(&self) -> Result<String, Error> {
+        Ok(self.signer(0)?.keyid().to_owned())
+    }
+
+    /// Build the signer, mixing a per process nonce seed.
+    ///
+    /// The nonce seed is derived rather than drawn from a random source,
+    /// because a nonce has to be unique and unguessable and neither of those
+    /// needs entropy when there is already a secret in the room. blake3 over
+    /// the private key gives the unguessable half and the start time and the
+    /// process id give the per process half, so two coordinators sharing a key
+    /// do not share a nonce stream.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Missing`] when the agent url does not parse, which it does.
+    pub fn signer(&self, started_ms: u64) -> Result<Signer, Error> {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.seed);
+        hasher.update(b"umi/web-bot-auth/nonce");
+        hasher.update(&started_ms.to_be_bytes());
+        hasher.update(&std::process::id().to_be_bytes());
+        let mut nonce_seed = [0u8; 16];
+        nonce_seed.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+
+        Signer::new(
+            self.seed,
+            umi_fetch::webbotauth::AGENT,
+            nonce_seed,
+            Box::new(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |since| since.as_secs())
+            }),
+        )
+        .map_err(|e| Error::Missing(e.to_string()))
+    }
+}
+
+impl fmt::Debug for Identity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Identity").finish_non_exhaustive()
+    }
 }
 
 /// What `--publish` needs, after doc 14.7's five layers have run.
@@ -338,7 +432,12 @@ pub fn crawl(options: &Options) -> Result<Summary, Error> {
 ///
 /// As [`crawl`], plus [`Error::Io`] if the directory has no `profile.toml`,
 /// which is what tells a crawl directory apart from any other directory.
-pub fn resume(dir: &Path, watch: bool, publish: Option<Publishing>) -> Result<Summary, Error> {
+pub fn resume(
+    dir: &Path,
+    watch: bool,
+    publish: Option<Publishing>,
+    identity: Option<Identity>,
+) -> Result<Summary, Error> {
     // Before the layout, so that pointing either of these at the wrong
     // directory says so rather than leaving two empty directories in it.
     let scope = profile_of(dir)?;
@@ -356,6 +455,7 @@ pub fn resume(dir: &Path, watch: bool, publish: Option<Publishing>) -> Result<Su
         seed: None,
         seeder: Vec::new(),
         publish,
+        identity,
         ..Options::default()
     };
     let mut config = settings(&options)?;
@@ -846,9 +946,17 @@ fn run(
     // `content_length` and body digest describe a prefix of what the origin
     // sent, which is worse than not having the page.
     fetch_config.body_cap = 8 << 20;
-    let fetcher = Ladder::with_config(fetch_config)?;
     let clock = SystemClock;
     let started_ms = clock.now_ms();
+
+    // Doc 07.2. Every rung signs, or none of them does. A crawl with no key
+    // configured sends the same requests it always sent.
+    let signer = match &options.identity {
+        Some(identity) => Some(Arc::new(identity.signer(started_ms)?)),
+        None => None,
+    };
+    let signed_as = signer.as_ref().map(|s| s.keyid().to_owned());
+    let fetcher = Ladder::with_signer(fetch_config, signer)?;
 
     let scope = Arc::new(scope.clone());
     let sink = SegmentSink::create(
@@ -882,6 +990,13 @@ fn run(
         .map_err(Error::Io)?;
 
     let mut log = Log::open(&layout.log)?;
+    if let Some(keyid) = &signed_as {
+        log.line(&format!(
+            "signing requests as {keyid}, published at {}{}",
+            umi_fetch::webbotauth::AGENT,
+            umi_fetch::webbotauth::DIRECTORY_PATH
+        ))?;
+    }
     let mut summary = Summary::default();
     let mut manifest = Manifest::new(&scope.name, &day(started_ms), StreamKind::Pages, None);
     let publisher = match &options.publish {
@@ -1795,6 +1910,7 @@ impl Default for Options {
             sitemaps: true,
             out: None,
             publish: None,
+            identity: None,
         }
     }
 }
