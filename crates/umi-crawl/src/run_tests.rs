@@ -916,11 +916,14 @@ async fn a_nofollow_page_keeps_its_row_and_gives_up_its_links() {
 }
 
 #[tokio::test]
-async fn a_rel_nofollow_link_is_not_followed_but_is_still_in_the_row() {
+async fn a_rel_nofollow_link_is_followed_and_is_still_in_the_row() {
+    // Doc 11.4: recorded, not obeyed. The two links here are treated
+    // identically, and the only difference between them is the published
+    // column, which consumers can weight on if they want to.
     let state = seeded(&["https://example.com/a"]).await;
     let body = "<html><head><title>A</title></head><body><p>Prose.</p>\
                 <a href='/good'>good</a>\
-                <a href='/bad' rel='nofollow'>bad</a></body></html>";
+                <a href='/spam' rel='nofollow'>spam</a></body></html>";
     let fetch = Canned::new()
         .robots("https://example.com", "User-agent: *\nAllow: /\n")
         .html("https://example.com/a", body);
@@ -928,12 +931,48 @@ async fn a_rel_nofollow_link_is_not_followed_but_is_still_in_the_row() {
     let sink = Collected::default();
 
     let report = crawler.tick(&sink).await.expect("tick");
-    assert_eq!(report.links_seen, 1);
+    assert_eq!(report.links_seen, 2);
+    assert_eq!(report.links_admitted, 2);
 
-    // Doc 10.5's `links` column is what the page said, not what we chose to
-    // do about it, so both links are in the row.
     let rows = sink.rows();
     assert_eq!(rows[0].links.len(), 2);
+}
+
+#[tokio::test]
+async fn the_head_puts_its_pages_in_the_frontier_and_keeps_its_assets_out() {
+    // The head of a real page, cut down. Found by crawling excalidraw.com on
+    // server3, which admitted two favicons, a stylesheet and a bundle, fetched
+    // all four and stored a row for each.
+    let state = seeded(&["https://example.com/a"]).await;
+    let body = "<html><head><title>A</title>\
+                <link rel='icon' href='/favicon-32x32.png'>\
+                <link rel='stylesheet' href='/assets/index.css'>\
+                <link rel='modulepreload' href='/assets/chunk.js'>\
+                <link rel='manifest' href='/manifest.webmanifest'>\
+                <link rel='next' href='/b'>\
+                </head><body><p>Prose here, enough of it to extract.</p></body></html>";
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/a", body)
+        .html("https://example.com/b", &page("B", &[]));
+    let clock = Arc::new(FixedClock::at(T0));
+    let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
+    let sink = Collected::default();
+
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.links_seen, 1, "an asset was offered to the frontier");
+    assert_eq!(report.links_admitted, 1);
+
+    // All five are still in doc 10.5's column, because that column is what the
+    // page said and this decision does not change what the page said.
+    assert_eq!(sink.rows()[0].links.len(), 5);
+
+    // Past doc 07.6's delay, so the one admitted link is leasable.
+    clock.advance(2000);
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.fetched, 1);
+    let urls: Vec<String> = sink.rows().into_iter().map(|r| r.url).collect();
+    assert_eq!(urls, ["https://example.com/a", "https://example.com/b"]);
 }
 
 #[tokio::test]
