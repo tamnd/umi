@@ -7,9 +7,13 @@
 //! silently turns a T0 revalidate into a full fetch on the sites that use them.
 //!
 //! There is no date crate here. The three grammars are fixed, they are ASCII,
-//! and the epoch conversion is the days from civil algorithm, which is thirty
-//! lines. Pulling in a general date library to parse a fixed width string
-//! would be a dependency in every fetcher a volunteer builds.
+//! and the epoch arithmetic is `umi_types::date`, which three crates share
+//! because three crates parse a different fixed width date and all of them
+//! need the same days from civil algorithm underneath. Pulling in a general
+//! date library to parse a fixed width string would be a dependency in every
+//! fetcher a volunteer builds.
+
+use umi_types::date::{civil_from_days, epoch_ms};
 
 /// Parse an HTTP date into milliseconds since the Unix epoch.
 ///
@@ -25,21 +29,7 @@ pub fn parse(text: &str) -> Option<u64> {
         .or_else(|| rfc850(text))
         .or_else(|| asctime(text))?;
     let (hour, minute, second) = time;
-
-    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-    // A leap second lands on 60 and there is nowhere to put it, so it becomes
-    // the second before. Rejecting the date instead would lose a revalidator
-    // over a value that is correct.
-    let second = second.min(59);
-
-    let days = days_from_civil(year, month, day)?;
-    let seconds = days.checked_mul(86_400)?
-        + u64::from(hour) * 3600
-        + u64::from(minute) * 60
-        + u64::from(second);
-    seconds.checked_mul(1000)
+    epoch_ms(year, month, day, hour, minute, second)
 }
 
 /// Format milliseconds since the epoch as an IMF-fixdate.
@@ -137,41 +127,6 @@ fn month_number(name: &str) -> Option<u32> {
 }
 
 /// Days since 1970-01-01, or `None` before it.
-///
-/// Howard Hinnant's days from civil, which is exact for any year the calendar
-/// is defined over and needs no tables.
-fn days_from_civil(year: i32, month: u32, day: u32) -> Option<u64> {
-    if year < 1970 {
-        return None;
-    }
-    let year = year - i32::from(month <= 2);
-    let era = year / 400;
-    let year_of_era = year - era * 400;
-    let day_of_year =
-        (153 * (month as i32 + if month > 2 { -3 } else { 9 }) + 2) / 5 + day as i32 - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    u64::try_from(era * 146_097 + day_of_era - 719_468).ok()
-}
-
-/// The inverse, for [`format`].
-fn civil_from_days(days: u64) -> (i32, u32, u32) {
-    let z = days as i64 + 719_468;
-    let era = z / 146_097;
-    let day_of_era = z - era * 146_097;
-    let year_of_era =
-        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_prime = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
-    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
-    (
-        (year + i64::from(month <= 2)) as i32,
-        month as u32,
-        day as u32,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{format, parse};

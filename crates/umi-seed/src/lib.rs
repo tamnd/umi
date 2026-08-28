@@ -35,6 +35,13 @@
 //! [`RowKey`] admission would derive. A seeder cannot set a priority, cannot
 //! mark a URL fetched and cannot skip robots. It is a source of candidates and
 //! nothing else, which is exactly why the contract can be one sentence long.
+//!
+//! Two of doc 13.6's sources are not seeders and are here as parsers instead.
+//! [`sitemap`] reads a sitemap, a sitemap index or the plain text form, and
+//! [`feed`] reads RSS and Atom. Both are in the crawler rather than behind the
+//! stdout contract because both carry a date the site wrote down, doc 09 feeds
+//! that date to the freshness model, and a line of text on a pipe has nowhere
+//! to put it.
 
 #![forbid(unsafe_code)]
 
@@ -45,13 +52,23 @@ use std::path::PathBuf;
 
 use umi_types::{CanonError, RowKey, UrlKey, canonicalize};
 
+pub mod date;
+pub mod feed;
 mod lines;
 mod run;
+pub mod sitemap;
+mod xml;
 
+#[cfg(test)]
+mod feed_tests;
+#[cfg(test)]
+mod sitemap_tests;
 #[cfg(test)]
 mod tests;
 
+pub use feed::Feed;
 pub use run::{SeedStream, seed};
+pub use sitemap::{Caps, Entry, Sitemap};
 
 /// One accepted candidate: the canonical URL and the keys derived from it.
 #[derive(Clone, PartialEq, Eq, Debug)]
