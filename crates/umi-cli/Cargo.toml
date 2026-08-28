@@ -79,3 +79,8 @@ tokio = { workspace = true, features = ["macros"] }
 # a process with openssl-sys, and because gate 2.2 asserts the default build
 # has neither. Build with `--features emulation` to get the rung.
 emulation = ["umi-crawl/emulation", "umi-fetch/emulation"]
+# Doc 05.6's T3. Off by default because it is useless without Chrome on the
+# box, and because a browser holds a gigabyte or more once its tabs are warm,
+# which is not something a default build should decide for somebody. Even with
+# the feature on, no browser starts until `tabs` is set above zero.
+render = ["umi-crawl/render", "umi-fetch/render"]

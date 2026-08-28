@@ -54,3 +54,9 @@ umi-state-sqlite.workspace = true
 # has that rung. The feature is here so a binary can turn T2 on without
 # depending on umi-fetch directly.
 emulation = ["umi-fetch/emulation"]
+# Doc 05.6's T3, forwarded the same way and for the same reason. Nothing in
+# this crate is behind it either: the render budget in `render.rs` is compiled
+# into every build, because the loop has to ask the fetcher how much it can
+# render whether or not this binary could have rendered anything, and `None` is
+# the honest answer from a ladder with no browser in it.
+render = ["umi-fetch/render"]

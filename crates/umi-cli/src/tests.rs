@@ -143,6 +143,41 @@ fn a_missing_file_is_not_an_error_and_a_broken_one_is() {
 }
 
 #[test]
+fn a_machine_says_whether_it_renders_and_says_it_once() {
+    // Doc 05.6's tab cap, which is why it is a section of its own rather than a
+    // key on the crawl: the same profile runs on all three servers and only one
+    // of them should be starting Chrome. Zero is the default, so a checkout
+    // that nobody has configured opens no browser.
+    let dir = tempfile::tempdir().unwrap();
+    let paths = paths(dir.path());
+    let bare = Config::load(&paths, &Env::new(), &Flags::default()).unwrap();
+    assert_eq!(bare.tabs.value, 0);
+    assert_eq!(bare.tabs.origin, Origin::Default);
+
+    write(&paths.local, "[render]\ntabs = 8\n");
+    let configured = Config::load(&paths, &Env::new(), &Flags::default()).unwrap();
+    assert_eq!(configured.tabs.value, 8);
+    assert_eq!(configured.tabs.origin, Origin::File(paths.local.clone()));
+
+    let env = env(&[("UMI_TABS", "4")]);
+    assert_eq!(
+        Config::load(&paths, &env, &Flags::default())
+            .unwrap()
+            .tabs
+            .value,
+        4
+    );
+
+    let flags = Flags {
+        tabs: Some(2),
+        ..Flags::default()
+    };
+    let flagged = Config::load(&paths, &env, &flags).unwrap();
+    assert_eq!(flagged.tabs.value, 2);
+    assert_eq!(flagged.tabs.origin, Origin::Flag);
+}
+
+#[test]
 fn an_unknown_key_is_a_typo_and_says_so() {
     let dir = tempfile::tempdir().unwrap();
     let paths = paths(dir.path());
