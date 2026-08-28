@@ -200,14 +200,17 @@ async fn a_lease_above_the_top_of_the_ladder_is_served_by_the_top_of_the_ladder(
 #[test]
 fn the_ladder_says_which_rungs_it_has() {
     // The build without `emulation` has one rung and the build with it has
-    // two. `umi get` prints this and refuses to pretend, which is the only
-    // reason the constant is public.
+    // two. A `render` build started through `with_config` has no browser and so
+    // has no T3, which is the case this pins: the feature being compiled in is
+    // not the same thing as the rung being there. `umi get` prints this and
+    // refuses to pretend, which is the only reason it is public.
     let expected = if cfg!(feature = "emulation") {
         Tier::Emulated
     } else {
         Tier::Plain
     };
-    assert_eq!(Ladder::highest(), expected);
+    let ladder = Ladder::new().expect("the ladder builds");
+    assert_eq!(ladder.highest(), expected);
 }
 
 #[tokio::test]

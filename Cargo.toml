@@ -107,6 +107,19 @@ bytes = "1"
 # comment there.
 wreq = { version = "0.16", features = ["stream", "gzip", "brotli", "zstd", "deflate"] }
 wreq-util = "0.2"
+
+# T3, doc 05.6. Headless Chromium over the DevTools Protocol, for the pages
+# whose content only exists after a script has run. Doc 05.6 names this crate
+# over `headless_chrome`, whose API is blocking and therefore wrong for a
+# pooled architecture, and says to revisit `rustwright` if the per session
+# controller overhead ever shows up in a profile.
+#
+# Default features only, which is what keeps it out of gate 2.2's way. The
+# `fetcher` feature downloads a Chromium build over HTTPS and is the only thing
+# in the crate that wants a TLS backend, so leaving it off means the reqwest it
+# depends on arrives with no TLS features at all. A fetcher operator installs
+# Chrome the way they install everything else.
+chromiumoxide = "0.9"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Only ever a dev dependency, and only for gate 2.2's crash suite, which needs
