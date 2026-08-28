@@ -223,3 +223,241 @@ const fn ln_ratio_q16(num: u64, den: u64) -> u64 {
 
     (((whole << 16) | fraction) * LN2_Q16) >> 16
 }
+
+/// What a URL is being crawled for, from the table in doc 09.5.
+///
+/// A class is derived rather than assigned. It is read off the interval the
+/// estimator last produced, so it is recomputed on every fetch for free and
+/// there is nothing to keep in step: a page that starts changing daily is in
+/// the daily class the moment the estimator notices, and a page that goes quiet
+/// leaves it the same way.
+///
+/// A backend may still store it, and the SQLite one does. That is not a second
+/// source of truth, it is an index key, and the rule there is that whatever
+/// writes the schedule writes the class in the same statement.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+#[repr(u8)]
+pub enum RefreshClass {
+    /// Feed and sitemap driven, news front pages. Minutes.
+    Realtime,
+    /// High lambda on a host worth the bandwidth. One to six hours.
+    Hourly,
+    /// Active pages on quality hosts. One to three days.
+    Daily,
+    /// The general web. A week to a month.
+    Weekly,
+    /// Never observed to change. A month to six.
+    Dormant,
+    /// Never fetched. The largest share of the fleet, and the one doc 09.5
+    /// says to spend down once coverage is respectable.
+    #[default]
+    Discovery,
+}
+
+/// An interval under an hour is realtime.
+pub const REALTIME_UNDER_MS: u64 = 60 * 60 * 1000;
+/// Under six hours is hourly.
+pub const HOURLY_UNDER_MS: u64 = 6 * REALTIME_UNDER_MS;
+/// Under three days is daily.
+pub const DAILY_UNDER_MS: u64 = 3 * 24 * REALTIME_UNDER_MS;
+/// Under thirty days is weekly, and anything slower is dormant.
+pub const WEEKLY_UNDER_MS: u64 = 30 * 24 * REALTIME_UNDER_MS;
+
+/// The classes in the order doc 09.5 lists them, for iteration.
+pub const CLASSES: [RefreshClass; 6] = [
+    RefreshClass::Realtime,
+    RefreshClass::Hourly,
+    RefreshClass::Daily,
+    RefreshClass::Weekly,
+    RefreshClass::Dormant,
+    RefreshClass::Discovery,
+];
+
+impl RefreshClass {
+    /// Where this class sits in [`CLASSES`] and in a [`Budget`].
+    #[must_use]
+    pub const fn index(self) -> usize {
+        self.as_u8() as usize
+    }
+
+    /// The byte a state backend stores, which is the position in doc 09.5's
+    /// table. Stable, because it is in a file.
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Back from the stored byte, or `None` for a byte no version of this ever
+    /// wrote.
+    #[must_use]
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Realtime),
+            1 => Some(Self::Hourly),
+            2 => Some(Self::Daily),
+            3 => Some(Self::Weekly),
+            4 => Some(Self::Dormant),
+            5 => Some(Self::Discovery),
+            _ => None,
+        }
+    }
+
+    /// The class a row is in, from the interval it was last given.
+    ///
+    /// The boundaries are the table in doc 09.5 read as upper bounds, so the
+    /// gaps in it (nothing there is between six hours and a day) fall to the
+    /// slower of the two neighbours rather than to nothing.
+    #[must_use]
+    pub const fn of(fetch_count: u32, interval_ms: u64) -> Self {
+        if fetch_count == 0 {
+            return Self::Discovery;
+        }
+        match interval_ms {
+            0..REALTIME_UNDER_MS => Self::Realtime,
+            REALTIME_UNDER_MS..HOURLY_UNDER_MS => Self::Hourly,
+            HOURLY_UNDER_MS..DAILY_UNDER_MS => Self::Daily,
+            DAILY_UNDER_MS..WEEKLY_UNDER_MS => Self::Weekly,
+            _ => Self::Dormant,
+        }
+    }
+
+    /// The class of a row, from the schedule on it.
+    ///
+    /// The interval is the one the estimator produced on the last fetch, which
+    /// is the gap between the fetch and the due time it set, rather than how
+    /// overdue the row is now.
+    #[must_use]
+    pub const fn of_row(row: &LedgerRow) -> Self {
+        Self::of(
+            row.fetch_count,
+            row.next_due_ms.saturating_sub(row.last_fetch_ms),
+        )
+    }
+
+    /// The name doc 09.5 uses, for anything an operator reads.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Realtime => "realtime",
+            Self::Hourly => "hourly",
+            Self::Daily => "daily",
+            Self::Weekly => "weekly",
+            Self::Dormant => "dormant",
+            Self::Discovery => "discovery",
+        }
+    }
+}
+
+/// How the fleet's capacity is split across the classes, from doc 09.5.
+///
+/// Percentages, in [`CLASSES`] order, summing to 100. Capacity is allocated to
+/// classes rather than left to compete freely because a pure priority queue
+/// lets discovery starve refresh or the reverse, depending on which happens to
+/// score higher this week.
+///
+/// A share is a floor and not a cap. A class that has no work due gives its
+/// capacity to whoever does, which is what stops a mostly idle realtime class
+/// from shrinking every lease batch by 5 percent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Budget {
+    shares: [u8; 6],
+}
+
+impl Budget {
+    /// The split in doc 09.5.
+    pub const DEFAULT: Self = Self {
+        shares: [5, 10, 20, 25, 5, 35],
+    };
+
+    /// A split of the caller's own, for doc 16's land grab where discovery is
+    /// raised and lowered as coverage changes.
+    ///
+    /// Shares are in [`CLASSES`] order. They do not have to sum to 100: what
+    /// matters is their ratio, and a caller that wants to switch a class off
+    /// entirely gives it zero.
+    #[must_use]
+    pub const fn new(shares: [u8; 6]) -> Self {
+        Self { shares }
+    }
+
+    /// The share of a batch this class is owed, in percent.
+    #[must_use]
+    pub const fn share(&self, class: RefreshClass) -> u8 {
+        self.shares[class.index()]
+    }
+
+    /// How many of `max_urls` this class is owed.
+    ///
+    /// Rounded down, but never to zero for a class with a share, because a
+    /// realtime quota of nothing in a batch of sixteen would keep the class off
+    /// the wire entirely rather than rationing it.
+    #[must_use]
+    pub const fn quota(&self, class: RefreshClass, max_urls: u32) -> u32 {
+        let total = self.total() as u32;
+        let share = self.shares[class.index()] as u32;
+        if share == 0 || total == 0 {
+            return 0;
+        }
+        let quota = max_urls.saturating_mul(share) / total;
+        if quota == 0 { 1 } else { quota }
+    }
+
+    const fn total(&self) -> u16 {
+        let mut sum = 0_u16;
+        let mut i = 0;
+        while i < self.shares.len() {
+            sum += self.shares[i] as u16;
+            i += 1;
+        }
+        sum
+    }
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
+/// One lease batch's worth of budget, as the scan sees it.
+///
+/// Both backends walk the frontier in priority order and ask this about every
+/// row they are otherwise willing to hand out. A row the budget turns down is
+/// not dropped: the caller keeps it aside and fills the batch with it if the
+/// classes that were owed the capacity turn out not to want it.
+#[derive(Clone, Copy, Debug)]
+pub struct Quotas {
+    quota: [u32; 6],
+    taken: [u32; 6],
+}
+
+impl Quotas {
+    /// The quotas for one batch.
+    #[must_use]
+    pub fn new(budget: &Budget, max_urls: u32) -> Self {
+        let mut quota = [0_u32; 6];
+        for class in CLASSES {
+            quota[class.index()] = budget.quota(class, max_urls);
+        }
+        Self {
+            quota,
+            taken: [0; 6],
+        }
+    }
+
+    /// Whether this class can take one more, counting it if so.
+    pub fn take(&mut self, class: RefreshClass) -> bool {
+        let index = class.index();
+        if self.taken[index] >= self.quota[index] {
+            return false;
+        }
+        self.taken[index] += 1;
+        true
+    }
+
+    /// How many of the batch this class has taken.
+    #[must_use]
+    pub const fn taken(&self, class: RefreshClass) -> u32 {
+        self.taken[class.index()]
+    }
+}

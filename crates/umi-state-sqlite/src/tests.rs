@@ -13,8 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use umi_state::{
-    Candidate, Discovery, FetchOutcome, FetchResult, HostRow, LeaseRequest, Pace, Revalidator,
-    SegmentRow, State, Stream, conformance,
+    Candidate, DAILY_UNDER_MS, Discovery, FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow,
+    LeaseRequest, Pace, REALTIME_UNDER_MS, RefreshClass, Revalidator, SegmentRow, State, Stream,
+    WEEKLY_UNDER_MS, conformance,
 };
 use umi_types::{Digest, FetcherId, RowKey, Tier, Ulid};
 
@@ -346,7 +347,7 @@ async fn the_lease_query_walks_the_index() {
         .prepare(&format!("EXPLAIN QUERY PLAN {}", sql::SELECT_READY))
         .expect("the lease query parses");
     let plan: Vec<String> = stmt
-        .query_map([0i64, 0i64], |row| row.get::<_, String>("detail"))
+        .query_map([0i64, 0i64, 0i64], |row| row.get::<_, String>("detail"))
         .expect("a plan")
         .collect::<rusqlite::Result<_>>()
         .expect("a plan");
@@ -369,8 +370,36 @@ fn the_index_and_the_query_agree_on_what_is_schedulable() {
     // and edits it in place, this says out loud that the partial index stops
     // applying.
     assert!(schema::MIGRATIONS[0].contains(schema::SCHEDULABLE));
+    assert!(schema::MIGRATIONS[5].contains(schema::SCHEDULABLE));
     assert!(sql::SELECT_READY.contains(schema::SCHEDULABLE));
     assert!(sql::SELECT_READY_IN_PLDS.contains(schema::SCHEDULABLE));
+}
+
+#[test]
+fn the_sql_class_boundaries_are_the_rust_ones() {
+    // Version 6 backfills doc 09.5's refresh class for rows that predate the
+    // column, and it has to spell the boundaries out because a migration is a
+    // string. `RefreshClass::of` is the definition; this is the only other copy
+    // of those numbers and it is the one nothing would notice was wrong.
+    let sql = schema::MIGRATIONS[5];
+    for boundary in [
+        REALTIME_UNDER_MS,
+        HOURLY_UNDER_MS,
+        DAILY_UNDER_MS,
+        WEEKLY_UNDER_MS,
+    ] {
+        assert!(
+            sql.contains(&format!("< {boundary} THEN")),
+            "the version 6 backfill does not use {boundary}, which is a boundary in umi-state"
+        );
+    }
+    assert!(
+        sql.contains(&format!(
+            "fetch_count = 0 THEN {}",
+            RefreshClass::Discovery.as_u8()
+        )),
+        "the version 6 backfill disagrees with Rust about what a never fetched row is"
+    );
 }
 
 #[test]

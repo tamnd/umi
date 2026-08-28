@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 5;
+pub const SCHEMA_VERSION: u32 = 6;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -93,7 +93,9 @@ CREATE TABLE ledger (
 -- The order `lease` hands work out in, as an index, so that choosing the next
 -- thousand urls is a prefix scan rather than a sort of the frontier. Partial,
 -- because a gone or excluded row is never coming back and has no business
--- taking up space in the index the scheduler reads on every call.
+-- taking up space in the index the scheduler reads on every call. Version 6
+-- replaces this with the same index behind a refresh class, and the comment
+-- there says why.
 CREATE INDEX ledger_ready
     ON ledger (priority DESC, next_due_ms, pld, host, url_key)
     WHERE ",
@@ -372,3 +374,48 @@ UPDATE ledger
        change_count = MIN(change_count, 1)
  WHERE fetch_count > 1;
 ";
+
+/// Version 6: doc 09.5's refresh class, stored so that the frontier can be read
+/// one class at a time.
+///
+/// The class is a function of the row and of nothing else, so storing it is
+/// redundant on its own. What it buys is the leading index column. Doc 09.5
+/// gives each class a share of every lease batch, and a share is only
+/// enforceable if the scheduler can reach a class's due work without walking
+/// past everything ahead of it in priority order. With the class in the index
+/// that is six prefix scans of a few hundred rows each. Without it, a thousand
+/// hourly URLs sitting below a hundred thousand discovery rows are never
+/// reached and their share is quietly zero, which is the exact failure doc 09.5
+/// exists to prevent.
+///
+/// `complete` writes it in the same statement as the schedule it comes from, so
+/// the two cannot disagree. `admit` leaves it alone and the default carries the
+/// insert, because a URL nobody has fetched is discovery by definition.
+///
+/// The backfill repeats the boundaries from `umi_state::freshness` in SQL,
+/// which is a duplicate, so `the_sql_class_boundaries_are_the_rust_ones` in the
+/// tests asserts the numbers here are still the constants there. It runs once
+/// over the ledger, and a store that is wrong about a class is not incorrect,
+/// only misbudgeted until the next fetch of that row puts it right.
+const V6: &str = concat!(
+    r"
+ALTER TABLE ledger ADD COLUMN refresh_class INTEGER NOT NULL DEFAULT 5;
+
+UPDATE ledger SET refresh_class = CASE
+    WHEN fetch_count = 0 THEN 5
+    WHEN next_due_ms - last_fetch_ms < 3600000 THEN 0
+    WHEN next_due_ms - last_fetch_ms < 21600000 THEN 1
+    WHEN next_due_ms - last_fetch_ms < 259200000 THEN 2
+    WHEN next_due_ms - last_fetch_ms < 2592000000 THEN 3
+    ELSE 4
+END;
+
+DROP INDEX ledger_ready;
+
+CREATE INDEX ledger_ready
+    ON ledger (refresh_class, priority DESC, next_due_ms, pld, host, url_key)
+    WHERE ",
+    schedulable!(),
+    r";
+"
+);

@@ -15,7 +15,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use umi_fetch::outcome::{Page, Version};
 use umi_fetch::{FetchError, Media, Outcome};
-use umi_state::{Candidate, MemoryState, State};
+use umi_state::{Budget, Candidate, MemoryState, State};
 use umi_types::{FetcherId, Revalidator, Tier};
 
 use crate::clock::FixedClock;
@@ -145,6 +145,7 @@ fn config() -> CrawlConfig {
         lease_for: Duration::from_secs(60),
         max_depth: 4,
         scope: Arc::new(Scope::general()),
+        budget: Budget::DEFAULT,
     }
 }
 

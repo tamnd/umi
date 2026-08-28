@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
 
+use crate::freshness::Budget;
 use crate::pace::Pace;
 
 // A fetcher needs this to build a conditional request and needs nothing else
@@ -208,6 +209,12 @@ pub struct LeaseRequest<'a> {
     /// shards are resident and asks only for those, rather than asking for
     /// anything and paying an object GET in the middle of the loop.
     pub plds: &'a [PldId],
+    /// How this batch is split across doc 09.5's refresh classes.
+    ///
+    /// A share is a floor rather than a cap, so a batch is only smaller than
+    /// `max_urls` when the frontier really has nothing else due. Set every
+    /// share equal to turn the split off and go back to pure priority order.
+    pub budget: Budget,
 }
 
 impl<'a> LeaseRequest<'a> {
@@ -223,6 +230,7 @@ impl<'a> LeaseRequest<'a> {
             max_tier: Tier::Plain,
             lease_for: Duration::from_secs(60),
             plds: &[],
+            budget: Budget::DEFAULT,
         }
     }
 }

@@ -35,7 +35,7 @@ use std::time::Duration;
 use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 
 use crate::{
-    Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow, LeaseRequest,
+    Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow, LeaseRequest,
     NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow, State, Stream,
     retry_after_ms,
 };
@@ -179,6 +179,7 @@ where
     run!(a_failed_url_comes_back_only_after_its_backoff);
     run!(a_revalidator_comes_back_on_the_next_lease);
     run!(a_page_that_changed_comes_back_sooner_than_one_that_did_not);
+    run!(discovery_cannot_take_the_whole_batch_from_refresh);
     run!(a_higher_priority_url_is_leased_first);
     run!(lease_returns_work_in_the_order_the_trait_promises);
     run!(a_host_politeness_timer_holds_the_whole_host);
@@ -724,6 +725,66 @@ async fn a_page_that_changed_comes_back_sooner_than_one_that_did_not(state: &dyn
     ensure!(
         later[0].url.contains("h2."),
         "the url that came back 304 was refetched first"
+    );
+    Ok(())
+}
+
+async fn discovery_cannot_take_the_whole_batch_from_refresh(state: &dyn State) -> Outcome {
+    // Doc 09.5's budget, through the only window the trait gives onto it. One
+    // url that has been fetched once, so it is due again a day later and sits
+    // in the daily class, against fifty that have never been fetched. Every row
+    // is at the default priority and the fetched one is due last, so in the
+    // order doc 08.4 promises it is the fifty first of fifty one rows and a
+    // batch of twenty would never reach it.
+    let refresh = host_url(1);
+    admit_all(state, std::slice::from_ref(&refresh)).await?;
+    let leases = lease_one(state, T0).await?;
+    ensure_eq!(leases.len(), 1, "nothing was leased");
+    state
+        .complete(&[fetched(&leases[0], T0 + 500, "hello")])
+        .await
+        .map_err(|e| format!("complete failed: {e}"))?;
+
+    let discovery: Vec<String> = (10..60).map(host_url).collect();
+    admit_all(state, &discovery).await?;
+    let due = T0 + DAY + 3_600_000;
+
+    // The control. Told to spend everything on discovery, a backend has to
+    // leave the refresh out, and a case where the refresh gets in either way
+    // would prove nothing about the budget.
+    let all_discovery = LeaseRequest {
+        budget: Budget::new([0, 0, 0, 0, 0, 100]),
+        ..request(due, 20)
+    };
+    let batch = state
+        .lease(&all_discovery)
+        .await
+        .map_err(|e| format!("lease failed: {e}"))?;
+    ensure!(
+        !batch.iter().any(|lease| lease.url == refresh),
+        "a budget with nothing in it for refresh still spent some on refresh"
+    );
+    let ids: Vec<_> = batch.iter().map(|lease| lease.id).collect();
+    state
+        .release(&ids, NackReason::Shutdown)
+        .await
+        .map_err(|e| format!("release failed: {e}"))?;
+
+    // The same frontier and the same instant, under doc 09.5's split. A lease
+    // is a second later so that the hosts the control touched are past their
+    // politeness delay again.
+    let batch = state
+        .lease(&request(due + 2_000, 20))
+        .await
+        .map_err(|e| format!("lease failed: {e}"))?;
+    ensure_eq!(
+        batch.len(),
+        20,
+        "the split turned into a cap and left the batch short"
+    );
+    ensure!(
+        batch.iter().any(|lease| lease.url == refresh),
+        "fifty new urls crowded the one url that was due for refresh out of the batch"
     );
     Ok(())
 }

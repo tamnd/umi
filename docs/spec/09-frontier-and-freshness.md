@@ -114,12 +114,14 @@ Capacity is allocated to classes rather than left to compete freely, because a p
 
 | Class | Interval | Membership | Fleet budget |
 | --- | --- | --- | --- |
-| realtime | minutes | feed and sitemap driven, news front pages | 5 percent |
+| realtime | under 1 h | feed and sitemap driven, news front pages | 5 percent |
 | hourly | 1 to 6 h | high lambda, high quality, working revalidator | 10 percent |
-| daily | 1 to 3 d | active pages on quality hosts | 20 percent |
-| weekly | 7 to 30 d | the general web | 25 percent |
-| dormant | 30 to 180 d | never observed to change | 5 percent |
+| daily | 6 h to 3 d | active pages on quality hosts | 20 percent |
+| weekly | 3 to 30 d | the general web | 25 percent |
+| dormant | 30 d and up | never observed to change | 5 percent |
 | discovery | n/a | never fetched | 35 percent |
+
+The intervals in that table are the boundaries the code uses and not a description of them, because a class has to be decided the same way by every backend or the budget means something different in each one.
 
 35 percent to discovery is a policy choice with a clear consequence. At 750 pages/s that is 262 pages/s of new URLs, or 8.3 billion a year, so reaching 100 billion pages on our own hardware is 12 years rather than 4.2. The community fleet changes this arithmetic and nothing else does. The split is configurable and doc 16 raises the discovery share during the initial land grab and lowers it once coverage is respectable.
 
@@ -134,7 +136,13 @@ realtime class (5%)             = 37.5 p/s = 3.2 million/day
 
 So a fresh core of roughly 600 million URLs at 15 day staleness, with about 40 million of them daily, is what the three boxes support. That is the honest version of "fresher than Common Crawl". It is not the whole web kept fresh, it is a large, well chosen core kept fresh while the long tail is revisited on the order of months. Doc 01's target of 100 million in the fresh core has plenty of room.
 
-Class assignment is recomputed on every fetch from lambda, host quality, and revalidator availability. A page moves between classes freely and there is no manual assignment.
+Class assignment is recomputed on every fetch from lambda, host quality, and revalidator availability. A page moves between classes freely and there is no manual assignment. Concretely the class is read off the interval the 9.4 estimator last produced, so there is no second model to keep in step with the first: a page that starts changing daily is in the daily class the moment the estimator notices, and a page that goes quiet leaves it the same way. A URL nobody has fetched is in discovery by definition.
+
+A share is a floor and not a cap. Each class is offered its share of a lease batch first, and whatever the classes did not want is then offered back to them in turn until the batch is full. A frontier that is nothing but discovery still fills every batch, and the split costs nothing when there is nothing to split. Without that second round the shares would be caps, and a fleet whose realtime class is empty would run at 95 percent of its capacity for no reason.
+
+The class is derived, so storing it is redundant, but the state backends store it anyway and it is the leading column of the index the scheduler leases through. That is not a second source of truth, it is an index key, and the rule is that whatever writes the schedule writes the class in the same statement. What it buys is reachability. A share is only enforceable if a class's due work can be reached without walking past everything ahead of it in priority order, and a lease scan is bounded, so a thousand due hourly URLs sitting below a hundred thousand discovery rows would never be reached and their share would be quietly zero. That is the exact failure this section exists to prevent. With the class in the index the scheduler runs one ordered scan per class, each of which is a prefix of the index, and the bound is on the total rather than on each of the six.
+
+The scans stay open across both rounds. Resuming with an offset instead would be slower than not splitting at all, because an offset in SQLite is not a seek and does the joins again for every row it skips, and the round that spends the leftover would redo a large part of the batch. Measured on server3 against the same benchmark that gates doc 08, the split as described is parity with no split on both lease and complete.
 
 ## 9.6 The realtime path
 

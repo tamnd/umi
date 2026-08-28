@@ -37,7 +37,7 @@ use futures_util::stream::FuturesUnordered;
 use umi_extract::extract;
 use umi_fetch::Outcome;
 use umi_state::{
-    Candidate, Discovery, FetchOutcome, FetchResult, LeaseRequest, Pace, Priority, State,
+    Budget, Candidate, Discovery, FetchOutcome, FetchResult, LeaseRequest, Pace, Priority, State,
     StateError,
 };
 use umi_types::{FetcherId, Revalidator, RowKey, Tier, Verification};
@@ -109,6 +109,9 @@ pub struct CrawlConfig {
     /// The default is [`Scope::general`], which is id 0 and admits everything,
     /// so the general crawl and a focused one run the same code.
     pub scope: Arc<Scope>,
+    /// How doc 09.5's refresh classes divide a tick's capacity between new
+    /// URLs and the ones already crawled.
+    pub budget: Budget,
 }
 
 impl CrawlConfig {
@@ -142,6 +145,7 @@ impl Default for CrawlConfig {
             lease_for: Duration::from_secs(60),
             max_depth: umi_frontier::MAX_DEPTH,
             scope: Arc::new(Scope::general()),
+            budget: Budget::DEFAULT,
         }
     }
 }
@@ -260,6 +264,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 max_tier: self.config.max_tier,
                 lease_for: self.config.lease_for,
                 plds: &[],
+                budget: self.config.budget,
             })
             .await?;
 
