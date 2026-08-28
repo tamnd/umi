@@ -557,7 +557,14 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
 
         let (decision, entry) = self
             .robots
-            .decide(&self.fetch, lease.key.host, &origin, &lease.url, now())
+            .decide(
+                &self.fetch,
+                lease.key.host,
+                &origin,
+                &lease.url,
+                lease.tier,
+                now(),
+            )
             .await;
         if !decision.is_allowed() {
             let mut out = Fetched::excluded(&lease, now(), umi_state::ExcludeReason::Robots);
@@ -569,7 +576,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         let started_ms = now();
         let outcome = match self
             .fetch
-            .fetch(&lease.url, lease.revalidate.as_ref())
+            .fetch(&lease.url, lease.revalidate.as_ref(), lease.tier)
             .await
         {
             Ok(outcome) => outcome,
@@ -774,7 +781,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         self.clock
             .sleep_until_ms(self.clock.now_ms().saturating_add(delay))
             .await;
-        match self.fetch.fetch(&lease.url, None).await {
+        match self.fetch.fetch(&lease.url, None, lease.tier).await {
             Ok(fresh @ Outcome::Ok(_)) => (fresh, true),
             _ => (outcome, false),
         }

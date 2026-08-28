@@ -45,3 +45,10 @@ bytes.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 umi-state-sqlite.workspace = true
+
+[features]
+# Doc 05.5's T2, forwarded to umi-fetch. Nothing in this crate changes: the
+# loop asks the ladder for a tier either way and the ladder decides whether it
+# has that rung. The feature is here so a binary can turn T2 on without
+# depending on umi-fetch directly.
+emulation = ["umi-fetch/emulation"]

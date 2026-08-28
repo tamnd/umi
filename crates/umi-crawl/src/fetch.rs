@@ -11,7 +11,7 @@
 //! flaky and would test hyper rather than umi, so the tests here implement this
 //! trait over a map of canned responses instead.
 
-use umi_fetch::{FetchError, Fetcher, Outcome, Revalidator};
+use umi_fetch::{FetchError, Fetcher, Ladder, Outcome, Revalidator, Tier};
 
 /// Somewhere bytes come from.
 ///
@@ -31,6 +31,13 @@ pub trait Fetch: Send + Sync {
     /// ignores it on a host that honours it is wasting the origin's bandwidth
     /// as well as ours.
     ///
+    /// `tier` is what doc 05.8 learned about this host, off the lease. It is a
+    /// request and not an instruction: a fetcher that does not have the rung
+    /// serves the highest one it does have, which for a build without the
+    /// `emulation` feature means a lease at T2 comes back over plain HTTP. The
+    /// loop cannot tell, and does not need to. It reports the block either way
+    /// and doc 05.8 backs the host off on its own.
+    ///
     /// # Errors
     ///
     /// Only for things that are wrong with the request rather than with the
@@ -42,15 +49,35 @@ pub trait Fetch: Send + Sync {
         &self,
         url: &str,
         revalidate: Option<&Revalidator>,
+        tier: Tier,
     ) -> Result<Outcome, FetchError>;
 }
 
+#[async_trait::async_trait]
+impl Fetch for Ladder {
+    async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+        tier: Tier,
+    ) -> Result<Outcome, FetchError> {
+        Self::fetch(self, url, revalidate, tier).await
+    }
+}
+
+/// T1 on its own, for callers that have no ladder to offer.
+///
+/// `umi get` is the honest example: it fetches one URL that a person typed and
+/// there is no host history to have learned a tier from. The tier is ignored
+/// rather than rejected, because refusing would turn a missing rung into an
+/// error the loop would have to handle.
 #[async_trait::async_trait]
 impl Fetch for Fetcher {
     async fn fetch(
         &self,
         url: &str,
         revalidate: Option<&Revalidator>,
+        _tier: Tier,
     ) -> Result<Outcome, FetchError> {
         Self::fetch(self, url, revalidate).await
     }
@@ -62,7 +89,8 @@ impl<T: Fetch + ?Sized> Fetch for std::sync::Arc<T> {
         &self,
         url: &str,
         revalidate: Option<&Revalidator>,
+        tier: Tier,
     ) -> Result<Outcome, FetchError> {
-        (**self).fetch(url, revalidate).await
+        (**self).fetch(url, revalidate, tier).await
     }
 }

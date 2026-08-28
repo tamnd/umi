@@ -42,7 +42,11 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      # Default features here, and in the test and stable jobs below. The one
+      # feature the workspace has is `emulation`, which links BoringSSL and
+      # takes minutes to compile, and doc 05.5 is explicit that it is not part
+      # of an ordinary build. The emulation job is where that rung is checked.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: test (${{ matrix.os }})
@@ -55,7 +59,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace --all-features
+      - run: cargo test --workspace
       - run: cargo build --workspace
 
   # Doc 16's gate 1.2. Doc 11.1 promises byte identical extraction on every
@@ -132,7 +136,7 @@ jobs:
           test "$(rustc +1.98 --version | cut -d' ' -f2)" = 1.98.0
       - env:
           RUSTUP_TOOLCHAIN: "1.98"
-        run: cargo build --workspace --all-features --locked
+        run: cargo build --workspace --locked
 
   # RUSTUP_TOOLCHAIN beats rust-toolchain.toml, which is how this job gets
   # past the pin. Allowed to fail: a new lint in a release nobody has
@@ -149,8 +153,36 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --all-features
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  # Doc 05.5's T2, and doc 16's gate 2.2. Two things are checked here and they
+  # pull in opposite directions: that the rung still compiles and passes its
+  # tests, and that it stays out of everything that did not ask for it.
+  #
+  # Ubuntu only, on purpose. T2 links BoringSSL, which is a cmake and Go
+  # toolchain build measured in minutes, and the fleet doc 15 describes runs
+  # Linux. A break in this rung on macOS or Windows is worth knowing about but
+  # is not worth three times the CI bill on every pull request.
+  emulation:
+    name: emulation feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Before anything is compiled, because this is the check that says the
+      # default tree has no BoringSSL and no OpenSSL in it, and it reads
+      # `cargo tree` rather than a build.
+      - run: ./scripts/check-tls.sh
+      - run: cargo clippy -p umi-cli --all-targets --features emulation -- -D warnings
+      # The live fingerprint check stays ignored here. It talks to a third
+      # party echo endpoint, and a test that goes red because somebody else is
+      # rate limiting us is a test people learn to ignore. Run it by hand after
+      # a dependency bump, as the doc comment on it says.
+      - run: cargo test -p umi-fetch --features emulation
 
   deny:
     name: cargo-deny

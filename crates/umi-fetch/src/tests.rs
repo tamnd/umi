@@ -15,7 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use super::{
-    Failure, FetchConfig, Fetcher, Media, Outcome, RetryAfter, Revalidator, Stage, USER_AGENT,
+    Failure, FetchConfig, Fetcher, Ladder, Media, Outcome, RetryAfter, Revalidator, Stage, Tier,
+    USER_AGENT,
 };
 
 /// What the scripted origin does once it has read a request.
@@ -170,6 +171,40 @@ fn impatient() -> FetchConfig {
 
 fn fetcher(config: FetchConfig) -> Fetcher {
     Fetcher::with_config(config).expect("the client builds")
+}
+
+#[tokio::test]
+async fn a_lease_above_the_top_of_the_ladder_is_served_by_the_top_of_the_ladder() {
+    // Doc 05.8 escalates a host to T2 whether or not this binary has T2, and
+    // the whole crawl would stop for that host if a missing rung were an
+    // error. So the ladder serves the highest rung it has and lets the block
+    // count keep climbing, which is the outcome doc 05.8 already knows how to
+    // handle.
+    let origin =
+        Origin::start(|_| Reply::response(200, &[("content-type", "text/html")], b"ok")).await;
+    let ladder = Ladder::with_config(FetchConfig::default()).expect("the ladder builds");
+
+    for tier in Tier::ALL {
+        let outcome = ladder
+            .fetch(&origin.url("/"), None, tier)
+            .await
+            .expect("a url we can crawl");
+        assert!(matches!(outcome, Outcome::Ok(_)), "{tier:?}: {outcome:?}");
+    }
+    assert_eq!(origin.requests().len(), Tier::ALL.len());
+}
+
+#[test]
+fn the_ladder_says_which_rungs_it_has() {
+    // The build without `emulation` has one rung and the build with it has
+    // two. `umi get` prints this and refuses to pretend, which is the only
+    // reason the constant is public.
+    let expected = if cfg!(feature = "emulation") {
+        Tier::Emulated
+    } else {
+        Tier::Plain
+    };
+    assert_eq!(Ladder::highest(), expected);
 }
 
 #[tokio::test]
@@ -678,18 +713,18 @@ fn a_host_with_a_request_in_flight_keeps_its_permits() {
         host_table_cap: 4,
         ..FetchConfig::default()
     });
-    let busy = fetcher.permits("busy.example.com");
+    let busy = fetcher.inner.permits("busy.example.com");
     for n in 0..64 {
-        drop(fetcher.permits(&format!("idle{n}.example.com")));
+        drop(fetcher.inner.permits(&format!("idle{n}.example.com")));
     }
 
-    let live = fetcher.inner.hosts.lock().expect("not poisoned").len();
+    let live = fetcher.inner.live_hosts();
     assert!(
         live <= 4,
         "the host table grew to {live} entries past a cap of 4"
     );
     assert!(
-        Arc::ptr_eq(&busy, &fetcher.permits("busy.example.com")),
+        Arc::ptr_eq(&busy, &fetcher.inner.permits("busy.example.com")),
         "the busy host lost the semaphore its in flight request was counted against"
     );
 }
@@ -728,12 +763,20 @@ async fn a_url_we_cannot_crawl_is_an_error_and_not_an_outcome() {
 }
 
 #[test]
-fn the_tree_is_rustls_only() {
-    // The issue's third done criterion, and gate 2.2 in doc 16 once `wreq`
-    // arrives with BoringSSL. Reading the lockfile rather than this crate's own
+fn nothing_in_the_lockfile_pulls_in_native_tls() {
+    // Half of gate 2.2. Reading the lockfile rather than this crate's own
     // dependencies is the stricter check and the useful one: two TLS stacks in
     // one binary is the problem, and it does not matter which crate pulled the
     // second one in.
+    //
+    // BoringSSL is deliberately not in this list any more. `wreq` is an
+    // optional dependency and an optional dependency is still locked, so
+    // `btls` has been in Cargo.lock since T2 landed and asserting against it
+    // here would only mean deleting this test the next time anyone looked.
+    // What a build actually compiles is a `cargo tree` question, and
+    // `scripts/check-tls.sh` is where it is asked. This half is still worth
+    // keeping, because it catches the accident: a new dependency that quietly
+    // brings native TLS with it, on a path nobody chose.
     //
     // What is checked is a second implementation, so `schannel`,
     // `security-framework` and `openssl-probe` are all fine to see here. They
@@ -741,10 +784,10 @@ fn the_tree_is_rustls_only() {
     // and Linux, they do no cryptography, and only one of the three is ever
     // compiled for a given target.
     let lock = include_str!("../../../Cargo.lock");
-    for forbidden in ["openssl-sys", "native-tls", "boring-sys", "aws-lc-fips-sys"] {
+    for forbidden in ["openssl-sys", "native-tls", "aws-lc-fips-sys"] {
         assert!(
             !lock.contains(&format!("name = \"{forbidden}\"")),
-            "{forbidden} is in the lockfile, so the tree is not rustls only"
+            "{forbidden} is in the lockfile, so something pulled in native tls"
         );
     }
     assert!(
