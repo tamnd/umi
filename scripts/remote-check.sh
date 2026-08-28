@@ -38,12 +38,22 @@ remote="umi-build"
 
 # `--delete` removes files that were deleted locally, but the excludes keep it
 # away from the target directory, so the cache survives.
-rsync -az --delete \
+changed="$(rsync -az --delete --out-format='%n' \
 	--exclude '.git' \
 	--exclude 'target' \
 	--exclude '.umi' \
 	--exclude 'umi.toml' \
-	"$root/" "$host:$remote/"
+	"$root/" "$host:$remote/" | grep -v -e '/$' -e '^deleting ' || true)"
+
+# rsync keeps the laptop's timestamps and cargo decides what to rebuild from
+# timestamps, so a file that is older here than the artefact the server built
+# from an older copy of it is quietly treated as up to date. That is not a
+# theoretical hazard: it silently benchmarked the wrong binary once. Touching
+# exactly what was transferred fixes it without touching anything else, so
+# incremental builds stay incremental.
+if [ -n "$changed" ]; then
+	printf '%s\n' "$changed" | ssh "$host" "cd $remote && xargs -d '\n' touch --"
+fi
 
 # Incremental compilation is on for the dev profile anyway, but say so, because
 # a stray profile override in CI copied into a shell would turn it off quietly.

@@ -35,7 +35,7 @@ use umi_crawl::robots::{Entry, TTL_MS};
 use umi_crawl::run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
 use umi_fetch::outcome::{Page, Version};
 use umi_fetch::{FetchError, Media, Outcome};
-use umi_state::{Candidate, MemoryState, State};
+use umi_state::{Budget, Candidate, MemoryState, State};
 use umi_types::{FetcherId, Revalidator, RowKey, Tier};
 
 mod support;
@@ -497,6 +497,7 @@ fn config(in_flight: usize, hosts: usize) -> CrawlConfig {
         lease_for: Duration::from_secs(60),
         max_depth: umi_frontier::MAX_DEPTH,
         scope: Arc::new(umi_crawl::Scope::general()),
+        budget: Budget::DEFAULT,
     }
 }
 

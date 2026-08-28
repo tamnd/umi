@@ -58,8 +58,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use umi_state::{
-    AdmitReport, BATCH, Candidate, Discovery, EvictReport, Lease, LeaseRequest, Priority, Result,
-    State,
+    AdmitReport, BATCH, Budget, Candidate, Discovery, EvictReport, Lease, LeaseRequest, Priority,
+    Result, State,
 };
 use umi_types::{FetcherId, PldId, RowKey, Tier, canonicalize};
 
@@ -89,6 +89,12 @@ pub struct Config {
     pub lease_for: Duration,
     /// The link distance past which a URL is not admitted, from doc 09.7.
     pub max_depth: u8,
+    /// How doc 09.5's refresh classes divide a tick's capacity.
+    ///
+    /// The default is the table in that section. Doc 16 raises the discovery
+    /// share during the initial land grab and lowers it once coverage is
+    /// respectable, which is a change to this and to nothing else.
+    pub budget: Budget,
 }
 
 impl Default for Config {
@@ -103,6 +109,7 @@ impl Default for Config {
             max_per_host: 8,
             lease_for: Duration::from_secs(60),
             max_depth: MAX_DEPTH,
+            budget: Budget::DEFAULT,
         }
     }
 }
@@ -435,6 +442,7 @@ impl<S: State> Frontier<S> {
             max_tier: ask.max_tier,
             lease_for: self.config.lease_for,
             plds: &plds,
+            budget: self.config.budget,
         };
         self.state.lease(&req).await
     }

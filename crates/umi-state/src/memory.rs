@@ -18,6 +18,7 @@
 //! simplest correct one and says so, so that a real backend can differ without
 //! that being a bug.
 
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
@@ -25,8 +26,9 @@ use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Ulid, UrlKey, U
 
 use crate::{
     AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult, HostRow,
-    Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Result, Revalidator,
-    SegmentQuery, SegmentRow, State, StateStats, UrlState, next_due_after, retry_after_ms,
+    Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Quotas, RefreshClass, Result,
+    Revalidator, SegmentQuery, SegmentRow, State, StateStats, UrlState, next_due_after,
+    retry_after_ms,
 };
 
 /// A [`State`] that lives entirely in memory.
@@ -77,6 +79,28 @@ struct Entry {
 struct InFlight {
     id: LeaseId,
     expires_ms: u64,
+}
+
+/// A row `lease` is willing to hand out, and the three things it decides in
+/// what order.
+#[derive(Clone, Copy, Debug)]
+struct Ready {
+    key: RowKey,
+    priority: Priority,
+    next_due_ms: u64,
+    class: RefreshClass,
+}
+
+impl Ready {
+    /// Doc 08.4's order. High priority first, then whatever has been waiting
+    /// longest, then the key. The key is the tiebreak that makes this a total
+    /// order, and a total order is what makes a replay produce the same crawl.
+    fn order(a: &Self, b: &Self) -> Ordering {
+        b.priority
+            .cmp(&a.priority)
+            .then(a.next_due_ms.cmp(&b.next_due_ms))
+            .then(a.key.cmp(&b.key))
+    }
 }
 
 /// One URL parked in the holding pen.
@@ -278,7 +302,7 @@ impl State for MemoryState {
         // Choose first, mutate second. Deciding and writing in one pass would
         // make the result depend on map iteration order in a way the
         // determinism promise does not allow.
-        let mut ready: Vec<(RowKey, Priority, u64)> = Vec::new();
+        let mut ready: Vec<Ready> = Vec::new();
         for (key, entry) in &inner.ledger {
             if !req.plds.is_empty() && !req.plds.contains(&key.pld) {
                 continue;
@@ -301,31 +325,75 @@ impl State for MemoryState {
             if !host.is_fetchable(req.now_ms) || !host.tier.reachable_by(req.max_tier) {
                 continue;
             }
-            ready.push((*key, entry.row.priority, entry.row.next_due_ms));
+            ready.push(Ready {
+                key: *key,
+                priority: entry.row.priority,
+                next_due_ms: entry.row.next_due_ms,
+                class: RefreshClass::of_row(&entry.row),
+            });
         }
 
         // High priority first, then whatever has been waiting longest, then
         // the key. The key is the tiebreak that makes this a total order, and
         // a total order is what makes a replay produce the same crawl.
-        ready.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
+        ready.sort_unstable_by(Ready::order);
+
+        // Doc 09.5 splits the batch across the refresh classes, so that
+        // discovery cannot crowd out refresh or the reverse. A share is a floor
+        // and not a cap: a row the quota turns down is kept aside rather than
+        // dropped, and the second pass below fills the batch out of what the
+        // classes that were owed the capacity did not want.
+        let max_urls = req.max_urls as usize;
+        let mut quotas = Quotas::new(&req.budget, req.max_urls);
+        let mut per_host: HashMap<HostId, u32> = HashMap::new();
+        let mut chosen: Vec<Ready> = Vec::new();
+        let mut spare: Vec<Ready> = Vec::new();
+
+        for row in ready {
+            if chosen.len() >= max_urls {
+                break;
+            }
+            if per_host
+                .get(&row.key.host)
+                .is_some_and(|n| *n >= req.max_per_host)
+            {
+                continue;
+            }
+            if !quotas.take(row.class) {
+                if spare.len() < max_urls {
+                    spare.push(row);
+                }
+                continue;
+            }
+            *per_host.entry(row.key.host).or_default() += 1;
+            chosen.push(row);
+        }
+
+        if chosen.len() < max_urls {
+            for row in spare {
+                if chosen.len() >= max_urls {
+                    break;
+                }
+                let held = per_host.entry(row.key.host).or_default();
+                if *held >= req.max_per_host {
+                    continue;
+                }
+                *held += 1;
+                chosen.push(row);
+            }
+            // The top up broke the order the batch is promised in, and only
+            // the top up can, so this is where it is put back.
+            chosen.sort_unstable_by(Ready::order);
+        }
 
         let mut leases = Vec::new();
-        let mut per_host: HashMap<HostId, u32> = HashMap::new();
         // The politeness clock this call is advancing, per host. It starts at
         // the stored timer and moves forward by the host's delay for every
         // lease handed out, so a fetcher holding eight URLs for one host is
         // told to space them out rather than trusted to.
         let mut clock: HashMap<HostId, u64> = HashMap::new();
 
-        for (key, _, _) in ready {
-            if leases.len() >= req.max_urls as usize {
-                break;
-            }
-            let taken = per_host.entry(key.host).or_default();
-            if *taken >= req.max_per_host {
-                continue;
-            }
-
+        for Ready { key, .. } in chosen {
             let host = inner.host_or_default(&key);
             let delay = host.delay().as_millis() as u64;
             let slot = clock
@@ -333,7 +401,6 @@ impl State for MemoryState {
                 .or_insert_with(|| host.next_allowed_ms.max(req.now_ms));
             let not_before_ms = *slot;
             *slot = not_before_ms.saturating_add(delay);
-            *taken += 1;
 
             inner.next_lease += 1;
             let id = LeaseId::from_raw(inner.next_lease);

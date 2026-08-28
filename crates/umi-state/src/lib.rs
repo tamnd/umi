@@ -66,7 +66,8 @@ mod types;
 mod tests;
 
 pub use freshness::{
-    INITIAL_REFRESH, MAX_REFRESH, MIN_REFRESH, next_due_after, refresh_interval_ms,
+    Budget, CLASSES, DAILY_UNDER_MS, HOURLY_UNDER_MS, INITIAL_REFRESH, MAX_REFRESH, MIN_REFRESH,
+    Quotas, REALTIME_UNDER_MS, RefreshClass, WEEKLY_UNDER_MS, next_due_after, refresh_interval_ms,
 };
 pub use memory::MemoryState;
 pub use pace::Pace;
@@ -192,7 +193,11 @@ pub trait State: Send + Sync + 'static {
     /// Ordering is deterministic. Rows are chosen by priority descending, then
     /// by due time ascending, then by [`RowKey`](umi_types::RowKey), so the
     /// same store in the same state at the same `now_ms` produces the same
-    /// leases. That is what makes a crawl replayable.
+    /// leases. That is what makes a crawl replayable. Within that order the
+    /// batch is split across doc 09.5's refresh classes by
+    /// [`LeaseRequest::budget`], so that discovery cannot crowd out refresh or
+    /// the reverse, and the returned leases are in the order above whichever
+    /// classes they came from.
     ///
     /// **Durability: durable.** A lease is on disk before it is returned.
     /// Otherwise a crash would leave a fetcher holding work the coordinator

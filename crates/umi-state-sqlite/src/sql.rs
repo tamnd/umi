@@ -39,6 +39,11 @@ pub const INSERT_SEEN: &str = "INSERT OR IGNORE INTO seen (url_key) VALUES (?1)"
 /// happen if a crash lost the tail of the write ahead log between the two
 /// tables. Keeping the older row is right in that case: it is the one with the
 /// fetch history on it.
+///
+/// `observed_secs` and `refresh_class` are missing from the list on purpose.
+/// Their column defaults are the right answer for a URL nobody has fetched, a
+/// window of nothing and doc 09.5's discovery class, and naming them here would
+/// be two more values to bind on the hottest write in the system.
 pub const INSERT_LEDGER: &str = "
 INSERT OR IGNORE INTO ledger (
     pld, host, url_key, url, url_key_full, depth, priority, state,
@@ -72,6 +77,7 @@ SELECT ledger.pld                              AS pld,
        ledger.depth                            AS depth,
        ledger.priority                         AS priority,
        ledger.fetch_count                      AS fetch_count,
+       ledger.next_due_ms                      AS next_due_ms,
        ledger.last_mod_ms                      AS last_mod_ms,
        etags.etag                              AS etag,
        COALESCE(hosts.adaptive_delay_ms, 1000) AS adaptive_delay_ms,
@@ -98,9 +104,14 @@ SELECT ledger.pld                              AS pld,
 /// The tier clause is `MIN(preferred, max)` and not `preferred` alone, because
 /// a host whose preferred tier sits above its own ceiling is served at the
 /// ceiling. It is `TierPolicy::reachable_by` written in SQL, which is the point.
+///
+/// The class clause is first because it is the leading column of `ledger_ready`
+/// and doc 09.5's budget is enforced by asking for one class at a time. See
+/// [`crate::schema`] version 6 for why the class is a column at all.
 macro_rules! lease_conditions {
     () => {
         "
+   AND ledger.refresh_class = ?3
    AND ledger.next_due_ms <= ?1
    AND (ledger.lease_id IS NULL OR ledger.lease_expires <= ?1)
    AND COALESCE(hosts.blocked, 0) = 0
@@ -125,7 +136,13 @@ macro_rules! lease_order {
     };
 }
 
-/// Ready work, anywhere in the frontier.
+/// Ready work of one refresh class, anywhere in the frontier.
+///
+/// There is no `LIMIT`. The scheduler runs one of these per class and reads as
+/// far down each as it needs, so the row count is decided in Rust with the
+/// cursor still open. A `LIMIT` here would mean a second query and an `OFFSET`
+/// to resume, and an `OFFSET` in SQLite is not a seek: it does the joins for
+/// every row it skips.
 pub const SELECT_READY: &str = concat!(
     lease_columns!(),
     schedulable!(),
@@ -250,9 +267,10 @@ UPDATE ledger SET
     tier_used      = ?12,
     fail_streak    = ?13,
     observed_secs  = ?14,
+    refresh_class  = ?15,
     lease_id       = NULL,
     lease_expires  = NULL
- WHERE pld = ?15 AND host = ?16 AND url_key = ?17";
+ WHERE pld = ?16 AND host = ?17 AND url_key = ?18";
 
 /// Give a url back without recording anything about it.
 ///

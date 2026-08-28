@@ -69,9 +69,9 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use umi_state::{
-    AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult, HostRow,
-    Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Result, Revalidator,
-    SegmentQuery, SegmentRow, State, StateError, StateStats, UrlState, next_due_after,
+    AdmitReport, CLASSES, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult,
+    HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, RefreshClass, Result,
+    Revalidator, SegmentQuery, SegmentRow, State, StateError, StateStats, UrlState, next_due_after,
     retry_after_ms,
 };
 use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
@@ -95,6 +95,10 @@ pub use schema::{APPLICATION_ID, SCHEMA_VERSION};
 /// is skipped. Returning fewer leases than asked for is already normal and is
 /// documented as such on the trait, so hitting this is not an error, but it is
 /// worth knowing it exists.
+///
+/// It is the total over the class scans and not a bound on each of them, so
+/// splitting a batch across doc 09.5's six classes cannot cost six times the
+/// scan.
 pub const LEASE_SCAN_LIMIT: usize = 65_536;
 
 /// How the store is opened.
@@ -465,11 +469,84 @@ struct Chosen {
     priority: Priority,
     attempt: u32,
     etag: Option<String>,
+    next_due_ms: u64,
     last_mod_ms: u64,
     delay_ms: u64,
     next_allowed_ms: u64,
     tier: Tier,
     lying_revalidator: bool,
+}
+
+/// What a lease call has settled on so far, across the class scans.
+struct Picks {
+    /// The batch, in the order the scans happened to produce rather than the
+    /// order it will be handed out in.
+    rows: Vec<Chosen>,
+    /// How much of the batch each host has, for `max_per_host`.
+    per_host: HashMap<HostId, u32>,
+    /// Ledger rows read so far, over every class, against
+    /// [`LEASE_SCAN_LIMIT`].
+    examined: usize,
+}
+
+/// Take up to `want` more rows from one class's cursor, in the order doc 08.4
+/// promises.
+///
+/// The cursor stays open between the two rounds of the split, so the round that
+/// spends what a class did not want resumes exactly where the first round
+/// stopped. A `LIMIT` and an `OFFSET` would read the same thing twice: SQLite
+/// runs the joins for the rows an `OFFSET` skips.
+fn pull(
+    rows: &mut rusqlite::Rows<'_>,
+    want: usize,
+    req: &LeaseRequest<'_>,
+    picks: &mut Picks,
+) -> Result<()> {
+    let mut taken = 0usize;
+    while taken < want && picks.examined < LEASE_SCAN_LIMIT {
+        let Some(r) = rows.next().state()? else { break };
+        picks.examined += 1;
+
+        let key = RowKey {
+            pld: row::pld(r, "pld").state()?,
+            host: row::host(r, "host").state()?,
+            url: row::url_key(r, "url_key").state()?,
+        };
+        let held = picks.per_host.entry(key.host).or_default();
+        if *held >= req.max_per_host {
+            continue;
+        }
+        *held += 1;
+        taken += 1;
+
+        let adaptive: i64 = r.get("adaptive_delay_ms").state()?;
+        let crawl: Option<i64> = r.get("crawl_delay_ms").state()?;
+        let preferred =
+            Tier::from_u8(u8::try_from(r.get::<_, i64>("tier_preferred").state()?).unwrap_or(0))
+                .unwrap_or_default();
+        let ceiling =
+            Tier::from_u8(u8::try_from(r.get::<_, i64>("tier_max").state()?).unwrap_or(0))
+                .unwrap_or_default();
+
+        picks.rows.push(Chosen {
+            key,
+            url: r.get("url").state()?,
+            depth: u8::try_from(r.get::<_, i64>("depth").state()?).unwrap_or(u8::MAX),
+            priority: Priority::from_raw(
+                u16::try_from(r.get::<_, i64>("priority").state()?).unwrap_or(0),
+            ),
+            attempt: u32::try_from(r.get::<_, i64>("fetch_count").state()?).unwrap_or(u32::MAX),
+            etag: r.get("etag").state()?,
+            next_due_ms: row::from_ms(r.get("next_due_ms").state()?),
+            last_mod_ms: row::from_ms(r.get("last_mod_ms").state()?),
+            delay_ms: adaptive.max(crawl.unwrap_or(0)).max(0) as u64,
+            next_allowed_ms: row::from_ms(r.get("next_allowed_ms").state()?),
+            tier: preferred.min(ceiling).min(req.max_tier),
+            lying_revalidator: r.get::<_, i64>("lying_revalidator").state()? != 0,
+        });
+    }
+
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -569,65 +646,72 @@ impl State for SqliteState {
                 }
             }
 
-            let now = row::to_ms(req.now_ms);
-            let max_tier = i64::from(req.max_tier.as_u8());
-            let mut chosen: Vec<Chosen> = Vec::new();
+            let max_urls = req.max_urls as usize;
+            let mut picks = Picks {
+                rows: Vec::new(),
+                per_host: HashMap::new(),
+                examined: 0,
+            };
 
+            // Doc 09.5 splits the batch across the refresh classes, so that
+            // discovery cannot crowd out refresh or the reverse. Each class is
+            // a prefix of `ledger_ready`, so this is one ordered scan per class
+            // rather than one scan of everything and a filter, and the class
+            // with two thousand rows behind a hundred thousand discovery rows
+            // is still reachable.
+            //
+            // All six cursors stay open across both rounds below, which is what
+            // makes the second round free.
             {
                 let statement = if req.plds.is_empty() {
                     sql::SELECT_READY
                 } else {
                     sql::SELECT_READY_IN_PLDS
                 };
-                let mut stmt = tx.prepare_cached(statement).state()?;
-                let mut rows = stmt.query(params![now, max_tier]).state()?;
-                let mut per_host: HashMap<HostId, u32> = HashMap::new();
-                let mut examined = 0usize;
+                let now = row::to_ms(req.now_ms);
+                let max_tier = i64::from(req.max_tier.as_u8());
+                let mut statements = Vec::with_capacity(CLASSES.len());
+                for _ in CLASSES {
+                    statements.push(tx.prepare_cached(statement).state()?);
+                }
+                let mut cursors = Vec::with_capacity(CLASSES.len());
+                for (stmt, class) in statements.iter_mut().zip(CLASSES) {
+                    cursors.push(
+                        stmt.query(params![now, max_tier, i64::from(class.as_u8())])
+                            .state()?,
+                    );
+                }
 
-                while chosen.len() < req.max_urls as usize && examined < LEASE_SCAN_LIMIT {
-                    let Some(r) = rows.next().state()? else { break };
-                    examined += 1;
+                for (rows, class) in cursors.iter_mut().zip(CLASSES) {
+                    let room = max_urls - picks.rows.len();
+                    let want = (req.budget.quota(class, req.max_urls) as usize).min(room);
+                    pull(rows, want, req, &mut picks)?;
+                }
 
-                    let key = RowKey {
-                        pld: row::pld(r, "pld").state()?,
-                        host: row::host(r, "host").state()?,
-                        url: row::url_key(r, "url_key").state()?,
-                    };
-                    let taken = per_host.entry(key.host).or_default();
-                    if *taken >= req.max_per_host {
-                        continue;
+                // A share is a floor and not a cap. Whatever the classes did
+                // not want is offered back to them in turn, each carrying on
+                // from where it stopped, so a frontier that is all discovery
+                // still fills a batch completely and the split costs nothing
+                // when there is nothing to split.
+                for rows in &mut cursors {
+                    let want = max_urls - picks.rows.len();
+                    if want == 0 {
+                        break;
                     }
-                    *taken += 1;
-
-                    let adaptive: i64 = r.get("adaptive_delay_ms").state()?;
-                    let crawl: Option<i64> = r.get("crawl_delay_ms").state()?;
-                    let preferred = Tier::from_u8(
-                        u8::try_from(r.get::<_, i64>("tier_preferred").state()?).unwrap_or(0),
-                    )
-                    .unwrap_or_default();
-                    let ceiling = Tier::from_u8(
-                        u8::try_from(r.get::<_, i64>("tier_max").state()?).unwrap_or(0),
-                    )
-                    .unwrap_or_default();
-
-                    chosen.push(Chosen {
-                        key,
-                        url: r.get("url").state()?,
-                        depth: u8::try_from(r.get::<_, i64>("depth").state()?).unwrap_or(u8::MAX),
-                        priority: Priority::from_raw(
-                            u16::try_from(r.get::<_, i64>("priority").state()?).unwrap_or(0),
-                        ),
-                        attempt: u32::try_from(r.get::<_, i64>("fetch_count").state()?)
-                            .unwrap_or(u32::MAX),
-                        etag: r.get("etag").state()?,
-                        last_mod_ms: row::from_ms(r.get("last_mod_ms").state()?),
-                        delay_ms: adaptive.max(crawl.unwrap_or(0)).max(0) as u64,
-                        next_allowed_ms: row::from_ms(r.get("next_allowed_ms").state()?),
-                        tier: preferred.min(ceiling).min(req.max_tier),
-                        lying_revalidator: r.get::<_, i64>("lying_revalidator").state()? != 0,
-                    });
+                    pull(rows, want, req, &mut picks)?;
                 }
             }
+
+            // The scans went class by class, so the batch is in class order and
+            // has to be put back into the order doc 08.4 promises before it
+            // leaves. It is at most `max_urls` long, which is a thousand.
+            let mut chosen = picks.rows;
+            chosen.sort_unstable_by(|a, b| {
+                b.priority
+                    .cmp(&a.priority)
+                    .then(a.next_due_ms.cmp(&b.next_due_ms))
+                    .then(a.key.cmp(&b.key))
+            });
 
             // The politeness clock this call is advancing, per host. It starts
             // at the stored timer and moves forward by the host's delay for
@@ -876,6 +960,9 @@ impl State for SqliteState {
                         i64::from(row.tier_used.as_u8()),
                         i64::from(row.fail_streak),
                         i64::from(row.observed_secs),
+                        // Written from the schedule it belongs to, in the same
+                        // statement, so the index cannot disagree with the row.
+                        i64::from(RefreshClass::of_row(&row).as_u8()),
                         &outcome.key.pld.as_bytes()[..],
                         &outcome.key.host.as_bytes()[..],
                         &outcome.key.url.as_bytes()[..],
