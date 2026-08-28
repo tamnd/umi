@@ -296,6 +296,44 @@ async fn a_304_is_not_read_as_a_redirect() {
 }
 
 #[tokio::test]
+async fn a_304_carrying_a_body_is_still_a_304() {
+    // The third of doc 05.3's misbehaviours. An origin that sends a body with
+    // a 304 is doing something HTTP does not allow, and the two ways to get it
+    // wrong both cost real money. Reading the body as content would store a
+    // page the origin just told us had not changed, and treating the response
+    // as malformed would fail a url that answered correctly apart from some
+    // bytes nobody asked for.
+    //
+    // Framed by hand rather than through `Reply::response`, which will not
+    // send a content-length on a 304 precisely because this is not a thing an
+    // origin is supposed to do.
+    let body = "<html><body>the origin should not have sent this</body></html>";
+    let head = format!(
+        "HTTP/1.1 304 X\r\netag: \"v2\"\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut raw = head.into_bytes();
+    raw.extend_from_slice(body.as_bytes());
+    let origin = Origin::start(move |_| Reply::Bytes(raw.clone())).await;
+
+    let outcome = fetcher(FetchConfig::default())
+        .fetch(
+            &origin.url("/"),
+            Some(&Revalidator {
+                etag: Some("\"v1\"".to_owned()),
+                last_modified_ms: None,
+            }),
+        )
+        .await
+        .expect("the url parses");
+
+    let Outcome::NotModified { revalidate, .. } = outcome else {
+        panic!("a 304 with a body was not read as a 304: {outcome:?}");
+    };
+    assert_eq!(revalidate.etag.as_deref(), Some("\"v2\""));
+}
+
+#[tokio::test]
 async fn a_same_domain_redirect_is_followed_and_written_down() {
     let origin = Origin::start(|request| {
         if request.starts_with("GET /a ") {
