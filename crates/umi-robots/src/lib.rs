@@ -42,6 +42,10 @@
 
 use std::time::Duration;
 
+mod usage;
+
+pub use usage::{MAX_UNREADABLE, Preference, Usage};
+
 /// The user agent tokens we answer to, in precedence order.
 ///
 /// `umi` first, then the catch all. Nothing else, deliberately: not `umibot`,
@@ -775,3 +779,5 @@ pub fn path_of(url: &str) -> String {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod usage_tests;
