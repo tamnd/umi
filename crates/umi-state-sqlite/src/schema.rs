@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6, V7];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -419,3 +419,35 @@ CREATE INDEX ledger_ready
     r";
 "
 );
+
+/// Version 7: doc 07.7's block list.
+///
+/// Keyed by the pay level domain, because that is the unit a coordinator owns
+/// in doc 03.3 and because a complaint comes from whoever runs the site rather
+/// than from whoever runs one subdomain of it.
+///
+/// It holds lifted blocks as well as live ones. Doc 07.7 says blocks are never
+/// silently reversed and that a domain asking to be unblocked gets a dated
+/// record of both events, so a lift is two columns on the row rather than a
+/// `DELETE`. A deleted row is a record only the person who deleted it can
+/// describe.
+///
+/// There is no index on `lifted_ms` and there is not meant to be one. The whole
+/// table is read into memory when the store is opened, because the enforcement
+/// points are `admit` and `lease` and neither can afford a query per url. A
+/// fleet that has blocked enough domains for that to cost anything has a much
+/// larger problem than this scan.
+///
+/// `domain` sits next to the key it hashes to so the file explains itself. A
+/// `PldId` is eight bytes of blake3 and there is no way back from one, so a
+/// table with only the key in it would be a block nobody could read.
+const V7: &str = r"
+CREATE TABLE blocks (
+    pld           BLOB PRIMARY KEY,
+    domain        TEXT    NOT NULL,
+    reason        TEXT    NOT NULL,
+    blocked_ms    INTEGER NOT NULL,
+    lifted_ms     INTEGER,
+    lifted_reason TEXT    NOT NULL
+) WITHOUT ROWID;
+";

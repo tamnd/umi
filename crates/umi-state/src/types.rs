@@ -10,7 +10,9 @@
 
 use std::time::Duration;
 
-use umi_types::{Digest, FetcherId, HostId, PldId, RowKey, Tier, TierSignal, Ulid, UrlKeyFull};
+use umi_types::{
+    Digest, FetcherId, HostId, PldId, RowKey, Tier, TierSignal, Ulid, UrlKeyFull, pay_level_domain,
+};
 
 use crate::freshness::Budget;
 use crate::pace::Pace;
@@ -702,6 +704,90 @@ impl HostRow {
     pub fn is_fetchable(&self, now_ms: u64) -> bool {
         !self.blocked && !self.refusing && self.next_allowed_ms <= now_ms
     }
+}
+
+/// One domain an operator has told us to stop crawling, from doc 07.7.
+///
+/// The unit is the pay level domain and not the host, because that is the unit
+/// a coordinator owns in doc 03.3 and because a complaint comes from whoever
+/// runs the site rather than from whoever runs one subdomain of it. Blocking
+/// `news.example.com` and leaving `example.com` running would be honouring the
+/// letter of a request and not the request.
+///
+/// A lift is recorded on the same row rather than by deleting it. Doc 07.7 says
+/// blocks are never silently reversed and that a domain asking to be unblocked
+/// gets a dated record of both events, and a row that is deleted is a record
+/// that only the person who deleted it can describe.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct BlockRow {
+    /// The domain, as the key everything else is matched on.
+    pub pld: PldId,
+    /// The same domain as text, because the block is published and a consumer
+    /// reading the list needs a name rather than eight bytes of hash.
+    pub domain: String,
+    /// Why we stopped. Published with the block, so it has to read as something
+    /// written for a stranger a year from now.
+    pub reason: String,
+    /// When the block was applied.
+    pub blocked_ms: u64,
+    /// When it was lifted, or `None` while it is in force.
+    pub lifted_ms: Option<u64>,
+    /// Why it was lifted, empty while it is in force.
+    pub lifted_reason: String,
+}
+
+impl BlockRow {
+    /// A block on whatever registrable domain `domain` falls under.
+    ///
+    /// The input is widened rather than taken literally, and the caller is
+    /// expected to tell the operator that it was. Somebody typing a host name
+    /// is asking for that site to stop being crawled, and the honest reading of
+    /// that is the whole domain.
+    #[must_use]
+    pub fn new(domain: &str, reason: &str, blocked_ms: u64) -> Self {
+        let pld = pay_level_domain(domain);
+        Self {
+            pld: PldId::derive(pld.as_bytes()),
+            domain: pld.to_owned(),
+            reason: reason.to_owned(),
+            blocked_ms,
+            lifted_ms: None,
+            lifted_reason: String::new(),
+        }
+    }
+
+    /// Whether this block still stops anything.
+    #[must_use]
+    pub const fn in_force(&self) -> bool {
+        self.lifted_ms.is_none()
+    }
+
+    /// The same block, lifted, keeping the original dates and reason.
+    #[must_use]
+    pub fn lift(&self, reason: &str, lifted_ms: u64) -> Self {
+        Self {
+            lifted_ms: Some(lifted_ms),
+            lifted_reason: reason.to_owned(),
+            ..self.clone()
+        }
+    }
+}
+
+/// What applying a batch of blocks did to the frontier.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct BlockReport {
+    /// Known URLs moved out of the frontier and into
+    /// [`UrlState::Excluded`](UrlState::Excluded).
+    pub excluded: u64,
+    /// Excluded URLs put back in the frontier by a lift.
+    ///
+    /// A lift restores more than it excluded, because the ledger does not
+    /// record why a URL was excluded and doc 08.4 is deliberate about that: a
+    /// stale reason on a row is worse than no reason at all. So a domain coming
+    /// back brings its robots exclusions back with it, and the robots layer
+    /// excludes them again the next time it looks. That costs one recheck of a
+    /// file we are about to fetch anyway.
+    pub restored: u64,
 }
 
 /// Where a host's robots.txt lives and how long we may believe it.

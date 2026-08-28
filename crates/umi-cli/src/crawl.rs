@@ -81,7 +81,7 @@ use umi_fetch::{FetchConfig, Ladder};
 use umi_file::{StreamKind, WriterConfig};
 use umi_publish::manifest::{FileEntry, Manifest, Verification};
 use umi_publish::repo::Corpus;
-use umi_publish::{Hub, PublishConfig, Published, Publisher, Role, SigningKey};
+use umi_publish::{BlockEntry, Hub, PublishConfig, Published, Publisher, Role, SigningKey};
 use umi_state::{Candidate, SegmentRow, State, StateStats, Stream};
 use umi_state_sqlite::SqliteState;
 use umi_types::{Digest, FetcherId, Tier, Ulid};
@@ -94,7 +94,7 @@ mod tests;
 
 /// The file names doc 13.5 fixes.
 const PROFILE: &str = "profile.toml";
-const STATE: &str = "state.sqlite";
+pub(crate) const STATE: &str = "state.sqlite";
 const SEGMENTS: &str = "segments";
 const DATA: &str = "data";
 const MANIFEST: &str = "manifest.json";
@@ -907,6 +907,26 @@ fn run(
             let added = publisher.announce(&meta_repo(org), clock.now_ms()).await?;
             if added {
                 log.line("the publishing key was added to the key directory")?;
+            }
+
+            // Doc 07.7's block list, and the reason it is here rather than at
+            // the end is the reason the key directory is. A block is fleet
+            // wide, and the published list is how one reaches a coordinator
+            // that was not the machine an operator typed it into. Applied
+            // before the first lease, so a domain somebody asked us to stop is
+            // out of the frontier rather than being noticed on the way past.
+            let published = umi_publish::published_blocks(publisher.hub(), &meta_repo(org)).await?;
+            let blocks: Vec<_> = published.iter().map(BlockEntry::to_row).collect();
+            if !blocks.is_empty() {
+                let report = state
+                    .block(&blocks)
+                    .await
+                    .map_err(|e| Error::State(e.to_string()))?;
+                log.line(&format!(
+                    "{} domains on the published block list, {} urls excluded",
+                    blocks.len(),
+                    report.excluded
+                ))?;
             }
 
             let collected = publisher.collect(&*state, clock.now_ms()).await?;

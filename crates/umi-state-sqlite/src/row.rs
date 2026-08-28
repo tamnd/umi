@@ -21,7 +21,8 @@
 use rusqlite::Row;
 use rusqlite::types::Type;
 use umi_state::{
-    HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Stream, TierPolicy, UrlState,
+    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Stream, TierPolicy,
+    UrlState,
 };
 use umi_types::{Digest, HostId, PldId, Tier, Ulid, UrlKey, UrlKeyFull};
 
@@ -232,6 +233,24 @@ pub fn pacing(row: &Row<'_>, host_id: HostId) -> rusqlite::Result<HostRow> {
         consecutive_failures: small(row, "consecutive_failures")?,
         fast_streak: small(row, "fast_streak")?,
         ..HostRow::default()
+    })
+}
+
+/// Read one of doc 07.7's blocks.
+///
+/// `lifted_ms` is the one column here that carries meaning by being null, and
+/// it is the difference between a block that is in force and a record of one
+/// that was. `lifted_reason` is not null even when there is no lift, because an
+/// empty string is what the type carries and a second way to spell nothing is a
+/// second thing for a reader to check.
+pub fn block(row: &Row<'_>) -> rusqlite::Result<BlockRow> {
+    Ok(BlockRow {
+        pld: pld(row, "pld")?,
+        domain: row.get("domain")?,
+        reason: row.get("reason")?,
+        blocked_ms: from_ms(row.get("blocked_ms")?),
+        lifted_ms: row.get::<_, Option<i64>>("lifted_ms")?.map(from_ms),
+        lifted_reason: row.get("lifted_reason")?,
     })
 }
 

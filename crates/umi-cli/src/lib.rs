@@ -11,6 +11,7 @@
 //! in [`Error::exit`].
 
 pub mod bandwidth;
+pub mod block;
 pub mod config;
 pub mod crawl;
 pub mod doctor;

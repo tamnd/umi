@@ -52,6 +52,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blocklist;
 pub mod convert;
 pub mod directory;
 pub mod gc;
@@ -67,6 +68,7 @@ mod scripted;
 #[cfg(test)]
 mod tests;
 
+pub use blocklist::{BlockEntry, publish_blocks, published_blocks};
 pub use convert::{Converted, Tally, convert, describe};
 pub use gc::{Blocked, Cleared, Evidence};
 pub use hub::{Commit, Hub, HubConfig, Remote, Retry, Upload, Who};
