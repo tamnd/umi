@@ -498,6 +498,12 @@ fn config(in_flight: usize, hosts: usize) -> CrawlConfig {
         max_depth: umi_frontier::MAX_DEPTH,
         scope: Arc::new(umi_crawl::Scope::general()),
         budget: Budget::DEFAULT,
+        rate: umi_frontier::Rate::default(),
+        // Every host here is its own pay level domain, and the default is 64
+        // of them a tick. Left at the default, part 2 would sweep a window of
+        // 512 over 64 domains and measure the domain cap rather than the
+        // window, which is the same trap the batch size above avoids.
+        max_domains: hosts,
     }
 }
 

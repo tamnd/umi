@@ -423,6 +423,75 @@ pub trait State: Send + Sync + 'static {
     async fn stats(&self) -> Result<StateStats>;
 }
 
+/// A shared store is a store.
+///
+/// The crawl loop holds its store as an `Arc<dyn State>`, because the daemon,
+/// the CLI and the tests all want the same one from more than one place, and
+/// the frontier in umi-frontier takes its store by value so that it can hand it
+/// back. Without this the two cannot be composed and the loop has to choose
+/// between the scheduler and being shared, which is not a real choice.
+///
+/// Every method forwards and nothing else happens here. `?Sized` so that
+/// `Arc<dyn State>` is covered and not just `Arc<SqliteState>`.
+#[async_trait::async_trait]
+impl<T: State + ?Sized> State for std::sync::Arc<T> {
+    async fn admit(&self, batch: &[Candidate<'_>]) -> Result<AdmitReport> {
+        (**self).admit(batch).await
+    }
+
+    async fn lease(&self, req: &LeaseRequest<'_>) -> Result<Vec<Lease>> {
+        (**self).lease(req).await
+    }
+
+    async fn complete(&self, outcomes: &[FetchOutcome]) -> Result<()> {
+        (**self).complete(outcomes).await
+    }
+
+    async fn release(&self, lease_ids: &[LeaseId], reason: NackReason) -> Result<()> {
+        (**self).release(lease_ids, reason).await
+    }
+
+    async fn host(&self, id: HostId) -> Result<Option<HostRow>> {
+        (**self).host(id).await
+    }
+
+    async fn put_host(&self, rows: &[HostRow]) -> Result<()> {
+        (**self).put_host(rows).await
+    }
+
+    async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()> {
+        (**self).put_segment(rows).await
+    }
+
+    async fn segment(&self, id: Ulid) -> Result<Option<SegmentRow>> {
+        (**self).segment(id).await
+    }
+
+    async fn segments(&self, query: SegmentQuery) -> Result<Vec<SegmentRow>> {
+        (**self).segments(query).await
+    }
+
+    async fn warm(&self, plds: &[PldId]) -> Result<()> {
+        (**self).warm(plds).await
+    }
+
+    async fn evict(&self, plds: &[PldId]) -> Result<EvictReport> {
+        (**self).evict(plds).await
+    }
+
+    async fn resident(&self) -> Result<Vec<PldId>> {
+        (**self).resident().await
+    }
+
+    async fn checkpoint(&self, now_ms: u64) -> Result<Checkpoint> {
+        (**self).checkpoint(now_ms).await
+    }
+
+    async fn stats(&self) -> Result<StateStats> {
+        (**self).stats().await
+    }
+}
+
 /// How long to wait after a failure, from the ladder in doc 05.8.
 ///
 /// One minute, five, twenty five, two hours, twelve hours, then daily. The

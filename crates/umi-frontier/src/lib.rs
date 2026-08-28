@@ -258,7 +258,20 @@ impl<S: State> Frontier<S> {
         self.admit_at(urls, 0, now_ms, Discovery::Trusted).await
     }
 
-    async fn admit_at(
+    /// Admit a batch at a depth the caller has already worked out.
+    ///
+    /// [`discover`](Self::discover) is this with the depth being the parent's
+    /// plus one, which is what a link off a page is. Doc 13.2's one hop policy
+    /// is the exception: a link out of scope is admitted at the ceiling so that
+    /// whatever it links to is dropped, and the crawl loop has to be able to
+    /// say so. Everything else about the two is the same, including the depth
+    /// cap and the domain becoming schedulable.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports. An error means nothing in the batch was
+    /// admitted.
+    pub async fn admit_at(
         &self,
         links: &[&str],
         depth: u8,
