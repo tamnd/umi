@@ -79,6 +79,7 @@ SELECT ledger.pld                              AS pld,
        ledger.fetch_count                      AS fetch_count,
        ledger.next_due_ms                      AS next_due_ms,
        ledger.last_mod_ms                      AS last_mod_ms,
+       ledger.content_hash                     AS content_hash,
        etags.etag                              AS etag,
        COALESCE(hosts.adaptive_delay_ms, 1000) AS adaptive_delay_ms,
        hosts.crawl_delay_ms                    AS crawl_delay_ms,
@@ -87,6 +88,7 @@ SELECT ledger.pld                              AS pld,
        COALESCE(hosts.tier_max, 2)             AS tier_max,
        COALESCE(hosts.tier_last_success, 1)    AS tier_last_success,
        COALESCE(hosts.tier_probe_down_ms, 0)   AS tier_probe_down_ms,
+       COALESCE(hosts.weak_revalidator, 0)     AS weak_revalidator,
        COALESCE(hosts.lying_revalidator, 0)    AS lying_revalidator
   FROM ledger
   LEFT JOIN hosts ON hosts.host = ledger.host

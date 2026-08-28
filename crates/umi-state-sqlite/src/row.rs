@@ -52,7 +52,7 @@ fn bad(column: &str, why: String, kind: Type) -> rusqlite::Error {
 }
 
 /// A fixed width key column, checked rather than truncated.
-fn bytes<const N: usize>(row: &Row<'_>, column: &str) -> rusqlite::Result<[u8; N]> {
+pub(crate) fn bytes<const N: usize>(row: &Row<'_>, column: &str) -> rusqlite::Result<[u8; N]> {
     let raw: Vec<u8> = row.get(column)?;
     let got = raw.len();
     raw.try_into().map_err(|_| {
@@ -94,7 +94,7 @@ fn url_state(row: &Row<'_>, column: &str) -> rusqlite::Result<UrlState> {
         .ok_or_else(|| bad(column, format!("{raw} is not a url state"), Type::Integer))
 }
 
-fn small<T: TryFrom<i64>>(row: &Row<'_>, column: &str) -> rusqlite::Result<T> {
+pub(crate) fn small<T: TryFrom<i64>>(row: &Row<'_>, column: &str) -> rusqlite::Result<T> {
     let raw: i64 = row.get(column)?;
     T::try_from(raw).map_err(|_| bad(column, format!("{raw} is out of range"), Type::Integer))
 }
@@ -195,7 +195,7 @@ pub fn host_record(row: &Row<'_>) -> rusqlite::Result<HostRow> {
             consecutive_blocks: small(row, "tier_blocks")?,
             last_probe_down_ms: from_ms(row.get("tier_probe_down_ms")?),
             render_required: row.get::<_, i64>("render_required")? != 0,
-            weak_revalidator: row.get::<_, i64>("weak_revalidator")? != 0,
+            weak_hits: small(row, "weak_revalidator")?,
             lying_revalidator: row.get::<_, i64>("lying_revalidator")? != 0,
         },
         content_usage: row.get("content_usage")?,

@@ -475,7 +475,8 @@ struct Chosen {
     next_allowed_ms: u64,
     tier: Tier,
     probe: bool,
-    lying_revalidator: bool,
+    content_hash: [u8; 8],
+    conditional: bool,
 }
 
 /// What a lease call has settled on so far, across the class scans.
@@ -531,6 +532,8 @@ fn pull(
             max: row::tier(r, "tier_max").state()?,
             last_success: row::tier(r, "tier_last_success").state()?,
             last_probe_down_ms: row::from_ms(r.get("tier_probe_down_ms").state()?),
+            weak_hits: row::small(r, "weak_revalidator").state()?,
+            lying_revalidator: r.get::<_, i64>("lying_revalidator").state()? != 0,
             ..TierPolicy::new()
         };
 
@@ -549,7 +552,8 @@ fn pull(
             next_allowed_ms: row::from_ms(r.get("next_allowed_ms").state()?),
             tier: policy.start_at(req.max_tier, req.now_ms),
             probe: policy.probing(req.now_ms),
-            lying_revalidator: r.get::<_, i64>("lying_revalidator").state()? != 0,
+            content_hash: row::bytes(r, "content_hash").state()?,
+            conditional: policy.conditional(),
         });
     }
 
@@ -763,12 +767,15 @@ impl State for SqliteState {
                         tier: row.tier,
                         probe: row.probe,
                         not_before_ms,
+                        delay_ms: u32::try_from(row.delay_ms).unwrap_or(u32::MAX),
                         expires_ms,
-                        // A host that lies about its revalidators gets
-                        // unconditional requests, per doc 05.8. Sending one it
-                        // will ignore costs a round trip and saves nothing.
-                        revalidate: (!revalidate.is_empty() && !row.lying_revalidator)
+                        // A host that lies about its revalidators, or ignores
+                        // them, gets unconditional requests, per doc 05.3.
+                        // Sending one it will not honour costs a round trip
+                        // and saves nothing.
+                        revalidate: (!revalidate.is_empty() && row.conditional)
                             .then_some(revalidate),
+                        content_hash: (row.content_hash != [0u8; 8]).then_some(row.content_hash),
                     });
                 }
             }
@@ -1112,7 +1119,7 @@ impl State for SqliteState {
                         i64::from(host.tier.consecutive_blocks),
                         row::to_ms(host.tier.last_probe_down_ms),
                         i64::from(host.tier.render_required),
-                        i64::from(host.tier.weak_revalidator),
+                        i64::from(host.tier.weak_hits),
                         i64::from(host.tier.lying_revalidator),
                         host.content_usage.as_deref(),
                         row::join_sitemaps(&host.sitemaps),

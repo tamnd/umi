@@ -129,6 +129,14 @@ pub struct CrawlConfig {
     /// The scheduler asks the store once per domain, so this is also the most
     /// round trips a tick can cost. See [`umi_frontier::Config::max_domains`].
     pub max_domains: usize,
+    /// One in how many 304s to check by fetching the page anyway.
+    ///
+    /// Doc 05.3's second trap is an origin that answers 304 when the content
+    /// has changed, usually a misconfigured cache in front of it, and there is
+    /// no way to notice it from the 304 itself. The sampled unconditional
+    /// fetch is the only thing that catches it, and one in a hundred costs
+    /// about a percent of the saving T0 exists for. Zero turns it off.
+    pub audit_every: u32,
 }
 
 impl CrawlConfig {
@@ -183,6 +191,8 @@ impl Default for CrawlConfig {
             budget: Budget::DEFAULT,
             rate: Rate::default(),
             max_domains: FrontierConfig::default().max_domains,
+            // Doc 05.3's 1 percent.
+            audit_every: 100,
         }
     }
 }
@@ -417,7 +427,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 // the row away and this is what is left of it. A block that
                 // does have a row is an honest 403 and is counted as a
                 // failure like any other.
-                if learned.signal == TierSignal::Blocked && row.is_none() {
+                if learned.signal == Some(TierSignal::Blocked) && row.is_none() {
                     report.challenged += 1;
                 }
                 // The `teaches` check belongs here and not in `relearn`, even
@@ -429,10 +439,14 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                     learn(&mut signals, learned);
                 }
             }
+            // Counted off the completion rather than off the row, because a
+            // 304 has no row. Everything else does.
+            if matches!(outcome.result, umi_state::FetchResult::NotModified { .. }) {
+                report.not_modified += 1;
+            }
             if let Some(row) = row {
                 match row.outcome {
                     umi_types::OutcomeCode::Ok => report.fetched += 1,
-                    umi_types::OutcomeCode::NotModified => report.not_modified += 1,
                     _ => report.failed += 1,
                 }
                 report.bytes_fetched += u64::from(row.content_length);
@@ -481,9 +495,22 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             let Some(mut host) = self.state().host(learned.host).await? else {
                 continue;
             };
-            let mut changed = host.tier.observe(learned.signal, learned.tier, now_ms);
+            let mut changed = match learned.signal {
+                Some(signal) => host.tier.observe(signal, learned.tier, now_ms),
+                None => false,
+            };
 
-            if learned.signal == TierSignal::Blocked {
+            // Doc 05.3's two verdicts. Both of them cost the host its T0, and
+            // both are applied before the ladder's backoff below so that a
+            // host that is both lying and blocking gets one write.
+            for _ in 0..learned.weak {
+                changed |= host.tier.saw_full_body();
+            }
+            if learned.lie {
+                changed |= host.tier.saw_lie();
+            }
+
+            if learned.signal == Some(TierSignal::Blocked) {
                 // Doc 05.8's exponential backoff. Separate from doc 07.6's
                 // adaptive delay, which the completion has already applied,
                 // and larger: a host that is refusing us is not asking us to
@@ -549,6 +576,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             Err(_) => return Fetched::malformed(&lease, now()),
         };
 
+        let (outcome, audited) = self.audit(&lease, outcome).await;
         let fetched_at_ms = now();
         let pace = pace_of(&outcome, started_ms, fetched_at_ms);
 
@@ -569,6 +597,28 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             return Fetched::excluded(&lease, fetched_at_ms, reason).paced(pace);
         }
 
+        // Doc 05.3: a 304 is not a page. No extraction runs and no row is
+        // written, only the ledger's last_checked and the next due time move.
+        // A row here would be a copy of one we published already with the
+        // content taken out, and at steady state most of a crawl is 304s, so
+        // writing them would fill the corpus with them. The one 304 that does
+        // go on past here is the audited one, which `audit` has already turned
+        // back into the body it was hiding.
+        if let Outcome::NotModified { revalidate, .. } = &outcome {
+            let result = FetchResult::NotModified {
+                status: 304,
+                revalidate: revalidate.clone(),
+            };
+            let mut out = Fetched::answered(&lease, fetched_at_ms, result).paced(pace);
+            out.signal = Some(Learned::tiered(
+                lease.key.host,
+                TierSignal::Success,
+                lease.tier,
+                lease.probe,
+            ));
+            return out;
+        }
+
         let host = host_of(&lease.url).unwrap_or_default();
         let extracted = match &outcome {
             Outcome::Ok(page) if page.media == umi_fetch::Media::Html => {
@@ -583,12 +633,8 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         // together. The status alone cannot tell a page from a wall, and the
         // extraction alone cannot tell a thin page from a shell.
         let signal = tier_signal(&outcome, extracted.as_ref());
-        let learned = signal.map(|signal| Learned {
-            host: lease.key.host,
-            signal,
-            tier: lease.tier,
-            probe: lease.probe,
-        });
+        let learned =
+            signal.map(|signal| Learned::tiered(lease.key.host, signal, lease.tier, lease.probe));
 
         // A challenge page is not a fetch. It keeps no row, so it is never
         // published and never counted as content, and it goes back as a
@@ -666,6 +712,27 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             .filter_map(|url| self.follow(url, lease.depth, limit))
             .collect();
 
+        // Doc 05.3's two traps, both of which need the stored hash and the new
+        // one side by side and so cannot be seen anywhere but here.
+        let learned = match reval_signal(&lease, &row, audited) {
+            None => learned,
+            Some(reval) => {
+                let mut learned = learned.unwrap_or(Learned {
+                    host: lease.key.host,
+                    signal: None,
+                    tier: lease.tier,
+                    probe: lease.probe,
+                    weak: 0,
+                    lie: false,
+                });
+                match reval {
+                    Reval::Weak => learned.weak += 1,
+                    Reval::Lie => learned.lie = true,
+                }
+                Some(learned)
+            }
+        };
+
         let outcome = FetchOutcome {
             lease: lease.id,
             key: lease.key,
@@ -682,6 +749,53 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             disallowed: false,
             signal: learned,
         }
+    }
+
+    /// Doc 05.3's sampled check on a 304, which is the only way to catch an
+    /// origin that answers one when the content has moved.
+    ///
+    /// The second request goes out a politeness delay after the first, not
+    /// straight away. Doc 07.6 is one request per host per delay and it has no
+    /// exception for a request we are making to check up on the host, so an
+    /// audit that skipped the wait would be the crawler breaking its own rule
+    /// in the course of enforcing one.
+    ///
+    /// A refetch that fails leaves the 304 standing. The audit is a check on
+    /// the origin and a failed check is not evidence of anything.
+    async fn audit(&self, lease: &umi_state::Lease, outcome: Outcome) -> (Outcome, bool) {
+        let sampled = matches!(outcome, Outcome::NotModified { .. })
+            && lease.content_hash.is_some()
+            && self.sampled(lease);
+        if !sampled {
+            return (outcome, false);
+        }
+
+        let delay = u64::from(lease.delay_ms);
+        self.clock
+            .sleep_until_ms(self.clock.now_ms().saturating_add(delay))
+            .await;
+        match self.fetch.fetch(&lease.url, None).await {
+            Ok(fresh @ Outcome::Ok(_)) => (fresh, true),
+            _ => (outcome, false),
+        }
+    }
+
+    /// Whether this lease is one of the sampled fraction.
+    ///
+    /// The url key and the attempt count together, so that the sample is a
+    /// different set of urls every time round rather than the same one percent
+    /// of the frontier for the life of the crawl. Deterministic, so a test can
+    /// ask for all of them or none.
+    fn sampled(&self, lease: &umi_state::Lease) -> bool {
+        let every = u64::from(self.config.audit_every);
+        if every == 0 {
+            return false;
+        }
+        let mut head = [0u8; 8];
+        head.copy_from_slice(&lease.key.url.as_bytes()[..8]);
+        let mixed =
+            u64::from_le_bytes(head) ^ u64::from(lease.attempt).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        mixed % every == 0
     }
 
     /// Doc 13.2's link policy: whether to enqueue one link, and at what depth.
@@ -770,20 +884,42 @@ struct Fetched {
 /// order would make the answer depend on which fetch finished first.
 struct Learned {
     host: umi_types::HostId,
-    signal: TierSignal,
+    /// What the answer said about the ladder, when it said anything. A 404 and
+    /// a timeout say nothing, but they can still carry a revalidation verdict.
+    signal: Option<TierSignal>,
     /// The tier the fetch that produced `signal` ran at.
     tier: Tier,
     /// Whether that fetch was doc 05.8's probe at a cheaper tier.
     probe: bool,
+    /// How many times in this tick the host answered a conditional request
+    /// with a full body carrying content we already had. Doc 05.3's first
+    /// trap, counted rather than flagged because it takes three of them.
+    weak: u16,
+    /// Whether the host was caught saying 304 about content that had moved.
+    /// Doc 05.3's second trap, which takes one.
+    lie: bool,
 }
 
 impl Learned {
+    /// The tier half of one answer, with nothing learned about revalidation.
+    const fn tiered(host: umi_types::HostId, signal: TierSignal, tier: Tier, probe: bool) -> Self {
+        Self {
+            host,
+            signal: Some(signal),
+            tier,
+            probe,
+            weak: 0,
+            lie: false,
+        }
+    }
+
     /// How bad the news is, for the fold. Higher wins.
-    const fn weight(signal: TierSignal) -> u8 {
+    const fn weight(signal: Option<TierSignal>) -> u8 {
         match signal {
-            TierSignal::Success => 0,
-            TierSignal::Shell => 1,
-            TierSignal::Blocked => 2,
+            None => 0,
+            Some(TierSignal::Success) => 1,
+            Some(TierSignal::Shell) => 2,
+            Some(TierSignal::Blocked) => 3,
         }
     }
 
@@ -796,22 +932,67 @@ impl Learned {
     /// that wants more than T1. There is nothing to learn from it and nothing
     /// to write, so it never becomes a lookup.
     const fn teaches(&self) -> bool {
+        if self.weak > 0 || self.lie {
+            return true;
+        }
         match self.signal {
-            TierSignal::Success => self.probe || self.tier as u8 > Tier::Plain as u8,
-            TierSignal::Blocked | TierSignal::Shell => true,
+            Some(TierSignal::Success) => self.probe || self.tier as u8 > Tier::Plain as u8,
+            Some(TierSignal::Blocked | TierSignal::Shell) => true,
+            None => false,
         }
     }
 }
 
 /// Fold one answer into what the tick knows about that host.
+///
+/// The two halves fold differently and have to. The tier signal is a verdict,
+/// so the worst one in the tick wins and the rest are noise. The weak
+/// revalidator count is evidence, so it adds up, because doc 05.3 asks for
+/// three observations and a host that produced three of them inside one tick
+/// has still produced three of them.
 fn learn(signals: &mut Vec<Learned>, learned: Learned) {
     let Some(seen) = signals.iter_mut().find(|l| l.host == learned.host) else {
         signals.push(learned);
         return;
     };
     if Learned::weight(learned.signal) > Learned::weight(seen.signal) {
-        *seen = learned;
+        seen.signal = learned.signal;
+        seen.tier = learned.tier;
+        seen.probe = learned.probe;
     }
+    seen.weak = seen.weak.saturating_add(learned.weak);
+    seen.lie |= learned.lie;
+}
+
+/// Which of doc 05.3's two traps this answer walked into, if either.
+///
+/// Both of them are a comparison between the body we just got and the digest
+/// of the one we already had, which is why neither can be seen in the fetcher
+/// or in the store. The fetcher does not know what we had and the store does
+/// not see the body.
+fn reval_signal(lease: &umi_state::Lease, row: &PageRow, audited: bool) -> Option<Reval> {
+    let stored = lease.content_hash?;
+    if row.outcome != umi_types::OutcomeCode::Ok {
+        return None;
+    }
+    let same = content_hash(row) == stored;
+    if audited {
+        // We asked without a validator on purpose, so the body is the truth
+        // and the 304 that preceded it was a claim about that truth.
+        return (!same).then_some(Reval::Lie);
+    }
+    // We sent a validator and the origin spent a full body telling us what we
+    // already had. One of those is a coincidence, three is a habit.
+    (lease.revalidate.is_some() && same).then_some(Reval::Weak)
+}
+
+/// One host's answer to doc 05.3's question about whether it revalidates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Reval {
+    /// Ignored a validator we sent and returned content we already had.
+    Weak,
+    /// Said 304 about content that had changed.
+    Lie,
 }
 
 impl Fetched {
