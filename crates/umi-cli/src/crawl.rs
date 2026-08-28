@@ -1,4 +1,5 @@
-//! `umi crawl` and `umi resume`, which is doc 13.5's crawl directory.
+//! `umi crawl`, `umi resume` and `umi watch`, which is doc 13.5's crawl
+//! directory.
 //!
 //! Everything below this file already exists and is tested on its own: the
 //! scope decides what is in, the frontier decides what is next, the fetcher
@@ -42,6 +43,19 @@
 //! line per segment saying which repository it went to and under what digest,
 //! which is the operator's record of where their crawl ended up.
 //!
+//! # With `--watch`
+//!
+//! The same loop, without the rule that stops it when the frontier drains.
+//! Everything that keeps a watch honest is in doc 09: a completed row gets a
+//! due time from the change rate estimator and is leasable again when that
+//! time arrives, so a watch does not need a scheduler of its own and does not
+//! have one. What it needs is to survive being left alone for a fortnight,
+//! which is two things. It backs off between empty ticks, because a crawl that
+//! is meant to be idle most of the time must not poll a database once a second
+//! to prove it. And it stops on the first interrupt rather than dying, because
+//! a process killed between two seals loses the rows in the open segment, and
+//! ctrl-c is how every long running command ends.
+//!
 //! # Deleting things
 //!
 //! Without `--publish`, only one path in here deletes anything, and it deletes
@@ -68,7 +82,7 @@ use umi_file::{StreamKind, WriterConfig};
 use umi_publish::manifest::{FileEntry, Manifest, Verification};
 use umi_publish::repo::Corpus;
 use umi_publish::{Hub, PublishConfig, Published, Publisher, Role, SigningKey};
-use umi_state::{Candidate, SegmentRow, State, Stream};
+use umi_state::{Candidate, SegmentRow, State, StateStats, Stream};
 use umi_state_sqlite::SqliteState;
 use umi_types::{Digest, FetcherId, Tier, Ulid};
 
@@ -99,6 +113,30 @@ const PUBLISHED: &str = "published.jsonl";
 /// politeness window, and the shortest useful wait is about that long. Asking
 /// faster is a spin loop that produces no fetches.
 const IDLE_WAIT: Duration = Duration::from_millis(1000);
+
+/// The longest a watching crawl waits between asking an idle frontier again.
+///
+/// A watch is idle most of the time on purpose, and at [`IDLE_WAIT`] it spends
+/// that time waking up once a second to run a lease query and a counter read
+/// that find nothing. Neither is expensive on its own, which is why this is a
+/// minute and not an hour, but doc 16 runs a watch for a fortnight next to a
+/// general crawl that wants the whole box, and a wakeup a second for a
+/// fortnight is a million of them. Measured over three minutes of watching a
+/// drained frontier on server3: 0.55 seconds of cpu and 824 voluntary context
+/// switches at one second, against 0.19 and 66 with the backoff.
+///
+/// What it costs in return is up to a minute of delay on a refresh. Doc 09.4
+/// will not schedule a URL closer than five minutes out however fast it
+/// changes, so the worst case is a page fetched at six minutes rather than
+/// five, and every other class is hours or days.
+const WATCH_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// How often a watching crawl says it is still there.
+///
+/// Doc 14.1 asks for progress that means something, and a command that prints
+/// nothing for six hours is indistinguishable from a hung one. This is slow
+/// enough that a fortnight of it is a readable log.
+const HEARTBEAT: Duration = Duration::from_secs(300);
 
 /// How long a frontier may hold work it never hands out before we stop.
 ///
@@ -256,6 +294,10 @@ pub enum Stop {
     Idle,
     /// A budget in doc 13.2 was reached. Doc 14.9's exit 4.
     Budget,
+    /// The operator interrupted it. Doc 14.9 has no code for that and does not
+    /// need one: stopping is what was asked for, so it is exit 0 like any other
+    /// command that did the thing.
+    Signal,
 }
 
 /// Start a new crawl in a fresh or existing directory.
@@ -879,6 +921,9 @@ fn run(
 
         let mut stall = Stall::default();
         let mut frontier = Frontier::default();
+        let mut backoff = Backoff::default();
+        let mut heartbeat = Heartbeat::default();
+        let mut interrupt = interrupt();
         loop {
             let report = crawler
                 .tick(&sink)
@@ -901,6 +946,16 @@ fn run(
                 let now_ms = clock.now_ms();
                 let queued = frontier.get(&*state, now_ms).await?;
                 log.line(&progress(&summary, &report, queued, started_ms, now_ms))?;
+                backoff.reset();
+            }
+
+            // After the tick and after the harvest, so an interrupt costs at
+            // most the fetches already in flight and never a segment. The
+            // completions this tick is holding are written either way.
+            if *interrupt.borrow_and_update() {
+                log.line("interrupted, stopping")?;
+                summary.stopped = Stop::Signal;
+                break;
             }
 
             if let Some(stop) = spent(&summary, settings, started_ms, clock.now_ms()) {
@@ -916,10 +971,12 @@ fn run(
             // finishes after five pages and still exits zero, which is the
             // worst kind of wrong: it looks like a complete crawl.
             //
-            // So an idle tick asks the state what is left. The count is two
-            // table scans on the sqlite backend, which is why it is on this
-            // branch and not on every tick: an idle tick is by definition one
-            // with no fetching to slow down.
+            // So an idle tick asks the state what is left. It is on this branch
+            // and not on every tick because an idle tick is by definition one
+            // with no fetching to slow down, and at gate 1.1's 250 pages a
+            // second a counter read per tick is a lock taken on the store's
+            // connection several hundred times a second for a number nothing
+            // decides anything on.
             if report.idle() {
                 let now_ms = clock.now_ms();
                 let stats = state
@@ -938,7 +995,24 @@ fn run(
                     ))?;
                     break;
                 }
-                tokio::time::sleep(IDLE_WAIT).await;
+                if settings.watch && heartbeat.due(now_ms) {
+                    log.line(&watching(&summary, &stats, started_ms, now_ms))?;
+                }
+                let wait = if settings.watch {
+                    backoff.next()
+                } else {
+                    IDLE_WAIT
+                };
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    // Waiting a minute to notice ctrl-c would make a watch feel
+                    // hung at exactly the moment somebody is trying to stop it.
+                    // A closed channel means there is no interrupt to wait for,
+                    // and `select!` drops a branch whose pattern does not match,
+                    // so that case leaves the sleep on its own rather than
+                    // spinning on an error.
+                    Ok(()) = interrupt.changed() => {}
+                }
             } else {
                 stall = Stall::default();
             }
@@ -1377,6 +1451,88 @@ impl Frontier {
     }
 }
 
+/// The ctrl-c switch, as something the loop can both test and wait on.
+///
+/// A watch runs for days, and the way it ends is somebody pressing ctrl-c, so
+/// what happens then is part of the design rather than an afterthought. The
+/// default handler kills the process wherever it happens to be, and the rows
+/// fetched since the last seal are in a segment whose footer nobody has written
+/// yet. So the first interrupt sets this, the loop sees it at the top of its
+/// next pass, and it leaves through the same path a budget leaves through,
+/// which seals the segment and converts it.
+///
+/// The second interrupt is the escape hatch, because the first one still waits
+/// for the fetches in flight and a slow origin can hold those for a timeout.
+/// 130 is the shell's number for a process ended by SIGINT, and it is not in
+/// doc 14.9 because doc 14.9 is about codes umi chooses.
+fn interrupt() -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        // An error here is a platform that will not give us the signal. Then
+        // there is nothing to report and nothing to wait for, and the sender
+        // dropping is how the loop finds that out.
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        eprintln!("umi: stopping after the fetches in flight, interrupt again to quit now");
+        tx.send_replace(true);
+        if tokio::signal::ctrl_c().await.is_ok() {
+            std::process::exit(130);
+        }
+    });
+    rx
+}
+
+/// How long to wait after an idle tick, which is the whole cost of a watch.
+///
+/// It doubles from [`IDLE_WAIT`] up to [`WATCH_MAX_WAIT`] and drops back to the
+/// floor as soon as a tick leases anything. Doubling is right because the two
+/// reasons a tick comes back empty are opposite. A host inside doc 07.6's
+/// politeness window has work coming in about a second, and a frontier whose
+/// next refresh is due at four in the morning has nothing coming for hours.
+/// Neither says which it is, but how long it lasts does, so the wait is short
+/// while it might be the first and long once it is clearly the second.
+#[derive(Default)]
+struct Backoff {
+    /// The last wait handed out, or `None` before the first one.
+    wait: Option<Duration>,
+}
+
+impl Backoff {
+    fn next(&mut self) -> Duration {
+        let wait = self
+            .wait
+            .map_or(IDLE_WAIT, |last| (last * 2).min(WATCH_MAX_WAIT));
+        self.wait = Some(wait);
+        wait
+    }
+
+    fn reset(&mut self) {
+        self.wait = None;
+    }
+}
+
+/// The timer behind [`HEARTBEAT`].
+#[derive(Default)]
+struct Heartbeat {
+    said_ms: Option<u64>,
+}
+
+impl Heartbeat {
+    /// Whether it is time to say something, which it always is the first time.
+    /// A watch that printed nothing until five minutes in would look like a
+    /// watch that had not started.
+    fn due(&mut self, now_ms: u64) -> bool {
+        let due = self
+            .said_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= HEARTBEAT.as_millis() as u64);
+        if due {
+            self.said_ms = Some(now_ms);
+        }
+        due
+    }
+}
+
 /// The "nothing is moving" detector behind [`STALL_LIMIT`].
 ///
 /// It watches the pending count rather than a clock on its own, because a
@@ -1429,6 +1585,36 @@ fn progress(
         summary.failed,
         bottleneck(report),
     )
+}
+
+/// The line a watch prints while there is nothing to fetch.
+///
+/// Doc 14.1 asks for progress that means something, and for a watch the useful
+/// thing is not pages per second, it is what the frontier is holding and how
+/// much of it has ever been fetched. Doc 09's schedule is what decides when the
+/// next one comes due, and a watch with a healthy schedule looks exactly like a
+/// watch that has hung, so the log has to be the difference.
+fn watching(summary: &Summary, stats: &StateStats, started_ms: u64, now_ms: u64) -> String {
+    format!(
+        "watching  {} scheduled  {} never fetched  {} in flight  {} rows this run  up {}",
+        stats.urls_fetched,
+        stats.urls_pending,
+        stats.leases_in_flight,
+        summary.rows,
+        span(now_ms.saturating_sub(started_ms)),
+    )
+}
+
+/// A duration in the shortest form that is still honest, for a log a person
+/// reads a fortnight of.
+fn span(ms: u64) -> String {
+    let secs = ms / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m", secs / 60),
+        3600..86_400 => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
+        _ => format!("{}d{:02}h", secs / 86_400, (secs % 86_400) / 3600),
+    }
 }
 
 /// Doc 14.3's one word answer to "why is this not faster".

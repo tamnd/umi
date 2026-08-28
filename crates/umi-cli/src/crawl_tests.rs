@@ -9,8 +9,9 @@
 use std::time::Duration;
 
 use super::{
-    Layout, Log, Options, Publishing, Settings, Stall, Stop, Summary, adopt, day, default_out,
-    delay_ms, profile_toml, scope_for, seed_url, settings, sources, spent, tier,
+    Backoff, HEARTBEAT, Heartbeat, IDLE_WAIT, Layout, Log, Options, Publishing, Settings, Stall,
+    Stop, Summary, WATCH_MAX_WAIT, adopt, day, default_out, delay_ms, profile_toml, scope_for,
+    seed_url, settings, sources, span, spent, tier,
 };
 use crate::config::{Config, Flags, Paths};
 
@@ -215,6 +216,67 @@ fn any_movement_at_all_resets_the_stall_clock() {
         "and the five minutes now runs from there, not from the start"
     );
     assert!(stall.stuck(8, 599_999));
+}
+
+#[test]
+fn a_watch_backs_off_to_a_minute_and_stays_there() {
+    // The reason this exists is arithmetic. A fortnight at one second is 1.2
+    // million lease queries and as many counter reads, all of them finding
+    // nothing, and the counter read is the expensive one on a real frontier.
+    let mut backoff = Backoff::default();
+    assert_eq!(backoff.next(), IDLE_WAIT, "the first wait is the short one");
+    let mut waits = vec![];
+    for _ in 0..20 {
+        waits.push(backoff.next());
+    }
+    assert_eq!(waits[0], IDLE_WAIT * 2);
+    assert_eq!(waits[1], IDLE_WAIT * 4);
+    assert_eq!(*waits.last().expect("waits"), WATCH_MAX_WAIT);
+    assert!(
+        waits.iter().all(|w| *w <= WATCH_MAX_WAIT),
+        "the ceiling is what bounds how late a refresh can be"
+    );
+}
+
+#[test]
+fn one_leased_url_puts_the_wait_back_on_the_floor() {
+    // A watch that has just found work is a watch that is about to find more,
+    // because doc 09 schedules a domain's urls near each other in time. Coming
+    // out of the long wait has to be immediate or the first refresh of the day
+    // drags the rest of the day behind it a minute at a time.
+    let mut backoff = Backoff::default();
+    for _ in 0..20 {
+        backoff.next();
+    }
+    backoff.reset();
+    assert_eq!(backoff.next(), IDLE_WAIT);
+}
+
+#[test]
+fn a_watch_says_something_immediately_and_then_on_the_heartbeat() {
+    let mut heartbeat = Heartbeat::default();
+    let every = HEARTBEAT.as_millis() as u64;
+    assert!(
+        heartbeat.due(5_000),
+        "a watch that printed nothing for five minutes would look like a hung one"
+    );
+    assert!(!heartbeat.due(5_000 + every - 1));
+    assert!(heartbeat.due(5_000 + every));
+    assert!(!heartbeat.due(5_000 + every + 1));
+}
+
+#[test]
+fn durations_in_the_log_are_readable_at_every_scale() {
+    assert_eq!(span(0), "0s");
+    assert_eq!(span(59_999), "59s");
+    assert_eq!(span(60_000), "1m");
+    assert_eq!(span(3_599_999), "59m");
+    assert_eq!(span(3_600_000), "1h00m");
+    assert_eq!(span(86_399_000), "23h59m");
+    assert_eq!(span(86_400_000), "1d00h");
+    // The number the whole command is for: doc 16's gate 2.5 is a watch left
+    // running for a fortnight.
+    assert_eq!(span(14 * 86_400_000 + 3_600_000), "14d01h");
 }
 
 #[test]

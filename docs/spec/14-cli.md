@@ -133,6 +133,21 @@ Everything after that is doc 12, unchanged. The same eight steps, the same read 
 
 It does not crawl, seed or extract. If the directory is short of pages the answer is `umi resume`, and this stays the command that publishes what is there.
 
+### `umi resume` and `umi watch`
+
+```
+umi resume ./example.com
+umi watch ./example.com
+```
+
+Both continue a crawl directory and neither takes a scope, because doc 13.5's promise is that the directory is the unit and everything a continuation needs is already in it. Neither reseeds either, since a resume that put the seeds back in the frontier on every restart would be a crawl that never finished.
+
+The difference is the stop rule. `umi resume` stops when the frontier is empty, the same as the crawl that made the directory. `umi watch` does not stop, and refreshes what it has instead, on the schedule doc 09.4's estimator wrote onto each row when it was fetched. There is nothing else to it: a completed row carries its own due time and becomes leasable again when that time arrives, so watching is the ordinary loop without the exit.
+
+Two things make it survivable over days rather than minutes. It backs off between empty ticks, from one second to a minute, and drops back to a second the moment a tick leases anything, because a command that is meant to be idle most of the time should not wake up once a second for a fortnight to prove it. And it stops on the first interrupt rather than dying on it: ctrl-c lets the fetches in flight finish, seals the open segment, converts it like any other, and exits 0, because the operator asked it to stop and it stopped. A second interrupt is the escape hatch for a slow origin holding the last fetch, and that one is the shell's 130.
+
+While it is quiet it says so every five minutes, with what the frontier holds and how long it has been up. A watch with a healthy schedule and a watch that has hung look exactly alike otherwise, and the log is the difference.
+
 ## 14.4 `umi fetch`
 
 The one command in doc 04's design constraint.
