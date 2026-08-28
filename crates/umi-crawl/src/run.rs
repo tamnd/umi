@@ -52,7 +52,7 @@ use umi_types::{FetcherId, Revalidator, Tier, TierSignal, Verification};
 use crate::clock::Clock;
 use crate::fetch::Fetch;
 use crate::page::{Crawled, PageRow};
-use crate::render::{RenderBudget, RenderPolicy};
+use crate::render::{RenderBudget, RenderPolicy, Slot};
 use crate::robots::RobotsCache;
 use crate::scope::{LinkPolicy, Scope};
 
@@ -608,7 +608,11 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 return Some((lease, due));
             }
             match self.render.take(self.clock.now_ms()) {
-                Some(at) => {
+                // A fleet with no browser at all serves the rung it does have,
+                // for the reason on `Slot::NoBrowser`. It is not counted as a
+                // render, because nothing rendered.
+                Slot::NoBrowser => return Some((lease, due)),
+                Slot::At(at) => {
                     report.rendered += 1;
                     // The later of the two waits. Politeness is owed to the
                     // origin and the budget is owed to the browser, and a page
@@ -616,7 +620,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                     // other.
                     return Some((lease, due.max(at)));
                 }
-                None => deferred.push(lease.id),
+                Slot::Defer => deferred.push(lease.id),
             }
         }
         None

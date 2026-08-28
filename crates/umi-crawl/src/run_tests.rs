@@ -1824,11 +1824,16 @@ async fn rendering_past_the_budget_is_deferred_and_not_fetched() {
 }
 
 #[tokio::test]
-async fn a_page_that_needs_a_browser_is_never_fetched_without_one() {
-    // The mistake worth guarding against, because it is invisible. A shell page
-    // fetched at T1 comes back 200 with markup on it, doc 05.8 reads that as a
-    // success and confirms the cheap tier, and the crawl stores an empty page
-    // and stops asking for a browser it was right to want.
+async fn a_fleet_with_no_browser_at_all_fetches_the_page_anyway() {
+    // The failure this is really about is a spin. A deferred lease keeps its
+    // due time, so if a machine with no browser deferred every page that wants
+    // one, the next tick would lease the same pages, defer them again, and do
+    // that for the week until doc 05.8 probes the host back down. Meanwhile
+    // nothing else gets leased.
+    //
+    // So a missing browser behaves like a missing T2: the page goes out at the
+    // rung the ladder has. The answer is probably a shell, which is a worse row
+    // than a rendered one and a much better outcome than a crawl that stopped.
     let url = "https://example.com/a";
     let state = seeded(&[url]).await;
     wants_rendering(&state, &[url]).await;
@@ -1842,23 +1847,56 @@ async fn a_page_that_needs_a_browser_is_never_fetched_without_one() {
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 1);
-    assert_eq!(report.deferred, 1);
-    assert_eq!(report.rendered, 0);
-    assert_eq!(report.rows, 0);
+    assert_eq!(report.deferred, 0, "there is no queue worth waiting in");
+    assert_eq!(report.rendered, 0, "nothing rendered, because nothing can");
+    assert_eq!(report.rows, 1);
     assert!(
-        crawler.fetcher().asked().is_empty(),
-        "a page with no browser for it was fetched anyway"
+        crawler.fetcher().asked().contains(&url.to_owned()),
+        "the page never went out"
     );
+    assert_eq!(crawler.render().deferred(), 0);
+    assert_eq!(crawler.render().granted(), 0);
 
-    // Not a failure either, which is the other half of it. A url that came back
-    // as failed would take a backoff and count against the host, and nothing
-    // about this is the host's doing.
-    let host = umi_types::RowKey::for_url(url, None)
-        .expect("a crawlable url")
-        .host;
-    let row = state.host(host).await.expect("host").expect("a record");
-    assert_eq!(row.consecutive_failures, 0);
-    assert_eq!(row.tier.preferred, Tier::Rendered, "the ladder moved");
+    // And the tick after it has nothing left, rather than the same page again.
+    let again = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(again.leased, 0, "the same page came back around");
+}
+
+#[tokio::test]
+async fn a_page_deferred_for_a_busy_browser_is_not_a_failure() {
+    // The other half of the deferral: a url that came back as failed would take
+    // a backoff and count against the host, and nothing about a busy browser is
+    // the host's doing.
+    let urls: Vec<String> = (0..2).map(|n| format!("https://s{n}.example/a")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    wants_rendering(&state, &refs).await;
+
+    let mut fetch = Canned::new().renders(1.0);
+    for url in &refs {
+        let origin = url.trim_end_matches("/a");
+        fetch = fetch
+            .robots(origin, "User-agent: *\nAllow: /\n")
+            .html(url, &page("A", &[]));
+    }
+    let clock = Arc::new(FixedClock::at(T0));
+    let crawler = with_browser(fetch, Arc::clone(&state), &clock);
+    let sink = Collected::default();
+
+    // One slot a second and a five second wait, so the second page is inside
+    // the wait and both go through. Making the second one defer needs a tick
+    // wider than the wait, which the budget test covers directly.
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.leased, 2);
+    assert_eq!(report.rendered, 2);
+    for url in &refs {
+        let host = umi_types::RowKey::for_url(url, None)
+            .expect("a crawlable url")
+            .host;
+        let row = state.host(host).await.expect("host").expect("a record");
+        assert_eq!(row.consecutive_failures, 0);
+        assert_eq!(row.tier.preferred, Tier::Rendered, "the ladder moved");
+    }
 }
 
 #[tokio::test]

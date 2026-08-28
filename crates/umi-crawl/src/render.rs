@@ -73,6 +73,36 @@ impl Default for RenderPolicy {
     }
 }
 
+/// What the budget says about one page that wants a browser.
+///
+/// Three answers and not two, because "wait your turn" and "there is no queue
+/// to wait in" are different situations with different right responses, and a
+/// budget that answered no to both would stall a crawl on a machine that never
+/// had a browser in the first place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// Render it, no earlier than this millisecond.
+    At(u64),
+    /// Doc 05.9's deferred queue. There is a browser and it is busy, so this
+    /// page goes back to the frontier and somebody asks again later.
+    Defer,
+    /// Nothing in reach renders at all.
+    ///
+    /// Not a deferral, because deferring assumes somebody will eventually be
+    /// able to do the work and here nobody can. The page goes out at whatever
+    /// rung the ladder does have, which is the same thing a build with no
+    /// `emulation` feature does with a lease that asks for T2: the crawl keeps
+    /// moving, the answer is probably a shell, and doc 05.8's weekly probe
+    /// brings the host back down to a tier this fleet can actually serve.
+    ///
+    /// The alternative was tried on paper and it is worse. A deferred lease
+    /// keeps its due time, so a tick would lease it, defer it, and lease it
+    /// again on the next tick, for the week until the probe. That is a spin,
+    /// and it spends the frontier's whole lease budget on pages nothing can
+    /// fetch.
+    NoBrowser,
+}
+
 /// The budget itself.
 ///
 /// A virtual clock rather than a token bucket, which is the same arithmetic
@@ -130,26 +160,23 @@ impl RenderBudget {
 
     /// Take a slot for one render.
     ///
-    /// `Some(at)` is the earliest millisecond the render may start, which the
-    /// caller waits for. `None` means defer this page: no slot was taken, and
-    /// the caller is expected to give the lease back rather than fetch it at a
-    /// cheaper tier. Serving a shell page at T1 would look like a success and
-    /// teach doc 05.8 nothing.
-    pub fn take(&self, now_ms: u64) -> Option<u64> {
+    /// A slot is only spent on [`Slot::At`]. The other two answers take
+    /// nothing, so a tick full of pages that want a browser does not use up a
+    /// budget it never got to spend.
+    pub fn take(&self, now_ms: u64) -> Slot {
         let mut bucket = self.lock();
         let Some(interval) = bucket.interval_ms else {
-            bucket.deferred += 1;
-            return None;
+            return Slot::NoBrowser;
         };
         let at = bucket.next_ms.max(now_ms);
         let wait_ms = u64::try_from(self.policy.wait.as_millis()).unwrap_or(u64::MAX);
         if at.saturating_sub(now_ms) > wait_ms {
             bucket.deferred += 1;
-            return None;
+            return Slot::Defer;
         }
         bucket.next_ms = at.saturating_add(interval);
         bucket.granted += 1;
-        Some(at)
+        Slot::At(at)
     }
 
     /// The budget in pages a second, which is zero for a process that cannot

@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use crate::render::{RenderBudget, RenderPolicy};
+use crate::render::{RenderBudget, RenderPolicy, Slot};
 
 const T0: u64 = 1_700_000_000_000;
 
@@ -19,18 +19,22 @@ fn budget(capacity: f64) -> RenderBudget {
 }
 
 #[test]
-fn a_process_with_no_browser_renders_nothing() {
+fn a_process_with_no_browser_says_so_rather_than_deferring() {
     let budget = RenderBudget::new(RenderPolicy::default());
     assert_eq!(budget.rate(), 0.0);
-    assert_eq!(budget.take(T0), None);
-    assert_eq!(budget.deferred(), 1);
+    assert_eq!(budget.take(T0), Slot::NoBrowser);
+    // Not a deferral. Deferring here is the spin described on `Slot`, since
+    // the lease would come straight back on the next tick and get the same
+    // answer for the week until doc 05.8 probes the host down again.
+    assert_eq!(budget.deferred(), 0);
 
     // And it stays that way when the fetcher says so, rather than falling back
     // to some default rate. A build without the render feature answers `None`
     // here, and reading that as unlimited would send every escalated page to a
     // browser that does not exist.
     budget.observe(None);
-    assert_eq!(budget.take(T0), None);
+    assert_eq!(budget.take(T0), Slot::NoBrowser);
+    assert_eq!(budget.granted(), 0);
 }
 
 #[test]
@@ -64,9 +68,9 @@ fn renders_come_out_one_interval_apart() {
     // browser would be handed the whole tick's rendering in the first
     // millisecond of it.
     let budget = budget(2.0);
-    assert_eq!(budget.take(T0), Some(T0));
-    assert_eq!(budget.take(T0), Some(T0 + 500));
-    assert_eq!(budget.take(T0), Some(T0 + 1000));
+    assert_eq!(budget.take(T0), Slot::At(T0));
+    assert_eq!(budget.take(T0), Slot::At(T0 + 500));
+    assert_eq!(budget.take(T0), Slot::At(T0 + 1000));
     assert_eq!(budget.granted(), 3);
     assert_eq!(budget.deferred(), 0);
 }
@@ -78,8 +82,8 @@ fn a_rate_that_does_not_divide_a_second_rounds_down_the_budget() {
     // direction that costs somebody else something: it means handing the
     // browser more than it measured itself able to do.
     let budget = budget(1.8);
-    assert_eq!(budget.take(T0), Some(T0));
-    assert_eq!(budget.take(T0), Some(T0 + 556));
+    assert_eq!(budget.take(T0), Slot::At(T0));
+    assert_eq!(budget.take(T0), Slot::At(T0 + 556));
     assert!(budget.rate() < 1.8);
 }
 
@@ -91,16 +95,16 @@ fn work_that_would_wait_too_long_is_deferred_rather_than_queued() {
     // frontier for a later tick to offer again.
     let budget = budget(1.0);
     for hop in 0..6 {
-        assert_eq!(budget.take(T0), Some(T0 + hop * 1000), "hop {hop}");
+        assert_eq!(budget.take(T0), Slot::At(T0 + hop * 1000), "hop {hop}");
     }
-    assert_eq!(budget.take(T0), None);
+    assert_eq!(budget.take(T0), Slot::Defer);
     assert_eq!(budget.granted(), 6);
     assert_eq!(budget.deferred(), 1);
 
     // A deferral takes no slot. If it did, a crawl asking for more rendering
     // than the fleet has would push the queue further out every time it asked
     // and eventually stop rendering at all.
-    assert_eq!(budget.take(T0 + 6000), Some(T0 + 6000));
+    assert_eq!(budget.take(T0 + 6000), Slot::At(T0 + 6000));
 }
 
 #[test]
@@ -109,11 +113,11 @@ fn a_budget_that_was_idle_does_not_bank_the_time() {
     // An hour of no rendering does not buy an hour's worth of renders at once,
     // it buys one now and the rest at the usual spacing.
     let budget = budget(2.0);
-    assert_eq!(budget.take(T0), Some(T0));
+    assert_eq!(budget.take(T0), Slot::At(T0));
 
     let later = T0 + 3_600_000;
-    assert_eq!(budget.take(later), Some(later));
-    assert_eq!(budget.take(later), Some(later + 500));
+    assert_eq!(budget.take(later), Slot::At(later));
+    assert_eq!(budget.take(later), Slot::At(later + 500));
 }
 
 #[test]
@@ -123,12 +127,16 @@ fn the_budget_moves_when_the_pool_does() {
     // own estimate is out by about a factor of two, which is exactly why this
     // is asked for again every tick rather than read once at startup.
     let budget = budget(2.0);
-    assert_eq!(budget.take(T0), Some(T0));
-    assert_eq!(budget.take(T0), Some(T0 + 500));
+    assert_eq!(budget.take(T0), Slot::At(T0));
+    assert_eq!(budget.take(T0), Slot::At(T0 + 500));
 
     budget.observe(Some(0.5));
-    assert_eq!(budget.take(T0), Some(T0 + 1000));
-    assert_eq!(budget.take(T0), Some(T0 + 3000), "the slower pace applied");
+    assert_eq!(budget.take(T0), Slot::At(T0 + 1000));
+    assert_eq!(
+        budget.take(T0),
+        Slot::At(T0 + 3000),
+        "the slower pace applied"
+    );
 }
 
 #[test]
@@ -143,7 +151,7 @@ fn a_wait_of_zero_makes_it_a_gate() {
     let budget = RenderBudget::new(policy);
     budget.observe(Some(2.0));
 
-    assert_eq!(budget.take(T0), Some(T0));
-    assert_eq!(budget.take(T0), None);
-    assert_eq!(budget.take(T0 + 500), Some(T0 + 500));
+    assert_eq!(budget.take(T0), Slot::At(T0));
+    assert_eq!(budget.take(T0), Slot::Defer);
+    assert_eq!(budget.take(T0 + 500), Slot::At(T0 + 500));
 }

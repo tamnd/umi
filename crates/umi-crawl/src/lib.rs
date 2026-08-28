@@ -54,7 +54,7 @@ pub use clock::{Clock, FixedClock, SystemClock};
 pub use digest::extract_digest;
 pub use fetch::Fetch;
 pub use page::{Crawled, PageBuilder, PageRow, Snippet, SnippetKind};
-pub use render::{RenderBudget, RenderPolicy};
+pub use render::{RenderBudget, RenderPolicy, Slot};
 pub use robots::RobotsCache;
 pub use run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
 pub use scope::{
