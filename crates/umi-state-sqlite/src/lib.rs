@@ -69,10 +69,10 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use umi_state::{
-    AdmitReport, CLASSES, Candidate, Checkpoint, DAILY_UNDER_MS, Discovery, EvictReport,
-    FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow,
-    NackReason, Priority, REALTIME_UNDER_MS, RefreshClass, Result, Revalidator, SegmentQuery,
-    SegmentRow, State, StateError, StateStats, TierPolicy, UrlState, WEEKLY_UNDER_MS,
+    AdmitReport, BlockReport, BlockRow, CLASSES, Candidate, Checkpoint, DAILY_UNDER_MS, Discovery,
+    EvictReport, FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow, Lease, LeaseId, LeaseRequest,
+    LedgerRow, NackReason, Priority, REALTIME_UNDER_MS, RefreshClass, Result, Revalidator,
+    SegmentQuery, SegmentRow, State, StateError, StateStats, TierPolicy, UrlState, WEEKLY_UNDER_MS,
     next_due_dated, retry_after_ms,
 };
 use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
@@ -192,6 +192,12 @@ struct Inner {
     /// fleet wide and a vanishing fraction of them are blocked, so this is
     /// small enough to hold and important enough to be exact.
     blocked: HashSet<HostId>,
+    /// Doc 07.7's blocks that are still in force, for the same reason and at a
+    /// hundredth of the size. Two sets rather than one, because a blocked host
+    /// is what doc 05.8 sets when a site refuses us and a block is what an
+    /// operator sets when somebody asks us to stop. Merging them would let the
+    /// tier logic clear a block.
+    blocked_plds: HashSet<PldId>,
     next_lease: u64,
     checkpoint_seq: u64,
 }
@@ -252,6 +258,7 @@ impl SqliteState {
         migrate(&conn)?;
 
         let blocked = load_blocked(&conn)?;
+        let blocked_plds = load_blocked_plds(&conn)?;
         let next_lease = meta_u64(&conn, "next_lease")?.unwrap_or(0);
         let checkpoint_seq = meta_u64(&conn, "checkpoint_seq")?.unwrap_or(0);
 
@@ -259,6 +266,7 @@ impl SqliteState {
             inner: Mutex::new(Inner {
                 conn,
                 blocked,
+                blocked_plds,
                 next_lease,
                 checkpoint_seq,
             }),
@@ -429,6 +437,22 @@ fn load_blocked(conn: &Connection) -> Result<HashSet<HostId>> {
     Ok(hosts)
 }
 
+/// The domains doc 07.7 says to leave alone, read once at open.
+///
+/// Lifted entries are left out, because this set is the enforcement and not the
+/// record. The record is the whole table and [`State::blocks`] reads it.
+fn load_blocked_plds(conn: &Connection) -> Result<HashSet<PldId>> {
+    let mut stmt = conn
+        .prepare("SELECT pld FROM blocks WHERE lifted_ms IS NULL")
+        .state()?;
+    let plds = stmt
+        .query_map([], |r| row::pld(r, "pld"))
+        .state()?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .state()?;
+    Ok(plds)
+}
+
 fn meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
     let value: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -503,6 +527,7 @@ fn pull(
     rows: &mut rusqlite::Rows<'_>,
     want: usize,
     req: &LeaseRequest<'_>,
+    blocked_plds: &HashSet<PldId>,
     picks: &mut Picks,
 ) -> Result<()> {
     let mut taken = 0usize;
@@ -515,6 +540,17 @@ fn pull(
             host: row::host(r, "host").state()?,
             url: row::url_key(r, "url_key").state()?,
         };
+        // Doc 07.7 enforces a block at lease issue and not at fetch. Applying
+        // one already took the domain's rows out of the frontier, so this only
+        // catches a row that arrived some other way, but a block that depends
+        // on the sweep having reached everything is a block with an ordering
+        // bug waiting in it. It is a hash of eight bytes against a set that is
+        // almost always empty, and it comes before the per host accounting so
+        // that a blocked url cannot spend another host's allowance.
+        if blocked_plds.contains(&key.pld) {
+            continue;
+        }
+
         let held = picks.per_host.entry(key.host).or_default();
         if *held >= req.max_per_host {
             continue;
@@ -570,7 +606,12 @@ impl State for SqliteState {
 
         blocking(|| {
             let mut guard = self.lock();
-            let Inner { conn, blocked, .. } = &mut *guard;
+            let Inner {
+                conn,
+                blocked,
+                blocked_plds,
+                ..
+            } = &mut *guard;
             set_sync(conn, Sync::Buffered)?;
             let tx = conn.transaction().state()?;
             let mut report = AdmitReport::default();
@@ -612,7 +653,16 @@ impl State for SqliteState {
                         continue;
                     }
 
-                    if blocked.contains(&candidate.key.host) {
+                    // Doc 07.7's block list and doc 05.8's blocked host, which
+                    // are the only two exclusions state applies by itself.
+                    // robots and scope are decided above this, because state
+                    // does not fetch robots.txt and does not own the crawl's
+                    // configuration. The url is still written down: a candidate
+                    // that is refused and forgotten costs the same decision
+                    // again on every page that links to it.
+                    if blocked_plds.contains(&candidate.key.pld)
+                        || blocked.contains(&candidate.key.host)
+                    {
                         let mut row = pending_row(candidate);
                         row.state = UrlState::Excluded;
                         row.next_due_ms = u64::MAX;
@@ -715,7 +765,7 @@ impl State for SqliteState {
                 for (rows, class) in cursors.iter_mut().zip(CLASSES) {
                     let room = max_urls - picks.rows.len();
                     let want = (req.budget.quota(class, req.max_urls) as usize).min(room);
-                    pull(rows, want, req, &mut picks)?;
+                    pull(rows, want, req, &inner.blocked_plds, &mut picks)?;
                 }
 
                 // A share is a floor and not a cap. Whatever the classes did
@@ -728,7 +778,7 @@ impl State for SqliteState {
                     if want == 0 {
                         break;
                     }
-                    pull(rows, want, req, &mut picks)?;
+                    pull(rows, want, req, &inner.blocked_plds, &mut picks)?;
                 }
             }
 
@@ -988,6 +1038,19 @@ impl State for SqliteState {
                     }
                 }
 
+                // A block landing while this fetch was in flight. The
+                // completion is recorded, because the page really was fetched
+                // and the segment already has it, and then the row goes back
+                // out of the frontier where the block put it. Without this the
+                // answer would reschedule the url and a blocked domain would
+                // keep one page alive for as long as the crawl ran.
+                if inner.blocked_plds.contains(&outcome.key.pld)
+                    || inner.blocked.contains(&outcome.key.host)
+                {
+                    row.state = UrlState::Excluded;
+                    row.next_due_ms = u64::MAX;
+                }
+
                 tx.prepare_cached(sql::UPDATE_LEDGER)
                     .state()?
                     .execute(params![
@@ -1174,6 +1237,100 @@ impl State for SqliteState {
                 }
             }
             Ok(())
+        })
+    }
+
+    async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {
+        if rows.is_empty() {
+            return Ok(BlockReport::default());
+        }
+
+        blocking(|| {
+            let mut guard = self.lock();
+            let Inner {
+                conn, blocked_plds, ..
+            } = &mut *guard;
+            // Durable, and the trait says why: doc 07.7 commits to applying a
+            // block within an hour of a valid request, and a block a crash can
+            // undo is not a block.
+            set_sync(conn, Sync::Durable)?;
+            let tx = conn.transaction().state()?;
+            let mut report = BlockReport::default();
+
+            {
+                // Three statements held open at once against a cache of
+                // sixteen, which would matter on a hot path and does not here.
+                // This runs when a complaint arrives.
+                let mut put = tx.prepare_cached(sql::PUT_BLOCK).state()?;
+                let mut exclude = tx.prepare_cached(sql::EXCLUDE_PLD).state()?;
+                let mut restore = tx.prepare_cached(sql::RESTORE_PLD).state()?;
+                let edges = class_edges();
+                let never = row::to_ms(u64::MAX);
+
+                for block in rows {
+                    put.execute(params![
+                        &block.pld.as_bytes()[..],
+                        block.domain.as_str(),
+                        block.reason.as_str(),
+                        row::to_ms(block.blocked_ms),
+                        block.lifted_ms.map(row::to_ms),
+                        block.lifted_reason.as_str(),
+                    ])
+                    .state()?;
+
+                    match block.lifted_ms {
+                        None => {
+                            let moved = exclude
+                                .execute(params![&block.pld.as_bytes()[..], never])
+                                .state()?;
+                            report.excluded += moved as u64;
+                        }
+                        Some(lifted_ms) => {
+                            // Due at the moment of the lift rather than now, so
+                            // that the domain comes back where the record says
+                            // it did and a replayed batch lands on the same
+                            // schedule as the first one.
+                            let moved = restore
+                                .execute(params![
+                                    &block.pld.as_bytes()[..],
+                                    row::to_ms(lifted_ms),
+                                    edges[0],
+                                    edges[1],
+                                    edges[2],
+                                    edges[3],
+                                ])
+                                .state()?;
+                            report.restored += moved as u64;
+                        }
+                    }
+                }
+            }
+
+            tx.commit().state()?;
+
+            // After the commit, so a batch that failed leaves the set agreeing
+            // with the file rather than with what the caller wanted.
+            for block in rows {
+                if block.in_force() {
+                    blocked_plds.insert(block.pld);
+                } else {
+                    blocked_plds.remove(&block.pld);
+                }
+            }
+            Ok(report)
+        })
+    }
+
+    async fn blocks(&self) -> Result<Vec<BlockRow>> {
+        blocking(|| {
+            let guard = self.lock();
+            let mut stmt = guard.conn.prepare_cached(sql::SELECT_BLOCKS).state()?;
+            let rows = stmt
+                .query_map([], row::block)
+                .state()?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .state()?;
+            Ok(rows)
         })
     }
 
@@ -1383,20 +1540,29 @@ fn pending_row(candidate: &Candidate<'_>) -> LedgerRow {
 /// Returns 1 if the row moved and 0 if it did not, which is what the caller adds
 /// to [`AdmitReport::refreshed`]. Every reason to do nothing is in the statement
 /// rather than here, so this is one round trip whatever the answer is.
-fn bring_forward(
-    stmt: &mut rusqlite::CachedStatement<'_>,
-    candidate: &Candidate<'_>,
-    lastmod_ms: u64,
-) -> Result<u32> {
-    // The class boundaries are durations rather than timestamps, but they cross
-    // the same u64 to i64 gap and clamping is the same answer.
-    let edges = [
+/// Doc 09.5's class boundaries, on their way into a statement that decides a
+/// class in SQL.
+///
+/// Two statements need them, and both bind them rather than writing them into
+/// the SQL, so that [`RefreshClass::of`] stays the only place the numbers are
+/// decided. They are durations rather than timestamps, but they cross the same
+/// u64 to i64 gap and clamping is the same answer.
+fn class_edges() -> [i64; 4] {
+    [
         REALTIME_UNDER_MS,
         HOURLY_UNDER_MS,
         DAILY_UNDER_MS,
         WEEKLY_UNDER_MS,
     ]
-    .map(row::to_ms);
+    .map(row::to_ms)
+}
+
+fn bring_forward(
+    stmt: &mut rusqlite::CachedStatement<'_>,
+    candidate: &Candidate<'_>,
+    lastmod_ms: u64,
+) -> Result<u32> {
+    let edges = class_edges();
     let moved = stmt
         .execute(params![
             &candidate.key.pld.as_bytes()[..],

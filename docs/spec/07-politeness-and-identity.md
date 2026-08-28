@@ -102,7 +102,13 @@ There is a contact address on the bot page and it goes to a person. The operatio
 
 `umi block <domain> --reason <text>` writes a permanent entry to state that removes the domain from the frontier, prevents future admission, and marks existing published rows for exclusion in the next corpus revision. The block list is published in `open-index/umi-meta` so that a downstream consumer of an older snapshot can honour it too. This matters: an open corpus that cannot be retroactively corrected is a liability, and the mechanism has to exist before the first complaint, not after.
 
-Blocks are never silently reversed. A domain that asks to be unblocked gets a dated record of both events.
+The unit is the registrable domain and not the host. Somebody typing `news.example.com` is asking for that site to stop being crawled, and blocking one host while the rest of the site keeps being fetched would honour the letter of the request rather than the request. The command widens what it was given and says so, because a block that quietly covers more than was typed is as bad as one that quietly covers less.
+
+Enforcement is at lease issue and not at fetch. Applying a block takes the domain's known URLs out of the frontier in the same transaction that records it, and the check at lease issue is what covers a URL that arrives afterwards by some other route. A block that depended on the sweep having reached everything would be a block with an ordering bug waiting in it.
+
+The published list is how a block reaches the rest of the fleet. Each entry is one file under `blocks/` in `open-index/umi-meta`, holding the domain, the reason and the dates, and a coordinator applies the published list to its own frontier before its first fetch. One file per domain rather than one list everybody rewrites, so that two operators working at once cannot lose each other's entry and a consumer who cares about one domain reads one small file.
+
+Blocks are never silently reversed. A domain that asks to be unblocked gets a dated record of both events. `umi block <domain> --lift --reason <text>` writes the lift onto the entry that is already there, keeping the original date and the original reason, and the entry stays in the published list forever. A lift gives back every URL of the domain that was excluded, not only the ones the block took, because the ledger does not record why a URL was excluded and section 08.4 is deliberate about that. The robots layer excludes the robots ones again the next time it looks, which costs one recheck of a file we are about to fetch anyway.
 
 ## 7.8 What we do not do
 

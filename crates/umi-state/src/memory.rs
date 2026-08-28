@@ -25,10 +25,10 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Ulid, UrlKey, UrlKeyFull};
 
 use crate::{
-    AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult, HostRow,
-    Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, Quotas, RefreshClass, Result,
-    Revalidator, SegmentQuery, SegmentRow, State, StateStats, UrlState, next_due_dated,
-    retry_after_ms,
+    AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
+    FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,
+    Priority, Quotas, RefreshClass, Result, Revalidator, SegmentQuery, SegmentRow, State,
+    StateStats, UrlState, next_due_dated, retry_after_ms,
 };
 
 /// A [`State`] that lives entirely in memory.
@@ -48,6 +48,10 @@ struct Inner {
     /// that iterating it gives the scan shape a real backend gets for free.
     ledger: BTreeMap<RowKey, Entry>,
     hosts: HashMap<HostId, HostRow>,
+    /// Doc 07.7's block list, keyed by domain so a lookup on the admit and
+    /// lease paths is a hash of eight bytes. Lifted entries stay in it, so this
+    /// is the published list and not just the enforced one.
+    blocks: BTreeMap<PldId, BlockRow>,
     /// Sealed segments, keyed by ULID. A `BTreeMap` so that iteration is in
     /// seal order already and the sort in `segments` is doing nothing on the
     /// common path.
@@ -193,6 +197,20 @@ impl Inner {
         true
     }
 
+    /// Whether doc 07.7 says to leave this URL alone.
+    ///
+    /// Two lists rather than one, and they are not the same thing. The host
+    /// flag is what doc 05.8 sets when a site refuses us, and the block list is
+    /// what an operator sets when somebody asks us to stop. A host can be one
+    /// without being the other, and merging them would mean a block could be
+    /// cleared by the tier logic.
+    fn refused(&self, key: &RowKey) -> bool {
+        self.blocks
+            .get(&key.pld)
+            .is_some_and(crate::BlockRow::in_force)
+            || self.hosts.get(&key.host).is_some_and(|host| host.blocked)
+    }
+
     fn intern_etag(&mut self, etag: &str) -> u32 {
         if let Some(index) = self.etag_index.get(etag) {
             return *index;
@@ -275,14 +293,11 @@ impl State for MemoryState {
                 continue;
             }
 
-            // A blocked host is the only exclusion this reference applies.
-            // robots and scope are decided above state, because state does not
-            // fetch robots.txt and does not own the crawl's configuration.
-            if inner
-                .hosts
-                .get(&candidate.key.host)
-                .is_some_and(|h| h.blocked)
-            {
+            // A blocked host and doc 07.7's block list are the only exclusions
+            // this reference applies. robots and scope are decided above state,
+            // because state does not fetch robots.txt and does not own the
+            // crawl's configuration.
+            if inner.refused(&candidate.key) {
                 let mut row = LedgerRow::pending(
                     &candidate.key,
                     candidate.url,
@@ -358,6 +373,18 @@ impl State for MemoryState {
                 continue;
             }
             if !entry.row.is_due(req.now_ms) {
+                continue;
+            }
+            // Doc 07.7 enforces a block at lease issue and not at fetch. The
+            // rows of a blocked domain are excluded when the block lands, so
+            // this only catches a row that arrived some other way, but a block
+            // that depends on the sweep having reached everything is a block
+            // with an ordering bug waiting in it.
+            if inner
+                .blocks
+                .get(&key.pld)
+                .is_some_and(crate::BlockRow::in_force)
+            {
                 continue;
             }
             // Politeness is enforced by not issuing the lease, not by asking
@@ -615,6 +642,17 @@ impl State for MemoryState {
                 }
             }
 
+            // A block landing while a fetch was in flight. The completion is
+            // recorded, because the page really was fetched and the segment
+            // already has it, and then the row goes back out of the frontier
+            // where the block put it. Without this the answer would reschedule
+            // the url and a blocked domain would keep one page alive for as
+            // long as the crawl ran.
+            if inner.refused(&outcome.key) {
+                row.state = UrlState::Excluded;
+                row.next_due_ms = u64::MAX;
+            }
+
             if let Some(entry) = inner.ledger.get_mut(&outcome.key) {
                 entry.row = row;
                 entry.lease = None;
@@ -662,6 +700,48 @@ impl State for MemoryState {
             inner.hosts.insert(row.host, row.clone());
         }
         Ok(())
+    }
+
+    async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {
+        let mut inner = self.lock();
+        let Inner { blocks, ledger, .. } = &mut *inner;
+        let mut report = BlockReport::default();
+
+        for block in rows {
+            blocks.insert(block.pld, block.clone());
+            // A whole domain at a time, by walking the lot. A real backend has
+            // the domain's rows as one contiguous range, which is what the
+            // `(pld, host, url)` ordering in doc 08.2 is for; the reference
+            // does the simple thing because this runs once when a complaint
+            // arrives and never on a hot path.
+            for entry in ledger
+                .iter_mut()
+                .filter(|(key, _)| key.pld == block.pld)
+                .map(|(_, entry)| entry)
+            {
+                match block.lifted_ms {
+                    None if entry.row.state.is_schedulable() => {
+                        entry.row.state = UrlState::Excluded;
+                        entry.row.next_due_ms = u64::MAX;
+                        report.excluded += 1;
+                    }
+                    Some(lifted_ms) if entry.row.state == UrlState::Excluded => {
+                        entry.row.state = UrlState::Pending;
+                        entry.row.next_due_ms = lifted_ms;
+                        report.restored += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn blocks(&self) -> Result<Vec<BlockRow>> {
+        // The map is keyed by the domain hash, so this is in key order rather
+        // than in alphabetical order. Both are stable and neither is what a
+        // reader wants, so whoever prints the list sorts it by name.
+        Ok(self.lock().blocks.values().cloned().collect())
     }
 
     async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()> {

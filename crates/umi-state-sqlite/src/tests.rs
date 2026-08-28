@@ -13,9 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use rusqlite::Connection;
 use tempfile::TempDir;
 use umi_state::{
-    Candidate, DAILY_UNDER_MS, Discovery, FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow,
-    LeaseRequest, Pace, REALTIME_UNDER_MS, RefreshClass, Revalidator, SegmentRow, State, Stream,
-    TierPolicy, WEEKLY_UNDER_MS, conformance,
+    BlockRow, Candidate, DAILY_UNDER_MS, Discovery, FetchOutcome, FetchResult, HOURLY_UNDER_MS,
+    HostRow, LeaseRequest, Pace, REALTIME_UNDER_MS, RefreshClass, Revalidator, SegmentRow, State,
+    Stream, TierPolicy, WEEKLY_UNDER_MS, conformance,
 };
 use umi_types::{Digest, FetcherId, RowKey, Tier, Ulid};
 
@@ -668,6 +668,87 @@ async fn a_blocked_host_keeps_urls_out_of_the_frontier_across_a_restart() {
         .await
         .expect("lease");
     assert!(leases.is_empty(), "a blocked host was leased");
+}
+
+#[tokio::test]
+async fn a_block_survives_a_restart_and_covers_the_whole_domain() {
+    // Doc 07.7 again, for the other list. The conformance suite says what a
+    // block does to a store that stays open; this says it is still true after
+    // the process that applied it has gone, which is the half an operator
+    // depends on and the half only a file can be wrong about.
+    let dir = TempDir::new().expect("a temp directory");
+    let path = dir.path().join("state.umistate");
+    let reason = "the site owner asked us to stop on 2026-08-14, ticket 41";
+
+    {
+        let state = SqliteState::open(&path).expect("a new store");
+        admit_one(&state, "https://news.example.com/one").await;
+        let report = state
+            .block(&[BlockRow::new("news.example.com", reason, T0)])
+            .await
+            .expect("block");
+        assert_eq!(report.excluded, 1, "the block left the url in the frontier");
+    }
+
+    let state = SqliteState::open(&path).expect("the same store again");
+
+    // A different host under the same registrable domain, because a block is
+    // about the domain and somebody typing a host name is asking for the site
+    // to stop being crawled.
+    let report = state
+        .admit(&[Candidate::new("https://www.example.com/two", T0).expect("a crawlable url")])
+        .await
+        .expect("admit");
+    assert_eq!(report.excluded, 1, "a block did not survive a restart");
+    assert_eq!(report.admitted, 0);
+
+    let leases = state
+        .lease(&LeaseRequest::new(fetcher(), T0 + 86_400_000, 4))
+        .await
+        .expect("lease");
+    assert!(leases.is_empty(), "a blocked domain was leased");
+
+    let list = state.blocks().await.expect("blocks");
+    assert_eq!(list.len(), 1, "the block list did not come back");
+    assert_eq!(
+        list[0].domain, "example.com",
+        "the block was not widened to the registrable domain"
+    );
+    assert_eq!(list[0].reason, reason, "the reason did not survive");
+    assert!(list[0].in_force(), "the block came back already lifted");
+}
+
+#[tokio::test]
+async fn a_row_that_arrived_around_the_block_is_still_not_leased() {
+    // The block sweep takes the domain's urls out of the frontier, so this can
+    // only happen to a row that got there some other way: an import, a hand
+    // edit, a bug above us. Enforcement at lease issue is what makes the answer
+    // the same either way, and this is the case that would notice if the sweep
+    // were the only thing holding a block up.
+    let (_dir, state) = on_disk();
+    admit_one(&state, "https://example.com/one").await;
+    state
+        .block(&[BlockRow::new("example.com", "ticket 41", T0)])
+        .await
+        .expect("block");
+
+    // Back into the frontier behind the store's back, which is exactly what
+    // this is testing the store does not trust.
+    let moved = state
+        .lock()
+        .conn
+        .execute("UPDATE ledger SET state = 0, next_due_ms = 0", [])
+        .expect("the hand edit");
+    assert_eq!(moved, 1, "the test did not put anything back");
+
+    let leases = state
+        .lease(&LeaseRequest::new(fetcher(), T0, 4))
+        .await
+        .expect("lease");
+    assert!(
+        leases.is_empty(),
+        "a blocked domain was leased from a row the sweep never saw"
+    );
 }
 
 #[tokio::test]

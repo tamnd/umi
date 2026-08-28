@@ -35,9 +35,9 @@ use std::time::Duration;
 use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 
 use crate::{
-    Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow, LeaseRequest,
-    NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow, State, Stream,
-    retry_after_ms,
+    BlockRow, Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow,
+    LeaseRequest, NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow,
+    State, Stream, retry_after_ms,
 };
 
 /// A fixed instant to run every case from, so nothing in here depends on when
@@ -194,6 +194,11 @@ where
     run!(an_unknown_host_reads_back_as_none);
     run!(put_host_replaces_rather_than_merges);
     run!(a_blocked_host_is_never_leased);
+    run!(a_block_takes_the_domain_out_of_the_frontier);
+    run!(a_blocked_domain_is_not_admitted_again);
+    run!(a_block_survives_being_applied_twice);
+    run!(a_lift_is_dated_and_gives_the_domain_back);
+    run!(the_block_list_reads_back_with_its_reason);
     run!(a_segment_record_round_trips);
     run!(an_unknown_segment_reads_back_as_none);
     run!(put_segment_replaces_rather_than_merges);
@@ -1146,6 +1151,149 @@ async fn a_blocked_host_is_never_leased(state: &dyn State) -> Outcome {
         leases.first().map(|lease| &lease.url)
     );
     Ok(())
+}
+
+/// The domain every URL in this file falls under, so a block here covers the
+/// whole suite's namespace and both URL shapes.
+const BLOCKED_DOMAIN: &str = "example.com";
+
+/// Doc 07.7's reason, written the way a real one would be.
+const BECAUSE: &str = "the site owner asked us to stop on 2026-08-14, ticket 41";
+
+async fn a_block_takes_the_domain_out_of_the_frontier(state: &dyn State) -> Outcome {
+    // Both shapes, because a block is about the registrable domain and not
+    // about one host under it. Blocking on the strength of the host we happened
+    // to be given would leave the rest of the site being crawled, which is
+    // honouring the letter of a request rather than the request.
+    let urls: Vec<String> = (0..3).map(path_url).chain((0..3).map(host_url)).collect();
+    admit_all(state, &urls).await?;
+    ensure!(
+        !lease_one(state, T0).await?.is_empty(),
+        "nothing was leasable before the block, so this case proves nothing"
+    );
+
+    let report = apply(state, &[BlockRow::new(BLOCKED_DOMAIN, BECAUSE, T0)]).await?;
+    ensure!(
+        report.excluded >= 6,
+        "a block left urls in the frontier: {} excluded of 6",
+        report.excluded
+    );
+
+    // Later than the leases the first call handed out, so a politeness timer
+    // cannot be what is keeping this empty.
+    let leases = lease_one(state, T0 + DAY).await?;
+    ensure!(
+        leases.is_empty(),
+        "a blocked domain was leased: {:?}",
+        leases.first().map(|lease| &lease.url)
+    );
+    Ok(())
+}
+
+async fn a_blocked_domain_is_not_admitted_again(state: &dyn State) -> Outcome {
+    apply(state, &[BlockRow::new(BLOCKED_DOMAIN, BECAUSE, T0)]).await?;
+
+    // Doc 07.7 says a block prevents future admission, and the url has to end
+    // up in the seen set anyway: a candidate that is refused and forgotten is
+    // one that costs the same decision again on every page that links to it.
+    let urls: Vec<String> = (0..4).map(path_url).collect();
+    let report = admit_all(state, &urls).await?;
+    ensure_eq!(report.admitted, 0, "a blocked domain was admitted");
+    ensure_eq!(report.total(), 4, "the batch was not accounted for");
+
+    let second = admit_all(state, &urls).await?;
+    ensure_eq!(
+        second.seen,
+        4,
+        "a refused candidate was not remembered, so it will be refused again"
+    );
+    ensure!(
+        lease_one(state, T0 + DAY).await?.is_empty(),
+        "a blocked domain was leased after being admitted into it"
+    );
+    Ok(())
+}
+
+async fn a_block_survives_being_applied_twice(state: &dyn State) -> Outcome {
+    // The trait says a caller that gets an error retries the batch whole, so
+    // applying one twice has to be the same as applying it once. It is also
+    // what happens when an operator does not know the block is already there.
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let block = BlockRow::new(BLOCKED_DOMAIN, BECAUSE, T0);
+    let first = apply(state, std::slice::from_ref(&block)).await?;
+    let second = apply(state, std::slice::from_ref(&block)).await?;
+    ensure_eq!(first.excluded, 3, "the first block moved the wrong number");
+    ensure_eq!(second.excluded, 0, "the second block moved something");
+
+    let list = state
+        .blocks()
+        .await
+        .map_err(|e| format!("blocks failed: {e}"))?;
+    ensure_eq!(list.len(), 1, "one domain produced more than one entry");
+    Ok(())
+}
+
+async fn a_lift_is_dated_and_gives_the_domain_back(state: &dyn State) -> Outcome {
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let block = BlockRow::new(BLOCKED_DOMAIN, BECAUSE, T0);
+    apply(state, std::slice::from_ref(&block)).await?;
+
+    let lifted_ms = T0 + DAY;
+    let lift = block.lift("they changed their minds, ticket 41", lifted_ms);
+    let report = apply(state, &[lift]).await?;
+    ensure_eq!(report.restored, 3, "a lift did not give the urls back");
+
+    let leases = lease_one(state, lifted_ms).await?;
+    ensure!(!leases.is_empty(), "a lifted domain is still not leasable");
+
+    // Doc 07.7 wants a dated record of both events, so the entry stays and
+    // carries both. A lift that deleted the row would leave nobody able to say
+    // what happened or when.
+    let list = state
+        .blocks()
+        .await
+        .map_err(|e| format!("blocks failed: {e}"))?;
+    let entry = list
+        .first()
+        .ok_or_else(|| "a lifted block left no record behind".to_owned())?;
+    ensure_eq!(entry.blocked_ms, T0, "the block date was lost by the lift");
+    ensure_eq!(entry.lifted_ms, Some(lifted_ms), "the lift was not dated");
+    ensure!(entry.reason == BECAUSE, "the original reason was lost");
+    ensure!(
+        !entry.lifted_reason.is_empty(),
+        "the lift has no reason on it"
+    );
+    Ok(())
+}
+
+async fn the_block_list_reads_back_with_its_reason(state: &dyn State) -> Outcome {
+    // The list is published, and the reason travels with it so that the record
+    // explains itself years later. That makes the round trip part of the
+    // contract rather than a convenience for the CLI.
+    let empty = state
+        .blocks()
+        .await
+        .map_err(|e| format!("blocks failed: {e}"))?;
+    ensure!(empty.is_empty(), "a fresh store already blocks something");
+
+    let block = BlockRow::new(BLOCKED_DOMAIN, BECAUSE, T0);
+    apply(state, std::slice::from_ref(&block)).await?;
+    let list = state
+        .blocks()
+        .await
+        .map_err(|e| format!("blocks failed: {e}"))?;
+    ensure_eq!(list.as_slice(), &[block], "the block did not round trip");
+    Ok(())
+}
+
+/// [`State::block`], with the error turned into the string the suite reports.
+async fn apply(state: &dyn State, rows: &[BlockRow]) -> Result<crate::BlockReport, String> {
+    state
+        .block(rows)
+        .await
+        .map_err(|e| format!("block failed: {e}"))
 }
 
 async fn a_segment_record_round_trips(state: &dyn State) -> Outcome {

@@ -489,6 +489,78 @@ pub const SELECT_SEALED_BETWEEN: &str = concat!(
       ORDER BY sealed_at_ms, id"
 );
 
+/// Write a block record whole, doc 07.7's list.
+///
+/// `INSERT OR REPLACE` rather than an upsert with a merge, because a lift is
+/// the same row with two more columns filled in and the caller has just built
+/// the whole thing. Applying the same block twice therefore writes the same six
+/// values twice and changes nothing, which is what the trait promises a caller
+/// retrying a failed batch.
+pub const PUT_BLOCK: &str = "
+INSERT OR REPLACE INTO blocks (
+    pld, domain, reason, blocked_ms, lifted_ms, lifted_reason
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// The whole list, lifted entries included, in key order.
+///
+/// Small enough to read whole. It is read once at open to build the enforcement
+/// set and again whenever somebody asks to see it, and a fleet with enough
+/// blocks for that to cost anything has a much larger problem.
+pub const SELECT_BLOCKS: &str = "
+SELECT pld, domain, reason, blocked_ms, lifted_ms, lifted_reason
+  FROM blocks";
+
+/// Take a blocked domain's urls out of the frontier.
+///
+/// The `WHERE` is the scheduler's own state test, so a gone row stays gone and
+/// a second application of the same block moves nothing. `?2` is the never due
+/// sentinel, saturated by [`to_ms`](crate::row::to_ms) the same way every other
+/// excluded row's is.
+///
+/// The lease columns are deliberately left alone. A fetch in flight when the
+/// block lands is already on the wire, and clearing the lease under it would
+/// hand the same url to a second fetcher; the completion is recorded and the
+/// row is put back out of the frontier by
+/// [`complete`](crate::SqliteState::complete) instead.
+///
+/// `refresh_class` is not touched either. Doc 09.5's index is partial on the
+/// schedulable states, so an excluded row is out of it whatever its class says,
+/// and leaving the class is what makes the number still true if the block is
+/// lifted later.
+pub const EXCLUDE_PLD: &str = concat!(
+    "
+UPDATE ledger SET state = 4, next_due_ms = ?2
+ WHERE pld = ?1 AND ",
+    schedulable!()
+);
+
+/// Put a lifted domain's urls back in the frontier.
+///
+/// Every excluded row of the domain comes back and not just the ones the block
+/// took, because the ledger does not record why a url was excluded. Doc 08.4 is
+/// deliberate about that, and the cost is that a lifted domain brings its
+/// robots exclusions back with it for the robots layer to exclude again next
+/// time it looks. That is one recheck of a file we are about to fetch anyway.
+///
+/// The class is recomputed because the rows are going back into doc 09.5's
+/// index and a row filed under the wrong class is a row its budget never
+/// offers. The arms are [`REFRESH_LEDGER`]'s, boundaries and all, for the same
+/// reason they are there: [`RefreshClass::of`](umi_state::RefreshClass::of)
+/// stays the only place they are decided.
+pub const RESTORE_PLD: &str = "
+UPDATE ledger SET
+    state         = 0,
+    next_due_ms   = ?2,
+    refresh_class = CASE
+        WHEN fetch_count = 0 THEN 5
+        WHEN ?2 - last_fetch_ms <  ?3 THEN 0
+        WHEN ?2 - last_fetch_ms <  ?4 THEN 1
+        WHEN ?2 - last_fetch_ms <  ?5 THEN 2
+        WHEN ?2 - last_fetch_ms <  ?6 THEN 3
+        ELSE 4
+    END
+ WHERE pld = ?1 AND state = 4";
+
 /// Write a segment record whole.
 ///
 /// Last write wins, as with [`PUT_HOST`], and for the same reason: one

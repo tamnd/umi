@@ -73,10 +73,10 @@ pub use freshness::{
 pub use memory::MemoryState;
 pub use pace::Pace;
 pub use types::{
-    AdmitReport, Candidate, Checkpoint, Discovery, EvictReport, ExcludeReason, FailureKind,
-    FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,
-    Priority, RemoteCopy, Revalidator, RobotsRef, SegmentQuery, SegmentRow, StateStats, Stream,
-    TierPolicy, UrlState,
+    AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
+    ExcludeReason, FailureKind, FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest,
+    LedgerRow, NackReason, Priority, RemoteCopy, Revalidator, RobotsRef, SegmentQuery, SegmentRow,
+    StateStats, Stream, TierPolicy, UrlState,
 };
 
 /// The batch size the whole design is tuned around, from doc 08.5.
@@ -146,7 +146,7 @@ pub type Result<T> = std::result::Result<T, StateError>;
 
 /// The state layer.
 ///
-/// Fourteen methods, all batched, all taking time as an argument. Implement it
+/// Sixteen methods, all batched, all taking time as an argument. Implement it
 /// and then run [`conformance::check`] against it: the suite is the definition
 /// of what these doc comments mean, and a backend that has not been through it
 /// has not implemented this trait, it has implemented something that compiles.
@@ -284,6 +284,42 @@ pub trait State: Send + Sync + 'static {
     ///
     /// Whatever the store reports.
     async fn put_host(&self, rows: &[HostRow]) -> Result<()>;
+
+    /// Stop crawling a domain, or record that a block has been lifted.
+    ///
+    /// Doc 07.7's mechanism. A block takes a domain out of the frontier, keeps
+    /// it out of future admissions, and stays until somebody records lifting
+    /// it. A row whose [`lifted_ms`](BlockRow::lifted_ms) is set is a lift, and
+    /// it puts the domain's excluded URLs back rather than deleting the record,
+    /// because doc 07.7 wants a dated record of both events.
+    ///
+    /// Last write wins per domain, and within one batch the last occurrence of
+    /// a domain wins, as with [`put_host`](State::put_host).
+    ///
+    /// **Durability: durable before it returns.** Doc 07.7 commits to applying
+    /// a block within an hour of a valid request, and a block a crash can undo
+    /// is not a block. This is the one call in the trait an operator makes
+    /// because somebody asked them to, so it is also the one where the answer
+    /// has to be true when it is given rather than shortly afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports. An error means the batch may have been
+    /// partially applied, so the caller retries it whole: applying the same
+    /// block twice moves nothing the second time.
+    async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport>;
+
+    /// The block list, in domain order, lifted entries included.
+    ///
+    /// Lifted entries are in it because the list is published and the record is
+    /// the point. A consumer honouring doc 07.7 reads
+    /// [`in_force`](BlockRow::in_force) and a person auditing us reads the
+    /// dates.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn blocks(&self) -> Result<Vec<BlockRow>>;
 
     /// Write segment records, replacing any that exist.
     ///
@@ -458,6 +494,14 @@ impl<T: State + ?Sized> State for std::sync::Arc<T> {
 
     async fn put_host(&self, rows: &[HostRow]) -> Result<()> {
         (**self).put_host(rows).await
+    }
+
+    async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {
+        (**self).block(rows).await
+    }
+
+    async fn blocks(&self) -> Result<Vec<BlockRow>> {
+        (**self).blocks().await
     }
 
     async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()> {

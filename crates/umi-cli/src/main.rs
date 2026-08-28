@@ -13,7 +13,8 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use umi_cli::{Error, config, crawl, doctor, get, inspect, verify};
+use umi_cli::{Error, block, config, crawl, doctor, get, inspect, verify};
+use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
 
 /// An internet scale web crawler that publishes what it finds.
@@ -163,11 +164,18 @@ enum Command {
     },
     /// Stop crawling a domain, permanently and on the record.
     Block {
-        /// The domain to block.
-        domain: String,
+        /// The domain to block. Left out, the command prints the list.
+        domain: Option<String>,
         /// Why, which is published alongside the block.
         #[arg(long)]
-        reason: String,
+        reason: Option<String>,
+        /// Record that this block has been lifted, with the reason as the
+        /// note. The entry stays in the list either way, per doc 07.7.
+        #[arg(long)]
+        lift: bool,
+        /// The crawl directory to apply it to.
+        #[arg(long, default_value = ".")]
+        dir: String,
     },
     /// Evaluate a scope profile against a list of URLs.
     Scope {
@@ -446,6 +454,23 @@ fn run(command: &Command) -> Result<(), Error> {
                 )),
             }
         }
+        Command::Block {
+            domain,
+            reason,
+            lift,
+            dir,
+        } => {
+            let config = load(command)?;
+            block::run(&block::Options {
+                dir: std::path::Path::new(dir),
+                domain: domain.as_deref(),
+                reason: reason.as_deref(),
+                lift: *lift,
+                token: token(&config)?,
+                org: &config.org.value,
+                now_ms: SystemClock.now_ms(),
+            })
+        }
         Command::Watch { dir, publish } => {
             let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
             finish(crawl::resume(std::path::Path::new(dir), true, publishing))
@@ -593,7 +618,7 @@ fn not_built(command: &Command) -> Error {
         Command::Manifest { .. } => {
             "reading a manifest chain back is milestone 2, and umi verify checks one today"
         }
-        Command::Block { .. } | Command::Scope { .. } => "milestone 2 builds this",
+        Command::Scope { .. } => "milestone 2 builds this",
         Command::State { .. } | Command::Checkpoint { .. } | Command::Sql { .. } => {
             "milestone 3 builds this"
         }

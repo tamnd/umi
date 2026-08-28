@@ -44,7 +44,7 @@ umi publish <dir>             push through the doc 12 pipeline
 umi verify <repo|dir>         re verify manifests, signatures and digests
 umi manifest <repo>           print or validate a manifest chain
 
-umi block <domain>            add to the block list, doc 07.7
+umi block [<domain>]          add to the block list, or print it, doc 07.7
 umi scope check <profile>     evaluate a scope against a list of URLs
 
 umid                          the coordinator daemon, doc 03.2
@@ -199,6 +199,24 @@ umi drain                        seal segments, publish, stop cleanly
 ```
 
 `umi drain` is the one to get right. It stops leasing, waits for outstanding leases to complete or expire, seals every open segment, runs the publish pipeline to completion, verifies, deletes, checkpoints state, and exits. A clean shutdown loses nothing. An unclean one loses at most the shoal in flight, per doc 10.7, and doc 09.8 covers frontier recovery.
+
+### `umi block`
+
+```
+umi block <domain> --reason <text> [--dir .]   stop crawling a domain
+umi block <domain> --lift --reason <text>      record that a block was lifted
+umi block                                      print the list
+```
+
+This is the command an operator runs because somebody asked us to stop, so it is arranged around doc 07.7's one hour commitment rather than around convenience. The block is on disk before the command returns, it takes the domain's URLs out of the frontier in the same transaction, and it goes to the published list in `open-index/umi-meta` so that the other coordinators and anyone holding an older snapshot see it too.
+
+`--reason` is required and is published with the block. It is the part that has to explain itself to a stranger a year from now, so "ticket 41" on its own is a worse reason than "the site owner asked us to stop on 2026-08-14, ticket 41".
+
+The domain is widened to the registrable domain and the command says when it has done that. Blocking `news.example.com` and leaving the rest of `example.com` running would be honouring the letter of a request rather than the request.
+
+Without a publishing token the block still applies locally and the command says the list was not published. That is a warning and not a failure: doc 07.7's promise is about stopping the crawling, and refusing to block a domain because a crawl directory has no write token near it would be the wrong answer to the wrong question.
+
+With no domain the command prints the list, in domain order, lifted entries included with both of their dates. Doc 14.9's exit 3 when there is nothing in it.
 
 ## 14.6 Inspection
 
