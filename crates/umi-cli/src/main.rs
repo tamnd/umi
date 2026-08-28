@@ -294,6 +294,7 @@ impl CrawlArgs {
             sitemaps: !self.no_sitemaps,
             out: self.out.clone(),
             publish: crawl::Publishing::resolve(config, self.publish)?,
+            identity: crawl::Identity::resolve(config)?,
         })
     }
 }
@@ -371,10 +372,16 @@ fn run(command: &Command) -> Result<(), Error> {
             bandwidth_secs,
         } => {
             let config = load(command)?;
+            let identity = crawl::Identity::resolve(&config)?;
+            let keyid = match identity {
+                Some(identity) => Some(identity.keyid()?),
+                None => None,
+            };
             let checks = doctor::doctor(&doctor::Options {
                 offline: *offline,
                 out: out.clone().unwrap_or(config.out.value).into(),
                 bandwidth: bandwidth.then_some(*bandwidth_secs),
+                identity: keyid,
             })?;
             match doctor::worst(&checks) {
                 doctor::Verdict::Bad => Err(Error::NotReady),
@@ -430,8 +437,15 @@ fn run(command: &Command) -> Result<(), Error> {
             finish(crawl::crawl(&args.plan(&config)?))
         }
         Command::Resume { dir, publish } => {
-            let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
-            finish(crawl::resume(std::path::Path::new(dir), false, publishing))
+            let config = load(command)?;
+            let publishing = crawl::Publishing::resolve(&config, *publish)?;
+            let identity = crawl::Identity::resolve(&config)?;
+            finish(crawl::resume(
+                std::path::Path::new(dir),
+                false,
+                publishing,
+                identity,
+            ))
         }
         Command::Verify { target, full } => {
             let config = load(command)?;
@@ -472,8 +486,15 @@ fn run(command: &Command) -> Result<(), Error> {
             })
         }
         Command::Watch { dir, publish } => {
-            let publishing = crawl::Publishing::resolve(&load(command)?, *publish)?;
-            finish(crawl::resume(std::path::Path::new(dir), true, publishing))
+            let config = load(command)?;
+            let publishing = crawl::Publishing::resolve(&config, *publish)?;
+            let identity = crawl::Identity::resolve(&config)?;
+            finish(crawl::resume(
+                std::path::Path::new(dir),
+                true,
+                publishing,
+                identity,
+            ))
         }
         other => Err(not_built(other)),
     }
@@ -506,7 +527,10 @@ fn load(command: &Command) -> Result<config::Config, Error> {
         &config::env_from_process(),
         &command.flags(),
     )?;
-    for secret in [&config.token, &config.key].into_iter().flatten() {
+    for secret in [&config.token, &config.key, &config.identity_key]
+        .into_iter()
+        .flatten()
+    {
         if let Some(warning) = secret.value.warning() {
             eprintln!("umi: {} says {warning}", secret.origin);
         }
@@ -563,6 +587,7 @@ fn print_config(config: &config::Config) -> Result<(), Error> {
     for (name, secret) in [
         ("publish.token", &config.token),
         ("publish.key", &config.key),
+        ("crawl.identity_key", &config.identity_key),
     ] {
         match secret {
             Some(found) => {

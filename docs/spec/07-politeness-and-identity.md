@@ -22,7 +22,11 @@ Every request from a coordinator operated fetcher is signed under RFC 9421 HTTP 
 
 The mechanics are three headers. `Signature-Agent` points at our public key directory. `Signature-Input` names the covered components. `Signature` carries the Ed25519 signature. We sign at minimum the `@authority` derived component, per Cloudflare's guidance, plus `@method`, `@path`, and a nonce and timestamp for replay resistance.
 
-Keys are Ed25519, published at `https://umi.dev/.well-known/http-message-signatures-directory`, rotated quarterly with an overlap window, and the rotation is announced on the bot page.
+Keys are Ed25519, published at `https://umi.dev/.well-known/http-message-signatures-directory`, rotated quarterly with an overlap window, and the rotation is announced on the bot page. The directory is a JSON Web Key Set, one entry per key we have ever signed with, and a `keyid` is the RFC 7638 thumbprint of the key it names. A rotated key keeps its entry and gains an `exp`, rather than being deleted, because deleting it would make every request we have ever signed unverifiable after the fact and the point of signing is that somebody can check later.
+
+The covered components are `@authority`, `@method`, `@path` and the `Signature-Agent` header, and a signature is good for sixty seconds. `Signature-Agent` is covered as well as sent, which is the draft's rule and is not a formality: an unsigned pointer at a key directory would let anyone replay one of our signatures while naming a directory they control.
+
+The private key stays on the coordinator that owns it. It is configured as `crawl.identity_key` in doc 14.7's file, it is an `env:` or a `file:` indirection like every other secret, and nothing in the system writes it to a log, a manifest or a published row. A crawl with no key configured signs nothing and says so in its log, which is the honest way for a volunteer's build to run before doc 06 has given them a fetcher key.
 
 This is worth doing for a concrete reason rather than as standards compliance theatre. Cloudflare activated Web Bot Auth at their edge in March 2026, fronts roughly 20 percent of the web, and moved to blocking AI crawlers by default in July 2025. Their verified bots program accepts message signatures, and Common Crawl is among the supported agents. Being verifiable is the difference between being allowed by default on a fifth of the web and being blocked by default on it.
 

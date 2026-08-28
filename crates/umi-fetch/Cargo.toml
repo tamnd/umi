@@ -12,14 +12,27 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[[bench]]
+name = "sign"
+harness = false
+
 [dependencies]
 umi-types = { workspace = true }
 
+base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = { workspace = true }
+# Doc 07.2's request signatures are Ed25519, the same scheme doc 12.5 uses for
+# manifests and doc 04 uses for receipts. One signature scheme in the tree.
+ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Only for the RFC 7638 key thumbprint, which is SHA-256 because the JOSE
+# specifications say so and a verifier reaching for a JWK library expects it.
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }

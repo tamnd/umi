@@ -3100,12 +3100,17 @@ dependencies = [
 name = "umi-fetch"
 version = "0.0.1"
 dependencies = [
+ "base64 0.22.1",
  "blake3",
  "bytes",
+ "ed25519-dalek",
  "futures-util",
  "http",
  "reqwest",
  "rustls",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
  "tokio-rustls",

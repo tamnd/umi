@@ -74,6 +74,10 @@ pub struct Options {
     /// moves gigabytes and takes minutes, and `umi doctor` is a thing people
     /// run before a crawl rather than a thing people run once a quarter.
     pub bandwidth: Option<u64>,
+    /// The thumbprint of doc 07.2's crawl identity key, when one is
+    /// configured. Resolved by the caller, because reading a secret is doc
+    /// 14.7's job and not this module's.
+    pub identity: Option<String>,
 }
 
 /// Run every check and print the report.
@@ -91,6 +95,7 @@ pub fn doctor(options: &Options) -> Result<Vec<Check>, Error> {
         dns(&options.offline),
         disk(&options.out),
         memory(),
+        crawl_identity(options.identity.as_deref()),
     ];
     if options.offline {
         checks.push(Check::new("inbound sample", "--offline", Verdict::Skip));
@@ -122,6 +127,24 @@ pub fn worst(checks: &[Check]) -> Verdict {
         Verdict::Warn
     } else {
         Verdict::Ok
+    }
+}
+
+/// Doc 07.2's request signing, as a line an operator can read.
+///
+/// Skip rather than warn when there is no key. Crawling unsigned is a
+/// supported way to run and it is what every volunteer does on their first
+/// day, so a report that went yellow over it would train people to ignore the
+/// colour. What the line is for is the other case: an operator who thinks they
+/// configured a key and wants to see the thumbprint they published.
+fn crawl_identity(keyid: Option<&str>) -> Check {
+    match keyid {
+        Some(keyid) => Check::new("crawl identity", format!("signing as {keyid}"), Verdict::Ok),
+        None => Check::new(
+            "crawl identity",
+            "no crawl.identity_key, requests go out unsigned",
+            Verdict::Skip,
+        ),
     }
 }
 

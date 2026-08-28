@@ -14,9 +14,12 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use base64::Engine as _;
+
+use super::webbotauth::{COVERED, LIFETIME_SECS, Params, signature_base, verify};
 use super::{
-    Failure, FetchConfig, Fetcher, Ladder, Media, Outcome, RetryAfter, Revalidator, Stage, Tier,
-    USER_AGENT,
+    Directory, Failure, FetchConfig, Fetcher, Jwk, Ladder, Media, Outcome, RetryAfter, Revalidator,
+    SignatureError, Signer, Stage, Tier, USER_AGENT,
 };
 
 /// What the scripted origin does once it has read a request.
@@ -794,4 +797,332 @@ fn nothing_in_the_lockfile_pulls_in_native_tls() {
         lock.contains("name = \"rustls\""),
         "rustls is not in the lockfile, so this test is asserting nothing"
     );
+}
+
+// Doc 07.2's Web Bot Auth signatures.
+//
+// Two kinds of test here. The first kind checks the bytes: a signature base
+// written out by hand from RFC 9421's rules, and a key thumbprint taken from
+// RFC 8037's own example. Those are the ones that would catch us being self
+// consistently wrong, which is the failure mode a round trip cannot see,
+// because an origin verifies with somebody else's library and not with ours.
+// The second kind checks the behaviour doc 07.2 promises: rotation without
+// breaking old requests, and a signature that is worth nothing anywhere but
+// on the request it was made for.
+
+/// A key nobody uses, for tests that only need two of them to differ.
+const SEED: [u8; 32] = [42; 32];
+/// The nonce seed, fixed here so a failure is reproducible.
+const NONCE_SEED: [u8; 16] = [7; 16];
+/// A fixed moment, so the numbers in the expected base are readable.
+const T0: u64 = 1_756_400_000;
+
+fn signer_at(secs: u64) -> Signer {
+    Signer::fixed(SEED, "https://umi.dev", NONCE_SEED, secs).expect("the agent is a url")
+}
+
+fn parsed(url: &str) -> url::Url {
+    url::Url::parse(url).expect("a url")
+}
+
+/// The headers out of a request head the scripted origin recorded.
+fn headers_of(request: &str) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    for line in request.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if let Ok(name) = name.trim().parse::<http::HeaderName>()
+            && let Ok(value) = value.trim().parse::<http::HeaderValue>()
+        {
+            headers.insert(name, value);
+        }
+    }
+    headers
+}
+
+#[test]
+fn the_key_id_is_rfc_8037s_own_thumbprint() {
+    // RFC 8037 appendix A.3 publishes an Ed25519 JWK and the thumbprint of it.
+    // Computing the same string from the same key is the only check here that
+    // does not go through our own code twice, and it is the one that would
+    // catch a canonical form with a space in it or the members in the wrong
+    // order.
+    let x = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(x)
+        .expect("the rfc's key is base64url");
+    let bytes: [u8; 32] = raw.try_into().expect("32 bytes");
+    let key = ed25519_dalek::VerifyingKey::from_bytes(&bytes).expect("on the curve");
+
+    let entry = Jwk::new(&key, None, None);
+    assert_eq!(entry.x, x);
+    assert_eq!(entry.kid, "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k");
+}
+
+#[test]
+fn the_signature_base_is_the_bytes_rfc_9421_describes() {
+    // Written out by hand from section 2.5 rather than produced and pasted
+    // back. One line per component, `"name": value`, newline separated, the
+    // parameters last with nothing after them. An origin builds this same
+    // string from the request it received, so a stray space or a trailing
+    // newline here is a signature that never verifies anywhere.
+    let params = Params {
+        created: T0,
+        expires: T0 + 60,
+        keyid: "kid".to_owned(),
+        alg: "ed25519".to_owned(),
+        nonce: "nonce".to_owned(),
+        tag: "web-bot-auth".to_owned(),
+    };
+    let covered: Vec<String> = COVERED.iter().map(|n| (*n).to_owned()).collect();
+    let mut fields = http::HeaderMap::new();
+    fields.insert(
+        "signature-agent",
+        "\"https://umi.dev\"".parse().expect("a value"),
+    );
+
+    let base = signature_base(
+        "get",
+        &parsed("https://example.com/a/b?q=1"),
+        &covered,
+        &params,
+        &fields,
+    )
+    .expect("the url has a host");
+
+    let expected = concat!(
+        "\"@authority\": example.com\n",
+        "\"@method\": GET\n",
+        "\"@path\": /a/b\n",
+        "\"signature-agent\": \"https://umi.dev\"\n",
+        "\"@signature-params\": (\"@authority\" \"@method\" \"@path\" \"signature-agent\")",
+        ";created=1756400000;expires=1756400060;keyid=\"kid\";alg=\"ed25519\"",
+        ";nonce=\"nonce\";tag=\"web-bot-auth\""
+    );
+    assert_eq!(base, expected);
+}
+
+#[test]
+fn the_default_port_is_not_in_the_authority() {
+    // RFC 9421 says the authority omits a default port, and getting this wrong
+    // would produce signatures that verify in tests and fail on the web,
+    // because nothing we crawl names its port.
+    let params = Params {
+        created: T0,
+        expires: T0 + 60,
+        keyid: "kid".to_owned(),
+        alg: "ed25519".to_owned(),
+        nonce: "n".to_owned(),
+        tag: "web-bot-auth".to_owned(),
+    };
+    let one = vec!["@authority".to_owned()];
+    let fields = http::HeaderMap::new();
+    let base = |url| {
+        signature_base("GET", &parsed(url), &one, &params, &fields).expect("the url has a host")
+    };
+
+    assert!(base("https://example.com:443/").starts_with("\"@authority\": example.com\n"));
+    assert!(base("http://example.com:80/").starts_with("\"@authority\": example.com\n"));
+    assert!(base("https://example.com:8443/").starts_with("\"@authority\": example.com:8443\n"));
+}
+
+#[test]
+fn a_signed_request_verifies_against_the_published_directory() {
+    let signer = signer_at(T0);
+    let url = parsed("https://example.com/page");
+    let signed = signer.sign("GET", &url).expect("the url has a host");
+
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in signed.headers() {
+        headers.insert(name, value.parse().expect("a header value"));
+    }
+
+    let directory = Directory {
+        keys: vec![signer.jwk(None, None)],
+    };
+    let verified =
+        verify("GET", &url, &headers, &directory, T0 + 1).expect("our own signature verifies");
+    assert_eq!(verified.keyid, signer.keyid());
+    assert_eq!(verified.agent, "https://umi.dev");
+    assert_eq!(verified.created, T0);
+}
+
+#[test]
+fn a_signature_is_worth_nothing_on_another_request() {
+    // The whole point of covering the authority, the method and the path. A
+    // signature lifted off one request and pasted onto another has to fail, or
+    // an origin that saw one of our fetches could speak as us anywhere.
+    let signer = signer_at(T0);
+    let signed = signer
+        .sign("GET", &parsed("https://example.com/page"))
+        .expect("the url has a host");
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in signed.headers() {
+        headers.insert(name, value.parse().expect("a header value"));
+    }
+    let directory = Directory {
+        keys: vec![signer.jwk(None, None)],
+    };
+
+    for elsewhere in [
+        "https://other.example/page",
+        "https://example.com/other",
+        "https://example.com:8443/page",
+    ] {
+        let result = verify("GET", &parsed(elsewhere), &headers, &directory, T0 + 1);
+        assert!(
+            matches!(result, Err(SignatureError::BadSignature)),
+            "{elsewhere} verified"
+        );
+    }
+}
+
+#[test]
+fn a_rotated_key_keeps_verifying_the_requests_it_signed() {
+    // Doc 07.2 rotates quarterly with an overlap window. The retired key stays
+    // in the directory and gains an `exp`, so a request from before the
+    // rotation still verifies and a request from after it does not. Deleting
+    // the entry instead would make every past request unverifiable, which is
+    // the thing an archive of signed fetches exists to prevent.
+    let retired_at = T0 + 3600;
+    let signer = signer_at(T0);
+    let url = parsed("https://example.com/page");
+    let directory = Directory {
+        keys: vec![signer.jwk(None, Some(retired_at))],
+    };
+
+    let before = signer.sign_at("GET", &url, T0).expect("a host");
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in before.headers() {
+        headers.insert(name, value.parse().expect("a header value"));
+    }
+    assert!(verify("GET", &url, &headers, &directory, T0 + 1).is_ok());
+
+    let after = signer
+        .sign_at("GET", &url, retired_at + 10)
+        .expect("a host");
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in after.headers() {
+        headers.insert(name, value.parse().expect("a header value"));
+    }
+    let result = verify("GET", &url, &headers, &directory, retired_at + 11);
+    assert!(
+        matches!(result, Err(SignatureError::KeyWindow)),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn a_signature_outside_its_window_or_key_is_refused() {
+    let signer = signer_at(T0);
+    let url = parsed("https://example.com/page");
+    let signed = signer.sign("GET", &url).expect("a host");
+    let mut headers = http::HeaderMap::new();
+    for (name, value) in signed.headers() {
+        headers.insert(name, value.parse().expect("a header value"));
+    }
+    let directory = Directory {
+        keys: vec![signer.jwk(None, None)],
+    };
+
+    let late = verify("GET", &url, &headers, &directory, T0 + LIFETIME_SECS);
+    assert!(matches!(late, Err(SignatureError::Expired)), "{late:?}");
+    let early = verify("GET", &url, &headers, &directory, T0 - 1);
+    assert!(matches!(early, Err(SignatureError::Expired)), "{early:?}");
+
+    let stranger = verify("GET", &url, &headers, &Directory::default(), T0 + 1);
+    assert!(
+        matches!(stranger, Err(SignatureError::UnknownKey(_))),
+        "{stranger:?}"
+    );
+}
+
+#[test]
+fn two_requests_never_carry_the_same_nonce() {
+    // The clock does not move in this signer, which is the case that matters:
+    // at 250 pages a second most requests share a second with several others,
+    // and a nonce that only varied with the clock would be no nonce at all.
+    let signer = signer_at(T0);
+    let url = parsed("https://example.com/page");
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..1000 {
+        let signed = signer.sign("GET", &url).expect("a host");
+        let nonce = signed
+            .input
+            .split("nonce=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("there is a nonce")
+            .to_owned();
+        assert!(seen.insert(nonce), "a nonce came round twice");
+    }
+}
+
+#[test]
+fn the_directory_round_trips_and_names_the_well_known_path() {
+    let signer = signer_at(T0);
+    let directory = Directory {
+        keys: vec![signer.jwk(Some(T0), None)],
+    };
+    let json = directory.to_json().expect("it serialises");
+    assert!(json.ends_with('\n'), "the file needs a trailing newline");
+    assert_eq!(Directory::parse(&json).expect("it parses"), directory);
+    assert_eq!(
+        signer.directory_url(),
+        "https://umi.dev/.well-known/http-message-signatures-directory"
+    );
+    assert_eq!(
+        directory.find(signer.keyid()).expect("the key is there").x,
+        signer.jwk(None, None).x
+    );
+}
+
+#[tokio::test]
+async fn the_three_headers_reach_the_origin_and_verify_there() {
+    // End to end through a real socket, because the thing that would break
+    // this in production is a header the client rewrites or drops rather than
+    // anything in the signing code.
+    let origin =
+        Origin::start(|_| Reply::response(200, &[("content-type", "text/html")], b"ok")).await;
+    let signer = Arc::new(signer_at(T0));
+    let fetcher = Fetcher::with_signer(FetchConfig::default(), Some(Arc::clone(&signer)))
+        .expect("the client builds");
+
+    let url = origin.url("/signed");
+    let outcome = fetcher.fetch(&url, None).await.expect("a url we can crawl");
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+
+    let request = origin.requests().pop().expect("the origin saw it");
+    let headers = headers_of(&request);
+    let directory = Directory {
+        keys: vec![signer.jwk(None, None)],
+    };
+    let verified =
+        verify("GET", &parsed(&url), &headers, &directory, T0 + 1).expect("what arrived verifies");
+    assert_eq!(verified.keyid, signer.keyid());
+}
+
+#[tokio::test]
+async fn a_fetcher_with_no_key_sends_none_of_the_three_headers() {
+    // A volunteer's build has no crawl identity key until doc 06 gives them a
+    // fetcher key, and an unsigned request is the honest thing to send. Half a
+    // signature, or a signature under a key nobody published, would be worse
+    // than none.
+    let origin =
+        Origin::start(|_| Reply::response(200, &[("content-type", "text/html")], b"ok")).await;
+    let fetcher = fetcher(FetchConfig::default());
+    fetcher
+        .fetch(&origin.url("/plain"), None)
+        .await
+        .expect("a url we can crawl");
+
+    let request = origin
+        .requests()
+        .pop()
+        .expect("the origin saw it")
+        .to_lowercase();
+    for name in ["signature-agent", "signature-input", "signature:"] {
+        assert!(!request.contains(name), "{name} was sent without a key");
+    }
 }

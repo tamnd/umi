@@ -56,12 +56,15 @@
 //! is `set_default_paths`, which reads OpenSSL's compiled in directory and is
 //! empty on macOS and Windows.
 
+use std::sync::Arc;
+
 use futures_util::StreamExt;
 use url::Url;
 use wreq_util::{Emulation, Platform, Profile};
 
 use crate::engine::{BodyStream, Head, Transport, conditional, failure_from_text};
 use crate::outcome::{Failure, Stage, Version};
+use crate::webbotauth::Signer;
 use crate::{FetchConfig, FetchError, Result, Revalidator, USER_AGENT};
 
 /// The browser build T2 presents as.
@@ -113,6 +116,7 @@ pub const EXPECTED_JA4: &str = "t13d1516h2_8daaf6152771_d8a2da3f94cd";
 /// The browser shaped client.
 pub(crate) struct Browser {
     client: wreq::Client,
+    signer: Option<Arc<Signer>>,
 }
 
 impl Browser {
@@ -126,7 +130,7 @@ impl Browser {
     ///
     /// [`FetchError::Client`] when BoringSSL or the certificate store will not
     /// initialise.
-    pub(crate) fn build(config: &FetchConfig) -> Result<Self> {
+    pub(crate) fn build(config: &FetchConfig, signer: Option<Arc<Signer>>) -> Result<Self> {
         let emulation = Emulation::builder()
             .profile(PROFILE)
             .platform(PLATFORM)
@@ -143,7 +147,7 @@ impl Browser {
             .build()
             .map_err(|e| FetchError::Client(e.to_string()))?;
 
-        Ok(Self { client })
+        Ok(Self { client, signer })
     }
 }
 
@@ -161,6 +165,17 @@ impl Transport for Browser {
         let mut request = self.client.get(url.as_str());
         for (name, value) in conditional(revalidate) {
             request = request.header(name, value);
+        }
+        // Signed at T2 as well as T1. Doc 07.1 keeps the honest user agent on
+        // the browser profile for the same reason: the profile is about the
+        // socket, not about who we are, and a signed request is the strongest
+        // statement of who we are that we can make.
+        if let Some(signer) = &self.signer
+            && let Ok(signed) = signer.sign("GET", url)
+        {
+            for (name, value) in signed.headers() {
+                request = request.header(name, value);
+            }
         }
         request.send().await.map_err(transport_failure)
     }

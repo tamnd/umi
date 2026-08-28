@@ -269,10 +269,11 @@ Precedence, highest first: command line flags, `UMI_*` environment variables, `.
 ```toml
 # ~/.config/umi/config.toml
 [crawl]
-rps         = 1.0
-concurrency = 4
-tier_max    = 3
-out         = "~/crawls"
+rps          = 1.0
+concurrency  = 4
+tier_max     = 3
+out          = "~/crawls"
+identity_key = "env:UMI_IDENTITY_KEY"
 
 [state]
 backend = "sqlite"
@@ -286,6 +287,8 @@ key   = "env:UMI_PUBLISH_KEY"
 coordinator = "https://umi.dev"
 rate        = 2.0
 ```
+
+`crawl.identity_key` is doc 07.2's Web Bot Auth signing key, 64 hex characters, and it is a third secret with a third rotation schedule rather than a second use for the publishing key. Leaving it unset is supported and means requests go out unsigned.
 
 Secrets are never literal in a config file. `token = "env:HF_TOKEN"` reads an environment variable, `token = "file:/run/secrets/hf"` reads a file, and a literal string is accepted with a warning printed on every run until it is fixed. There is no keyring integration, because a keyring is a portability problem in exchange for very little.
 
@@ -305,6 +308,7 @@ $ umi doctor
   dns                   resolves, no captive portal                   ok
   disk /var/lib/umi     112 GB free, 24 GB needed for 8 segments      ok
   memory                10.2 GB available, 1.5 GB budgeted            ok
+  crawl identity        signing as kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7Ty     ok
   outbound to hf        11.4 MB/s measured over 8s                    ok
   inbound sample        38.1 MB/s measured over 8s                    ok
   hf token              valid, write access to open-index             ok
