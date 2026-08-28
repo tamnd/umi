@@ -163,6 +163,8 @@ struct FileConfig {
     publish: PublishFile,
     #[serde(default)]
     fetch: FetchFile,
+    #[serde(default)]
+    render: RenderFile,
 }
 
 #[derive(Default, Deserialize)]
@@ -196,6 +198,16 @@ struct FetchFile {
     rate: Option<f32>,
 }
 
+/// Doc 05.6's browser, which is a property of the machine rather than of the
+/// crawl. Its own section and not a key under `[crawl]` for that reason: the
+/// same scope profile runs on server1 and on server3, and only one of them
+/// should be starting Chrome.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenderFile {
+    tabs: Option<u16>,
+}
+
 /// The flags that participate in configuration, as options, so that "the user
 /// did not say" is distinguishable from "the user said the default".
 #[derive(Default)]
@@ -214,6 +226,8 @@ pub struct Flags {
     pub coordinator: Option<String>,
     /// `--rate`.
     pub rate: Option<f32>,
+    /// `--tabs`.
+    pub tabs: Option<u16>,
 }
 
 /// The effective configuration, with every value's origin.
@@ -246,6 +260,13 @@ pub struct Config {
     pub coordinator: Sourced<String>,
     /// Pages a second a fetcher offers.
     pub rate: Sourced<f32>,
+    /// Doc 05.6's tab cap, which is how a machine says whether it renders.
+    ///
+    /// Zero, and zero is the default, means no browser and no T3 on this box.
+    /// It is here rather than on the crawl because it is a property of the
+    /// machine and not of the crawl: eight tabs is fine on server3 and would
+    /// take server1 apart, and both of them run the same profiles.
+    pub tabs: Sourced<u16>,
     /// The files that were actually read, in precedence order, for `umi config`.
     pub files: Vec<PathBuf>,
 }
@@ -376,6 +397,7 @@ impl Config {
                 "https://umi.dev",
             )?,
             rate: layers.number(flags.rate, "UMI_RATE", "number", |f| f.fetch.rate, 2.0)?,
+            tabs: layers.number(flags.tabs, "UMI_TABS", "whole number", |f| f.render.tabs, 0)?,
             files,
         })
     }

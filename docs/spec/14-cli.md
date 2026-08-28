@@ -90,7 +90,8 @@ Rate
 
 Fetching
   --tier <max>                 highest tier allowed, default 3 in focused mode
-  --no-render                  equivalent to --tier 2
+  --no-render                  equivalent to --tier 2, and sets --tabs 0
+  --tabs <n>                   doc 05.6's browser tab cap, default 0
   --timeout <duration>         per request, default 30s
 
 Seeding
@@ -286,7 +287,12 @@ key   = "env:UMI_PUBLISH_KEY"
 [fetch]
 coordinator = "https://umi.dev"
 rate        = 2.0
+
+[render]
+tabs = 0
 ```
+
+`render.tabs` is doc 05.6's browser tab cap and it is how a machine says whether it renders at all. Its own section rather than a key under `[crawl]` because it is a property of the machine and not of the crawl: eight tabs is right on server3 and would take server1 apart, and both of them run the same scope profiles. Zero is the default, so nothing starts a browser until somebody asks for one, and a build without the `render` feature says so and carries on rather than failing.
 
 `crawl.identity_key` is doc 07.2's Web Bot Auth signing key, 64 hex characters, and it is a third secret with a third rotation schedule rather than a second use for the publishing key. Leaving it unset is supported and means requests go out unsigned.
 

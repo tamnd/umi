@@ -231,6 +231,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p umi-fetch --all-targets --features render -- -D warnings
       - run: cargo test -p umi-fetch --features render
+      # The crate that spends the budget and the binary that turns the feature
+      # on. Neither has anything behind a cfg, so what this catches is the
+      # feature forwarding itself: a `render = [...]` line that names a crate
+      # wrong compiles fine until somebody tries to use it.
+      - run: cargo clippy -p umi-cli --all-targets --features render -- -D warnings
+      - run: cargo test -p umi-crawl --features render
       # Both rungs at once is what the fleet builds, and the thing worth
       # proving is that BoringSSL and chromiumoxide's tree link together.
       - run: cargo test -p umi-fetch --features emulation,render

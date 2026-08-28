@@ -239,6 +239,10 @@ struct CrawlArgs {
     /// Never open a browser. Equivalent to `--tier 2`.
     #[arg(long)]
     no_render: bool,
+    /// Browser tabs for tier 3, doc 05.6. Zero, the default, is a machine
+    /// that does not render.
+    #[arg(long)]
+    tabs: Option<u16>,
 
     /// Seed from a file of URLs, or `-` for stdin.
     #[arg(long)]
@@ -286,6 +290,7 @@ impl CrawlArgs {
             rps: config.rps.value,
             concurrency: config.concurrency.value,
             tier_max: config.tier_max.value,
+            tabs: config.tabs.value,
             seed: self.seed.clone(),
             seeder: self.seeder.clone(),
             // Doc 14.9 has this on by default, so the flag that decides
@@ -337,6 +342,10 @@ impl Command {
                 // explicit flag wins when both are given because a person who
                 // typed a number meant it.
                 tier_max: args.tier.or(if args.no_render { Some(2) } else { None }),
+                // `--no-render` has to reach the tab cap as well as the tier
+                // ceiling, or a box with tabs configured would still start a
+                // browser and then never send it a page.
+                tabs: if args.no_render { Some(0) } else { args.tabs },
                 out: args.out.clone(),
                 backend: args.state.clone(),
                 ..config::Flags::default()
@@ -619,6 +628,11 @@ fn print_config(config: &config::Config) -> Result<(), Error> {
         "fetch.rate",
         config.rate.value.to_string(),
         &config.rate.origin,
+    );
+    line(
+        "render.tabs",
+        config.tabs.value.to_string(),
+        &config.tabs.origin,
     );
     println!();
     if config.files.is_empty() {
