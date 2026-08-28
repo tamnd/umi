@@ -480,6 +480,22 @@ impl Ladder {
         self.rendered.as_ref()
     }
 
+    /// Doc 05.9's `browser_pool_capacity`, in pages a second, or `None` when
+    /// this process has no browser.
+    ///
+    /// Not behind the feature, unlike everything else about T3, because the
+    /// crawl loop's render budget has to compile the same way either way. A
+    /// `cfg` here saves two more crates from carrying the feature, and `None`
+    /// is the honest answer for a build that cannot render.
+    #[must_use]
+    pub fn render_rate(&self) -> Option<f64> {
+        #[cfg(feature = "render")]
+        let rate = self.rendered.as_ref().map(Renderer::rate);
+        #[cfg(not(feature = "render"))]
+        let rate = None;
+        rate
+    }
+
     /// Close the browser, if there is one.
     ///
     /// Dropping the ladder also kills Chromium, because the child is spawned

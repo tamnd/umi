@@ -336,3 +336,38 @@ fn only_markup_is_serialised_as_a_page() {
     assert!(!markup("text/plain"));
     assert!(!markup(""));
 }
+
+#[test]
+fn pool_capacity_is_tabs_over_the_time_a_page_takes() {
+    // Doc 05.9's `browser_pool_capacity`, which the crawl loop's render budget
+    // reads every tick. The spec works its example at 8 tabs over 2 seconds.
+    let mut counts = Counts {
+        pages: 4,
+        nanos: 4 * 2_000_000_000,
+        ..Counts::default()
+    };
+    assert!((counts.capacity(8) - 4.0).abs() < f64::EPSILON);
+
+    // And what the bench actually measures, which is most of a second slower
+    // per page and so most of a page a second lower.
+    counts.nanos = 4 * 3_500_000_000;
+    assert!(counts.capacity(8) < 2.4);
+    assert!(counts.capacity(8) > 2.2);
+}
+
+#[test]
+fn a_pool_that_has_rendered_nothing_has_no_measured_capacity() {
+    // Zero rather than infinity, because the budget reads this as how many
+    // pages a second it may hand over. `Renderer::rate` is what covers the gap
+    // before the first page, with an estimate that says where it came from.
+    let counts = Counts::default();
+    assert!((counts.capacity(8) - 0.0).abs() < f64::EPSILON);
+
+    // Nor does a pool with no tabs, which is doc 05.6's server1.
+    let rendered = Counts {
+        pages: 1,
+        nanos: 1_000_000_000,
+        ..Counts::default()
+    };
+    assert!((rendered.capacity(0) - 0.0).abs() < f64::EPSILON);
+}
