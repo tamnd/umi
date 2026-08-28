@@ -181,6 +181,10 @@ pub struct Options {
     pub concurrency: u16,
     /// Highest tier allowed.
     pub tier_max: u8,
+    /// Doc 05.6's tab cap. Zero means this machine does not render, which is
+    /// the default and is also what a build without the `render` feature can
+    /// do regardless of what is configured.
+    pub tabs: u16,
     /// A file of URLs, or `-` for standard input.
     pub seed: Option<String>,
     /// Any program that prints URLs, repeatable.
@@ -926,6 +930,40 @@ fn matcher_toml(matcher: &umi_crawl::Matcher) -> String {
     }
 }
 
+/// Every rung this build has, with a browser behind T3 when the machine asked
+/// for one.
+///
+/// Async because starting Chrome is, and it takes the tab cap rather than
+/// reading it from anywhere so that the two ways of ending up without a
+/// browser stay separate: `tabs = 0` is a machine saying no, and a build with
+/// no `render` feature is a binary that could not have said yes. Both end with
+/// a T2 ladder and the second one says so in the log, because a crawl that
+/// silently ignored a configured tab cap would look like a browser that keeps
+/// failing to help.
+async fn ladder(
+    config: FetchConfig,
+    signer: Option<Arc<umi_fetch::webbotauth::Signer>>,
+    tabs: u16,
+) -> Result<Ladder, Error> {
+    if tabs == 0 {
+        return Ok(Ladder::with_signer(config, signer)?);
+    }
+    #[cfg(feature = "render")]
+    {
+        // Assigned rather than built with a struct literal because
+        // `RenderConfig` is non exhaustive, which is the point: the rest of
+        // doc 05.6's numbers are defaults the crawl does not second guess.
+        let mut render = umi_fetch::RenderConfig::default();
+        render.tabs = usize::from(tabs);
+        Ok(Ladder::with_rendered(config, signer, render).await?)
+    }
+    #[cfg(not(feature = "render"))]
+    {
+        eprintln!("umi: this build has no tier 3, so the tab cap of {tabs} does nothing");
+        Ok(Ladder::with_signer(config, signer)?)
+    }
+}
+
 /// The loop, which is the part worth reading.
 fn run(
     layout: &Layout,
@@ -956,7 +994,19 @@ fn run(
         None => None,
     };
     let signed_as = signer.as_ref().map(|s| s.keyid().to_owned());
-    let fetcher = Ladder::with_signer(fetch_config, signer)?;
+
+    // One runtime for the whole crawl, multi threaded because gate 1.1 wants
+    // 250 pages a second and the extract and the sketch are CPU work that a
+    // single threaded runtime would serialise behind the fetches.
+    //
+    // Built before the ladder rather than after it, because starting a browser
+    // is async and a browser started on a runtime that is then dropped takes
+    // its connection with it.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Io)?;
+    let fetcher = runtime.block_on(ladder(fetch_config, signer, options.tabs))?;
 
     let scope = Arc::new(scope.clone());
     let sink = SegmentSink::create(
@@ -980,14 +1030,6 @@ fn run(
             ..settings.config.clone()
         },
     );
-
-    // One runtime for the whole crawl, multi threaded because gate 1.1 wants
-    // 250 pages a second and the extract and the sketch are CPU work that a
-    // single threaded runtime would serialise behind the fetches.
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(Error::Io)?;
 
     let mut log = Log::open(&layout.log)?;
     if let Some(keyid) = &signed_as {
@@ -1905,6 +1947,7 @@ impl Default for Options {
             rps: 1.0,
             concurrency: 4,
             tier_max: 3,
+            tabs: 0,
             seed: None,
             seeder: Vec::new(),
             sitemaps: true,
