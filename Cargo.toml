@@ -101,9 +101,18 @@ bytes = "1"
 # advertised encodings gets bytes it cannot parse. `stream` is what gives the
 # body as chunks rather than one buffer, which is how the body cap is enforced
 # before the bytes are in memory rather than after.
+#
+# `prefix-symbols` is gate 2.2's other half and umi-fetch asks for it on Linux
+# only, in a target section, because it is broken everywhere else. See the
+# comment there.
 wreq = { version = "0.16", features = ["stream", "gzip", "brotli", "zstd", "deflate"] }
 wreq-util = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# Only ever a dev dependency, and only for gate 2.2's crash suite, which needs
+# a TLS origin on loopback to make both stacks do a real handshake.
+rustls = "0.23"
+tokio-rustls = "0.26"
 
 # Storage and publishing.
 rusqlite = { version = "0.40", features = ["bundled"] }

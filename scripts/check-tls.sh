@@ -44,7 +44,10 @@ done
 # says it does and the JA4 self check is measuring rustls.
 echo "emulation build, boringssl present"
 emu=$(cargo tree -p umi-fetch --features emulation --edges normal --prefix none --format '{p}')
-if ! printf '%s\n' "$emu" | grep -qE '^btls v'; then
+# Counted rather than `grep -q`, because `grep -q` stops reading at the first
+# match, the printf upstream takes SIGPIPE, and `set -o pipefail` then reports
+# the pipeline as failed even though the thing we were looking for was there.
+if [ "$(printf '%s\n' "$emu" | grep -cE '^btls v' || true)" -eq 0 ]; then
 	printf '  the emulation build has no btls, so T2 is not BoringSSL\n'
 	fail=1
 fi
