@@ -114,6 +114,19 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rustls = "0.23"
 tokio-rustls = "0.26"
 
+# Sitemaps and feeds, doc 13.6. A pull parser rather than a tree parser,
+# because a sitemap index can point at fifty thousand files and none of them
+# has to be held whole to read the URLs out of it.
+#
+# It is also the safe choice, which matters more here than the speed. A sitemap
+# is a document from a site we have never met, and the classic XML denial of
+# service is a document whose DTD defines an entity that expands to gigabytes.
+# quick-xml does not resolve DTD entities at all, so that document is a parse
+# error rather than a machine with no memory left. `encoding` is on because
+# real sitemaps still declare windows-1252 and a parser that only reads UTF-8
+# drops them.
+quick-xml = { version = "0.42", features = ["encoding"] }
+
 # Storage and publishing.
 rusqlite = { version = "0.40", features = ["bundled"] }
 arrow = "59"

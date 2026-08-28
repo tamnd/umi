@@ -11,6 +11,11 @@
 //! 11.2's, it is the same work admission does anyway, and making it faster
 //! helps the crawl and not just seeding.
 //!
+//! Part 4 is the other two sources doc 13.6 names, sitemaps and feeds. Same
+//! bar, and it is the one that matters: a full sitemap is 50000 URLs in one
+//! request, so if the parse is slower than admission then reading the file
+//! costs more than fetching it did.
+//!
 //! Environment:
 //!
 //! * `UMI_BENCH_URLS` how many URLs, default 200000
@@ -144,6 +149,113 @@ fn main() {
     );
     println!("  past the cap the stream stops deduplicating rather than growing,");
     println!("  and doc 08's seen set catches the repeats at admission anyway.");
+
+    println!("\npart 4: sitemaps and feeds, doc 13.6");
+    println!(
+        "  {:<24} {:>12} {:>12} {:>16}",
+        "document", "URLs/s", "MB/s", "vs admission"
+    );
+    // 50000 is sitemaps.org's cap, so this is the largest single file that is
+    // still in spec and is what a big site actually serves.
+    let full = umi_seed::sitemap::MAX_URLS;
+    for (name, doc, urls) in [
+        ("sitemap", sitemap_doc(full, true), full),
+        ("sitemap, no lastmod", sitemap_doc(full, false), full),
+        ("sitemap index", index_doc(full), full),
+        ("sitemap, plain text", text_doc(full), full),
+        ("rss", rss_doc(full), full),
+        ("atom", atom_doc(full), full),
+    ] {
+        let bytes = doc.len();
+        let best = time(repeat, || {
+            if name == "rss" || name == "atom" {
+                umi_seed::Feed::parse(doc.as_bytes()).entries.len()
+            } else {
+                umi_seed::Sitemap::parse(doc.as_bytes()).all().count()
+            }
+        });
+        let per_s = urls as f64 / best;
+        println!(
+            "  {name:<24} {per_s:>12.0} {:>12.1} {:>15.1}x",
+            bytes as f64 / 1e6 / best,
+            per_s / ADMISSION
+        );
+    }
+    println!("  a full sitemap is a few MB and one request, so anything here that");
+    println!("  beats admission means the fetch is the cost and the parse is not.");
+}
+
+/// A `<urlset>` with `count` URLs in it, with or without the date.
+fn sitemap_doc(count: usize, lastmod: bool) -> String {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    for i in 0..count {
+        out.push_str("  <url><loc>https://example.com/page/");
+        out.push_str(&i.to_string());
+        out.push_str("?q=1&amp;r=2</loc>");
+        if lastmod {
+            out.push_str("<lastmod>2026-08-28T12:30:45Z</lastmod>");
+        }
+        out.push_str("<changefreq>daily</changefreq><priority>0.8</priority></url>\n");
+    }
+    out.push_str("</urlset>\n");
+    out
+}
+
+/// A `<sitemapindex>` pointing at `count` other files.
+fn index_doc(count: usize) -> String {
+    let mut out = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <sitemapindex xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">\n",
+    );
+    for i in 0..count {
+        out.push_str("  <sitemap><loc>https://example.com/sitemap-");
+        out.push_str(&i.to_string());
+        out.push_str(".xml</loc><lastmod>2026-08-28</lastmod></sitemap>\n");
+    }
+    out.push_str("</sitemapindex>\n");
+    out
+}
+
+/// The plain text form, which is the cheapest of the three to read.
+fn text_doc(count: usize) -> String {
+    let mut out = String::new();
+    for i in 0..count {
+        out.push_str("https://example.com/page/");
+        out.push_str(&i.to_string());
+        out.push('\n');
+    }
+    out
+}
+
+fn rss_doc(count: usize) -> String {
+    let mut out = String::from("<rss version=\"2.0\"><channel><title>Example</title>\n");
+    for i in 0..count {
+        out.push_str("<item><title>Post ");
+        out.push_str(&i.to_string());
+        out.push_str("</title><link>https://example.com/page/");
+        out.push_str(&i.to_string());
+        out.push_str("</link><guid isPermaLink=\"false\">tag:example.com,2026:");
+        out.push_str(&i.to_string());
+        out.push_str("</guid><pubDate>Fri, 28 Aug 2026 12:30:45 GMT</pubDate></item>\n");
+    }
+    out.push_str("</channel></rss>\n");
+    out
+}
+
+fn atom_doc(count: usize) -> String {
+    let mut out = String::from("<feed xmlns=\"http://www.w3.org/2005/Atom\">\n");
+    for i in 0..count {
+        out.push_str("<entry><title>Post ");
+        out.push_str(&i.to_string());
+        out.push_str("</title><link rel=\"alternate\" href=\"https://example.com/page/");
+        out.push_str(&i.to_string());
+        out.push_str("\"/><updated>2026-08-28T12:30:45Z</updated></entry>\n");
+    }
+    out.push_str("</feed>\n");
+    out
 }
 
 /// What kind of list to write.
