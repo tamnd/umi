@@ -309,12 +309,15 @@ $ umi doctor
   disk /var/lib/umi     112 GB free, 24 GB needed for 8 segments      ok
   memory                10.2 GB available, 1.5 GB budgeted            ok
   crawl identity        signing as kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7Ty     ok
+  crawl addresses       62.171.131.190 confirms as fetch-3.umi.dev     ok
   outbound to hf        11.4 MB/s measured over 8s                    ok
   inbound sample        38.1 MB/s measured over 8s                    ok
   hf token              valid, write access to open-index             ok
 ```
 
 Two of these lines are load bearing. The `openssl-sys` check is doc 05.5's CI assertion run at runtime, because the BoringSSL symbol prefix conflict produces link failures and segfaults rather than clean errors and it is worth catching before a crawl rather than during one. The bandwidth measurements are doc 01's milestone 1 gate, and having them in `doctor` means the number gets measured on every box every time rather than once by whoever set it up.
+
+The `crawl addresses` line is doc 07.1's forward confirmation run on the box rather than assumed, one line per address the box sends from, and it asks a public resolver because that is the answer a site operator gets. An address that is not in the published list is a skip and not a failure, so a volunteer running `doctor` at home sees a line saying nothing is required of their address rather than a red one about a PTR record they do not control.
 
 `--bandwidth` is the gate itself rather than the sample. It runs eight concurrent streams for sixty seconds in each direction, `--bandwidth-secs` changes the sixty, and it moves a few gigabytes and takes a couple of minutes, which is why the plain `doctor` takes a one request sample and says out loud that the sample is too small to be the gate.
 

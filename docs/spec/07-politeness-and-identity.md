@@ -14,7 +14,22 @@ The URL resolves to a page that states who runs the crawler, what the data is us
 
 T2 is the awkward case. Its whole purpose is to present a browser's TLS and HTTP/2 fingerprint, and a browser fingerprint with a bot user agent is an inconsistency. We keep the honest user agent anyway. The alternative is to present ourselves as Chrome, which is the thing that turns a crawler into a scraper in every sense that matters, including legally. If a site's bot management scores us as suspicious because the layers disagree, that is a signal we should accept rather than paper over.
 
-Forward confirmable reverse DNS is set up for every crawling IP, so `umi-fetch-1.tamnd.com` resolves to the address and the address resolves back. This is how Googlebot and Bingbot are verified and it is the check most site operators know how to run.
+Forward confirmable reverse DNS is set up for every crawling address, so `62.171.131.190` reverses to `fetch-3.umi.dev` and `fetch-3.umi.dev` resolves back to `62.171.131.190`. This is how Googlebot and Bingbot are verified and it is the check most site operators know how to run. It works because the two halves are held by different parties: anyone can put `umi.dev` in a PTR record for an address they own, and only we can put an address in a name under `umi.dev`. The names are `fetch-N.umi.dev`, under the same domain as the bot page and the key directory, so one domain answers every question about who we are.
+
+The addresses are also published as a list, at `https://umi.dev/bot/umi.json`, in the same shape as Google's `googlebot.json` down to the field names. An operator who wants to allow us, rate limit us or just recognise us should not have to write a second reader for our version of the same file, and the tooling that already eats Google's list works on ours unchanged. The one addition is a `name` on each entry carrying the reverse DNS name for that range, which a reader that does not expect it ignores. Ranges today are single addresses, written `/32` and `/128`, because three servers is what there is.
+
+```json
+{
+  "creationTime": "2026-08-29T00:00:00.000000",
+  "prefixes": [
+    { "ipv4Prefix": "62.171.131.190/32", "name": "fetch-3.umi.dev" }
+  ]
+}
+```
+
+Every box checks its own reverse DNS rather than trusting that somebody set it up. `umi doctor` finds the address the kernel would send from, looks it up in the published list, and for an address that is on the list does the full forward confirmation and says which name came back. An address that is not on the list is skipped rather than judged, because a volunteer's laptop has whatever PTR record their provider gave it and none of this asks anything of it. The query goes to a public resolver and not to the one in `/etc/resolv.conf`, which matters more than it sounds: a hosting provider that puts the box's own name in `/etc/hosts` makes the local resolver answer the forward half with a loopback address, so the box would fail its own check while the rest of the internet saw it pass. The question is what somebody else sees.
+
+When an address changes, the order is fixed and it is the reverse of what feels natural. The published list gains the new address first and keeps the old one, then reverse DNS is set for the new address and forward confirmation is checked from the box itself, then the crawl moves, and only after a full crawl cycle on the new address does the old entry come out of the list. Publishing last would mean crawling from an address that operators have no record of, which is exactly the thing an allowlist is meant to prevent, and removing the old entry early would strand anybody who checks a log from yesterday. An address that is retired for cause, rather than by planning, comes out of the list immediately and the bot page says when and why.
 
 ## 7.2 Web Bot Auth
 

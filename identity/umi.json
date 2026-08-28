@@ -1,0 +1,10 @@
+{
+  "creationTime": "2026-08-29T00:00:00.000000",
+  "prefixes": [
+    { "ipv4Prefix": "194.233.70.53/32", "name": "fetch-1.umi.dev" },
+    { "ipv4Prefix": "185.209.229.109/32", "name": "fetch-2.umi.dev" },
+    { "ipv6Prefix": "2a02:c207:2311:2167::1/128", "name": "fetch-2.umi.dev" },
+    { "ipv4Prefix": "62.171.131.190/32", "name": "fetch-3.umi.dev" },
+    { "ipv6Prefix": "2a02:c207:2339:1933::1/128", "name": "fetch-3.umi.dev" }
+  ]
+}
