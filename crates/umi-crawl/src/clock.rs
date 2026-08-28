@@ -13,9 +13,10 @@
 //! [`SystemClock`] and nothing else in the crate knows the difference.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// What the loop needs from a clock.
+#[async_trait::async_trait]
 pub trait Clock: Send + Sync {
     /// Milliseconds since the Unix epoch.
     ///
@@ -24,12 +25,23 @@ pub trait Clock: Send + Sync {
     /// it. Callers that want to measure a duration use `Instant` and do not
     /// come here.
     fn now_ms(&self) -> u64;
+
+    /// Wait until `when_ms`, and return at once if it has already gone by.
+    ///
+    /// Waiting is here rather than at the call site because a fetch held back
+    /// by doc 07.6's politeness timer has to be held back in a test too, and a
+    /// test that sleeps for real takes as long as the politeness delay it is
+    /// checking. A crawl of one host at one request a second is a minute of
+    /// wall time for sixty pages, which is correct in production and is not a
+    /// test anybody will run.
+    async fn sleep_until_ms(&self, when_ms: u64);
 }
 
 /// The wall clock.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemClock;
 
+#[async_trait::async_trait]
 impl Clock for SystemClock {
     fn now_ms(&self) -> u64 {
         // A clock before 1970 is a broken machine rather than a case worth
@@ -42,6 +54,17 @@ impl Clock for SystemClock {
             .map_or(0, |since| {
                 u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
             })
+    }
+
+    async fn sleep_until_ms(&self, when_ms: u64) {
+        // Read once and subtract, rather than looping until the wall clock
+        // passes the target. A wall clock can be stepped backwards by ntp,
+        // and a loop that trusts it would hold a lease for however far back
+        // it went. One sleep of a bounded length cannot do that.
+        let now_ms = self.now_ms();
+        if when_ms > now_ms {
+            tokio::time::sleep(Duration::from_millis(when_ms - now_ms)).await;
+        }
     }
 }
 
@@ -71,14 +94,33 @@ impl FixedClock {
     }
 }
 
+#[async_trait::async_trait]
 impl Clock for FixedClock {
     fn now_ms(&self) -> u64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    async fn sleep_until_ms(&self, when_ms: u64) {
+        // Jump to the target instead of waiting for it. A test that wants to
+        // know whether the loop respects a politeness window wants the answer
+        // now, and the answer is the same either way: what the loop observes
+        // is that the clock reads `when_ms` by the time the fetch goes out.
+        //
+        // `fetch_max` rather than `set` because the sleeps of a tick are
+        // concurrent and the earlier ones finish last as often as not, and a
+        // clock that can go backwards would make a recorded fetch time depend
+        // on which future the executor happened to poll.
+        self.0.fetch_max(when_ms, Ordering::Relaxed);
+    }
 }
 
+#[async_trait::async_trait]
 impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
     fn now_ms(&self) -> u64 {
         (**self).now_ms()
+    }
+
+    async fn sleep_until_ms(&self, when_ms: u64) {
+        (**self).sleep_until_ms(when_ms).await;
     }
 }

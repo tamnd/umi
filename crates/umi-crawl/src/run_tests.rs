@@ -18,7 +18,7 @@ use umi_fetch::{FetchError, Media, Outcome};
 use umi_state::{Budget, Candidate, MemoryState, State};
 use umi_types::{FetcherId, Revalidator, Tier};
 
-use crate::clock::FixedClock;
+use crate::clock::{Clock, FixedClock};
 use crate::fetch::Fetch;
 use crate::page::PageRow;
 use crate::run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
@@ -82,6 +82,49 @@ impl Fetch for Canned {
             status: Some(404),
             retry_after: None,
         }))
+    }
+}
+
+/// The same fetcher, noting the clock as each request goes out.
+///
+/// [`Canned`] records the order of requests, which answers whether robots.txt
+/// came first. It cannot answer whether two requests to one host were far
+/// enough apart, because order says nothing about spacing, and spacing is the
+/// whole of doc 07.6.
+struct Timed {
+    inner: Canned,
+    clock: Arc<FixedClock>,
+    sent: Mutex<Vec<(String, u64)>>,
+}
+
+impl Timed {
+    /// Build the inner fetcher with `pages`, reading `clock` as it serves.
+    fn new(clock: &Arc<FixedClock>, pages: impl FnOnce(Canned) -> Canned) -> Self {
+        Self {
+            inner: pages(Canned::new()),
+            clock: Arc::clone(clock),
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// What went out and when, in the order it went out.
+    fn sent(&self) -> Vec<(String, u64)> {
+        self.sent.lock().expect("not poisoned").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Fetch for Timed {
+    async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+    ) -> Result<Outcome, FetchError> {
+        self.sent
+            .lock()
+            .expect("not poisoned")
+            .push((url.to_owned(), self.clock.now_ms()));
+        self.inner.fetch(url, revalidate).await
     }
 }
 
@@ -286,6 +329,119 @@ async fn robots_is_fetched_before_the_page_and_only_once_per_host() {
         .filter(|u| u.ends_with("/robots.txt"))
         .count();
     assert_eq!(robots, 1, "asked for robots.txt {robots} times");
+}
+
+#[tokio::test]
+async fn a_batch_covering_one_host_is_spread_out_rather_than_sent_at_once() {
+    // Doc 07.6. The state layer already staggers the leases of a batch by the
+    // host's delay and reports each one's earliest send in `not_before_ms`, and
+    // for a while the loop dropped that on the floor and pushed the whole batch
+    // into the window at once. It is invisible from our side: the totals are
+    // right, the rate averaged over a minute is right, and the origin is the
+    // only party who sees four requests land together.
+    //
+    // Measured on a real site before the fix, `umi crawl blog.rust-lang.org
+    // --rps 1` sent four requests in 138 ms.
+    let urls = [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+        "https://example.com/d",
+    ];
+    let state = seeded(&urls).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Timed::new(&clock, |f| {
+        let mut f = f.robots("https://example.com", "User-agent: *\nAllow: /\n");
+        for url in urls {
+            f = f.html(url, &page("P", &[]));
+        }
+        f
+    }));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        state,
+        Arc::clone(&clock),
+        CrawlConfig {
+            in_flight: 8,
+            ..config()
+        },
+    );
+
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.fetched, 4, "{report:?}");
+
+    let sent: Vec<u64> = fetch
+        .sent()
+        .into_iter()
+        .filter(|(url, _)| !url.ends_with("/robots.txt"))
+        .map(|(_, at)| at)
+        .collect();
+    assert_eq!(sent.len(), 4, "{sent:?}");
+
+    let delay = u64::from(umi_state::HostRow::INITIAL_DELAY_MS);
+    for pair in sent.windows(2) {
+        let gap = pair[1].saturating_sub(pair[0]);
+        assert!(
+            gap >= delay,
+            "two requests to one host {gap} ms apart, {delay} ms asked for: {sent:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_lease_that_is_ready_now_does_not_wait_behind_one_that_is_not() {
+    // The other half. Honouring `not_before_ms` costs nothing if a slow host
+    // can park the window while it waits, so the batch goes out earliest first
+    // and a host with work ready keeps going while another host serves its
+    // penalty. Two hosts, four urls each, one window: the fourth url of the
+    // second host must not be waiting on the fourth url of the first.
+    let mut urls = Vec::new();
+    for host in ["a.example", "b.example"] {
+        for n in 0..4 {
+            urls.push(format!("https://{host}/p{n}"));
+        }
+    }
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Timed::new(&clock, |f| {
+        let mut f = f
+            .robots("https://a.example", "User-agent: *\nAllow: /\n")
+            .robots("https://b.example", "User-agent: *\nAllow: /\n");
+        for url in &urls {
+            f = f.html(url, &page("P", &[]));
+        }
+        f
+    }));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        state,
+        Arc::clone(&clock),
+        CrawlConfig {
+            in_flight: 8,
+            ..config()
+        },
+    );
+
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.fetched, 8, "{report:?}");
+
+    // Three delays covers the fourth request on either host. If the two hosts
+    // were being served one after the other it would take seven.
+    let delay = u64::from(umi_state::HostRow::INITIAL_DELAY_MS);
+    let last = fetch
+        .sent()
+        .into_iter()
+        .map(|(_, at)| at)
+        .max()
+        .expect("something was sent");
+    assert_eq!(
+        last - T0,
+        3 * delay,
+        "eight urls over two hosts took {} ms, and one host's worth is {} ms",
+        last - T0,
+        3 * delay
+    );
 }
 
 #[tokio::test]

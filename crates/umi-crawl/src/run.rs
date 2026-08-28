@@ -276,6 +276,15 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             return Ok(report);
         }
 
+        // Earliest first, because a lease that is not due yet still occupies a
+        // slot in the window while it waits. Sorted, the only time a slot holds
+        // a waiting lease is when everything ahead of it is waiting too, so
+        // nothing that could have been fetched is sitting behind something that
+        // could not. Unsorted, one host that owes a minute of politeness can
+        // park the whole window while other hosts have work ready to go.
+        let mut leases = leases;
+        leases.sort_by_key(|lease| lease.not_before_ms);
+
         let mut pending = FuturesUnordered::new();
         let mut queue = leases.into_iter();
         let mut rows = Vec::with_capacity(report.leased);
@@ -334,6 +343,17 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
 
     /// One lease, from robots check to row.
     async fn one(&self, lease: umi_state::Lease) -> Fetched {
+        // Doc 07.6, and the whole reason `not_before_ms` exists. The state
+        // layer already spaced the leases of a batch by each host's politeness
+        // delay, and until this line the loop threw that away and sent the
+        // batch as fast as the window allowed. A crawl asking for one request a
+        // second put four on blog.rust-lang.org inside 138 ms, which is the
+        // kind of mistake the origin sees and we do not.
+        //
+        // Before the robots check rather than after, since robots.txt is a
+        // request to the same host and counts the same way.
+        self.clock.sleep_until_ms(lease.not_before_ms).await;
+
         let now = || self.clock.now_ms();
         let Some(origin) = origin_of(&lease.url) else {
             return Fetched::malformed(&lease, now());
