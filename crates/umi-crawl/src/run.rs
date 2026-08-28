@@ -315,6 +315,42 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         &self.robots
     }
 
+    /// Seed from an origin's own sitemaps, per doc 13.6.
+    ///
+    /// Call it with the origins the seeds are on, before the first
+    /// [`tick`](Self::tick). It is the difference between starting a site at
+    /// its front page and starting it with everything the site says it has, and
+    /// on a site whose pages are behind a search form it is the only way to
+    /// find them at all.
+    ///
+    /// This makes requests. They go through the same robots decision and the
+    /// same politeness delay a page fetch does, but not through the frontier,
+    /// because a sitemap is not a page: there is no row to write and nothing to
+    /// publish, and putting it in the ledger would mean a sitemap turning up in
+    /// the corpus. What it costs is bounded by
+    /// [`SitemapLimits`](crate::sitemap::SitemapLimits).
+    ///
+    /// # Errors
+    ///
+    /// [`CrawlError::State`] if the URLs could not be admitted. A sitemap that
+    /// is missing, unparseable or disallowed is not an error and is in the
+    /// report.
+    pub async fn seed_from_sitemaps(
+        &self,
+        origin: &str,
+        limits: crate::sitemap::SitemapLimits,
+    ) -> Result<crate::sitemap::SitemapReport, CrawlError> {
+        Ok(crate::sitemap::discover(
+            &self.fetch,
+            &self.clock,
+            &self.robots,
+            &self.frontier,
+            origin,
+            limits,
+        )
+        .await?)
+    }
+
     /// The clock this crawler reads.
     ///
     /// A daemon needs it to decide how long to sleep between ticks, and it

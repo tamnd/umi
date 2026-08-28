@@ -105,7 +105,12 @@ impl RobotsCache {
     }
 
     /// The entry for a host, fetching it if it is missing or stale.
-    async fn entry<F: Fetch + ?Sized>(
+    ///
+    /// Public because robots.txt carries more than rules. Doc 13.6's sitemap
+    /// discovery reads the `Sitemap` lines off it and the crawl delay off the
+    /// same entry, and neither of those is a decision about a URL, so
+    /// [`decide`](Self::decide) is the wrong shape for them.
+    pub async fn entry<F: Fetch + ?Sized>(
         &self,
         fetch: &F,
         host: HostId,

@@ -44,8 +44,26 @@ impl Feed {
     }
 
     /// Read one, with limits the caller chose.
+    ///
+    /// Gzip is unwrapped first, on the same terms as [`Sitemap::parse_with`].
+    /// Feeds are served compressed far less often than sitemaps are, but a
+    /// caller that has a document and does not yet know which of the two it is
+    /// should not have to care.
+    ///
+    /// [`Sitemap::parse_with`]: crate::Sitemap::parse_with
     #[must_use]
     pub fn parse_with(bytes: &[u8], caps: &Caps) -> Self {
+        if crate::gzip::is_gzip(bytes) {
+            let (inflated, truncated) = crate::gzip::inflate(bytes, caps.max_bytes);
+            let mut out = Self::read(&inflated, caps);
+            out.truncated |= truncated;
+            return out;
+        }
+        Self::read(bytes, caps)
+    }
+
+    /// The parse itself, on bytes that are already plain.
+    fn read(bytes: &[u8], caps: &Caps) -> Self {
         let mut out = Self::default();
         let bytes = if bytes.len() > caps.max_bytes {
             out.truncated = true;

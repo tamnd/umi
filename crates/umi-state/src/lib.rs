@@ -67,7 +67,8 @@ mod tests;
 
 pub use freshness::{
     Budget, CLASSES, DAILY_UNDER_MS, HOURLY_UNDER_MS, INITIAL_REFRESH, MAX_REFRESH, MIN_REFRESH,
-    Quotas, REALTIME_UNDER_MS, RefreshClass, WEEKLY_UNDER_MS, next_due_after, refresh_interval_ms,
+    Quotas, REALTIME_UNDER_MS, RefreshClass, WEEKLY_UNDER_MS, initial_refresh_ms, next_due_after,
+    next_due_dated, refresh_interval_dated, refresh_interval_ms,
 };
 pub use memory::MemoryState;
 pub use pace::Pace;

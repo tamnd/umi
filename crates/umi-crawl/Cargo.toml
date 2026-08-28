@@ -37,6 +37,7 @@ umi-fetch.workspace = true
 umi-file.workspace = true
 umi-frontier.workspace = true
 umi-robots.workspace = true
+umi-seed.workspace = true
 umi-state.workspace = true
 umi-types.workspace = true
 

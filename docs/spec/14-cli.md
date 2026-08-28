@@ -97,6 +97,7 @@ Seeding
   --seed <file|->              URL list
   --seeder <cmd>               repeatable, any program that prints URLs
   --sitemaps                   follow sitemaps, default on
+  --no-sitemaps                do not follow them
   --from-cc                    seed from Common Crawl first
 
 Output

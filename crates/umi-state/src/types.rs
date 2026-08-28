@@ -124,6 +124,24 @@ pub struct Candidate<'a> {
     pub discovered_ms: u64,
     /// Whether this goes to the frontier or the holding pen.
     pub discovery: Discovery,
+    /// When the publisher says the page last changed, from a sitemap `lastmod`
+    /// or a feed date, in milliseconds since the Unix epoch.
+    ///
+    /// Doc 09.4 says this beats the change rate estimator when it is there, and
+    /// doc 13.6 says a sitemap seeds the schedule as well as the frontier, so
+    /// it is on the candidate rather than being thrown away at the parser. It
+    /// does two things and only two. On a URL we have never fetched it sets the
+    /// first refresh interval through
+    /// [`initial_refresh_ms`](crate::freshness::initial_refresh_ms). On a URL
+    /// we have, a date later than our last fetch brings the next visit forward
+    /// to now, because the site has just told us the page moved.
+    ///
+    /// It is never written to [`LedgerRow::last_mod_ms`], which is the
+    /// `Last-Modified` header we saw on our own fetch. That field is half of
+    /// the revalidator and the freshness estimator reads it as evidence the
+    /// origin supports conditional requests, so filling it in from a sitemap
+    /// would have us halving intervals on the strength of a header nobody sent.
+    pub lastmod_ms: Option<u64>,
 }
 
 impl<'a> Candidate<'a> {
@@ -141,6 +159,7 @@ impl<'a> Candidate<'a> {
             priority: Priority::DEFAULT,
             discovered_ms,
             discovery: Discovery::Trusted,
+            lastmod_ms: None,
         })
     }
 }
@@ -166,11 +185,21 @@ pub struct AdmitReport {
     /// Pay level domains whose shard had to be warmed from cold storage
     /// during this call. Zero on a backend that does not shard.
     pub shard_misses: u32,
+    /// URLs already known whose next visit was brought forward, because the
+    /// candidate carried a [`lastmod`](Candidate::lastmod_ms) later than our
+    /// last fetch of them.
+    ///
+    /// A subset of `seen` rather than a fifth disposition, so it is not part of
+    /// [`total`](AdmitReport::total). A sitemap poll that finds nothing new
+    /// reports every URL as seen and this is the number that says whether the
+    /// poll was worth making.
+    pub refreshed: u32,
 }
 
 impl AdmitReport {
     /// The number of candidates accounted for, which must equal the batch
-    /// length. `shard_misses` is not part of it: it counts domains, not URLs.
+    /// length. `shard_misses` and `refreshed` are not part of it: the first
+    /// counts domains and the second counts a subset of `seen`.
     #[must_use]
     pub const fn total(&self) -> u32 {
         self.seen + self.admitted + self.held + self.excluded

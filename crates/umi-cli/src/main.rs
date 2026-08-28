@@ -238,6 +238,12 @@ struct CrawlArgs {
     /// Any program that prints URLs to stdout, repeatable.
     #[arg(long)]
     seeder: Vec<String>,
+    /// Follow the site's own sitemaps before crawling. On by default.
+    #[arg(long, overrides_with = "no_sitemaps")]
+    sitemaps: bool,
+    /// Do not follow sitemaps.
+    #[arg(long)]
+    no_sitemaps: bool,
     /// Seed from Common Crawl before starting.
     #[arg(long)]
     from_cc: bool,
@@ -274,6 +280,10 @@ impl CrawlArgs {
             tier_max: config.tier_max.value,
             seed: self.seed.clone(),
             seeder: self.seeder.clone(),
+            // Doc 14.9 has this on by default, so the flag that decides
+            // anything is the negative one and `--sitemaps` is there to say
+            // out loud what the default already is.
+            sitemaps: !self.no_sitemaps,
             out: self.out.clone(),
             publish: crawl::Publishing::resolve(config, self.publish)?,
         })

@@ -278,15 +278,66 @@ impl<S: State> Frontier<S> {
         now_ms: u64,
         discovery: Discovery,
     ) -> Result<DiscoverReport> {
+        self.admit_each(
+            links.iter().map(|link| (*link, None)),
+            links.len(),
+            depth,
+            now_ms,
+            discovery,
+        )
+        .await
+    }
+
+    /// Admit a batch where the publisher has told us when each URL last
+    /// changed.
+    ///
+    /// This is [`admit_at`](Self::admit_at) for a sitemap or a feed, which
+    /// carry a `lastmod` per URL. Doc 13.6 wants that date used rather than
+    /// thrown away, and what it does is in
+    /// [`Candidate::lastmod_ms`](umi_state::Candidate::lastmod_ms): on a URL we
+    /// have never fetched, nothing, since it is due immediately anyway, and on
+    /// one we have, it brings the next visit forward if the page moved after we
+    /// last looked. A `None` in the list is a URL the document did not date and
+    /// behaves exactly like a link off a page.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports. An error means nothing in the batch was
+    /// admitted.
+    pub async fn admit_dated(
+        &self,
+        links: &[(&str, Option<u64>)],
+        depth: u8,
+        now_ms: u64,
+        discovery: Discovery,
+    ) -> Result<DiscoverReport> {
+        self.admit_each(links.iter().copied(), links.len(), depth, now_ms, discovery)
+            .await
+    }
+
+    /// The body both of the above share.
+    ///
+    /// It takes an iterator and a count rather than a slice so that the hot
+    /// path, a page's worth of links with no dates on them, does not have to
+    /// build a vector of pairs to get here.
+    async fn admit_each<'a>(
+        &self,
+        links: impl Iterator<Item = (&'a str, Option<u64>)>,
+        count: usize,
+        depth: u8,
+        now_ms: u64,
+        discovery: Discovery,
+    ) -> Result<DiscoverReport> {
         let mut report = DiscoverReport::default();
         if !within_depth(depth, self.config.max_depth) {
-            report.too_deep = u32::try_from(links.len()).unwrap_or(u32::MAX);
+            report.too_deep = u32::try_from(count).unwrap_or(u32::MAX);
             return Ok(report);
         }
 
-        let mut urls: Vec<String> = Vec::with_capacity(links.len());
-        let mut keys: Vec<RowKey> = Vec::with_capacity(links.len());
-        for link in links {
+        let mut urls: Vec<String> = Vec::with_capacity(count);
+        let mut keys: Vec<RowKey> = Vec::with_capacity(count);
+        let mut dates: Vec<Option<u64>> = Vec::with_capacity(count);
+        for (link, lastmod_ms) in links {
             let Ok(canonical) = canonicalize(link, None) else {
                 report.uncrawlable += 1;
                 continue;
@@ -297,19 +348,22 @@ impl<S: State> Frontier<S> {
             };
             urls.push(canonical);
             keys.push(key);
+            dates.push(lastmod_ms);
         }
 
         let priority = depth_score(depth);
         let batch: Vec<Candidate<'_>> = urls
             .iter()
             .zip(&keys)
-            .map(|(url, key)| Candidate {
+            .zip(&dates)
+            .map(|((url, key), lastmod_ms)| Candidate {
                 key: *key,
                 url,
                 depth,
                 priority,
                 discovered_ms: now_ms,
                 discovery,
+                lastmod_ms: *lastmod_ms,
             })
             .collect();
 
@@ -482,5 +536,6 @@ fn add(a: AdmitReport, b: AdmitReport) -> AdmitReport {
         held: a.held.saturating_add(b.held),
         excluded: a.excluded.saturating_add(b.excluded),
         shard_misses: a.shard_misses.saturating_add(b.shard_misses),
+        refreshed: a.refreshed.saturating_add(b.refreshed),
     }
 }

@@ -69,10 +69,11 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OptionalExtension, params};
 use umi_state::{
-    AdmitReport, CLASSES, Candidate, Checkpoint, Discovery, EvictReport, FetchOutcome, FetchResult,
-    HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason, Priority, RefreshClass, Result,
-    Revalidator, SegmentQuery, SegmentRow, State, StateError, StateStats, TierPolicy, UrlState,
-    next_due_after, retry_after_ms,
+    AdmitReport, CLASSES, Candidate, Checkpoint, DAILY_UNDER_MS, Discovery, EvictReport,
+    FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow,
+    NackReason, Priority, REALTIME_UNDER_MS, RefreshClass, Result, Revalidator, SegmentQuery,
+    SegmentRow, State, StateError, StateStats, TierPolicy, UrlState, WEEKLY_UNDER_MS,
+    next_due_dated, retry_after_ms,
 };
 use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
 
@@ -578,6 +579,12 @@ impl State for SqliteState {
                 let mut see = tx.prepare_cached(sql::INSERT_SEEN).state()?;
                 let mut into_ledger = tx.prepare_cached(sql::INSERT_LEDGER).state()?;
                 let mut into_pen = tx.prepare_cached(sql::INSERT_PEN).state()?;
+                // Prepared on the first dated candidate and not before. The
+                // connection keeps sixteen statements and the backend has more
+                // than that, so a fourth one held open here is one that gets
+                // pushed out of the cache and prepared again elsewhere. Most
+                // batches are links off a page and carry no dates at all.
+                let mut refresh_due = None;
 
                 for candidate in batch {
                     // The seen set decides first, so a url that is already
@@ -590,6 +597,18 @@ impl State for SqliteState {
                         .state()?;
                     if fresh == 0 {
                         report.seen += 1;
+                        // Only a candidate carrying a publisher date can move
+                        // anything, and most do not, so the ordinary link that
+                        // we have seen before still costs one statement.
+                        if let Some(lastmod_ms) = candidate.lastmod_ms {
+                            let stmt = match &mut refresh_due {
+                                Some(stmt) => stmt,
+                                none => {
+                                    none.insert(tx.prepare_cached(sql::REFRESH_LEDGER).state()?)
+                                }
+                            };
+                            report.refreshed += bring_forward(stmt, candidate, lastmod_ms)?;
+                        }
                         continue;
                     }
 
@@ -900,7 +919,12 @@ impl State for SqliteState {
                             None => LedgerRow::NO_ETAG,
                         };
                         row.last_mod_ms = revalidate.last_modified_ms.unwrap_or(0);
-                        row.next_due_ms = next_due_after(&before, changed, outcome.finished_ms);
+                        row.next_due_ms = next_due_dated(
+                            &before,
+                            changed,
+                            outcome.finished_ms,
+                            revalidate.last_modified_ms,
+                        );
                     }
                     FetchResult::NotModified { status, revalidate } => {
                         // The content did not move, so `content_hash` and
@@ -919,7 +943,12 @@ impl State for SqliteState {
                         if let Some(last_mod_ms) = revalidate.last_modified_ms {
                             row.last_mod_ms = last_mod_ms;
                         }
-                        row.next_due_ms = next_due_after(&before, false, outcome.finished_ms);
+                        row.next_due_ms = next_due_dated(
+                            &before,
+                            false,
+                            outcome.finished_ms,
+                            revalidate.last_modified_ms,
+                        );
                     }
                     FetchResult::Failed { status, kind: _ } => {
                         row.state = UrlState::Failed;
@@ -1347,6 +1376,41 @@ fn pending_row(candidate: &Candidate<'_>) -> LedgerRow {
         candidate.priority,
         candidate.discovered_ms,
     )
+}
+
+/// Move a known url's next visit forward because the publisher says it changed.
+///
+/// Returns 1 if the row moved and 0 if it did not, which is what the caller adds
+/// to [`AdmitReport::refreshed`]. Every reason to do nothing is in the statement
+/// rather than here, so this is one round trip whatever the answer is.
+fn bring_forward(
+    stmt: &mut rusqlite::CachedStatement<'_>,
+    candidate: &Candidate<'_>,
+    lastmod_ms: u64,
+) -> Result<u32> {
+    // The class boundaries are durations rather than timestamps, but they cross
+    // the same u64 to i64 gap and clamping is the same answer.
+    let edges = [
+        REALTIME_UNDER_MS,
+        HOURLY_UNDER_MS,
+        DAILY_UNDER_MS,
+        WEEKLY_UNDER_MS,
+    ]
+    .map(row::to_ms);
+    let moved = stmt
+        .execute(params![
+            &candidate.key.pld.as_bytes()[..],
+            &candidate.key.host.as_bytes()[..],
+            &candidate.key.url.as_bytes()[..],
+            row::to_ms(candidate.discovered_ms),
+            row::to_ms(lastmod_ms),
+            edges[0],
+            edges[1],
+            edges[2],
+            edges[3],
+        ])
+        .state()?;
+    Ok(u32::try_from(moved).unwrap_or(1))
 }
 
 fn insert_ledger(
