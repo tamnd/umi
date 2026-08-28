@@ -189,6 +189,8 @@ fn config() -> CrawlConfig {
         max_depth: 4,
         scope: Arc::new(Scope::general()),
         budget: Budget::DEFAULT,
+        rate: umi_frontier::Rate::default(),
+        max_domains: 64,
     }
 }
 
@@ -386,6 +388,52 @@ async fn a_batch_covering_one_host_is_spread_out_rather_than_sent_at_once() {
             "two requests to one host {gap} ms apart, {delay} ms asked for: {sent:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn forty_hosts_under_one_domain_are_still_one_domain() {
+    // Doc 09.3's cap, and the reason the loop schedules through the frontier
+    // rather than leasing from the store directly. Every host here is polite on
+    // its own terms, one request in flight and a second between them, and forty
+    // of them at once is still forty of our connections arriving at one
+    // operator. The store cannot see that, because it hands out work per host.
+    // The frontier can, because it counts per pay level domain.
+    let urls: Vec<String> = (0..40)
+        .map(|n| format!("https://h{n}.example.com/a"))
+        .collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let mut fetch = Canned::new();
+    for n in 0..40 {
+        fetch = fetch
+            .robots(
+                &format!("https://h{n}.example.com"),
+                "User-agent: *\nAllow: /\n",
+            )
+            .html(&format!("https://h{n}.example.com/a"), &page("P", &[]));
+    }
+    let clock = Arc::new(FixedClock::at(T0));
+    let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
+
+    // The cap is 20 a second and the burst is a second's worth, so the first
+    // tick spends the lot and the second gets nothing until time moves.
+    let first = crawler.tick(&Collected::default()).await.expect("tick");
+    let cap = umi_frontier::Rate::DEFAULT_PER_SECOND as usize;
+    assert_eq!(first.leased, cap, "{first:?}");
+
+    let second = crawler.tick(&Collected::default()).await.expect("tick");
+    assert!(
+        second.idle(),
+        "the domain was over its cap and got {} more urls anyway",
+        second.leased
+    );
+
+    // A second later it may go again, and the twenty urls left are the twenty
+    // it takes. Without the frontier on the path both of these ticks would have
+    // handed out all forty at once.
+    clock.advance(1000);
+    let third = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(third.leased, urls.len() - cap, "{third:?}");
 }
 
 #[tokio::test]

@@ -919,6 +919,17 @@ fn run(
             layout.state.display()
         ))?;
 
+        // Doc 09.8. The seeds went straight into the store, and the domain rate
+        // limits are in memory, so this is where a fresh crawl and a resumed
+        // one both learn which domains they are working. The loop does it for
+        // itself if nobody asks, and asking here is what puts the count in the
+        // log where an operator resuming a crawl can see it.
+        let domains = crawler
+            .resume()
+            .await
+            .map_err(|e| Error::Crawl(e.to_string()))?;
+        log.line(&format!("scheduling {domains} domains"))?;
+
         let mut stall = Stall::default();
         let mut frontier = Frontier::default();
         let mut backoff = Backoff::default();

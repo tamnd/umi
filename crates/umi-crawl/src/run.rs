@@ -7,11 +7,18 @@
 //!
 //! # Shape
 //!
-//! One [`tick`](Crawler::tick) is a batch: take leases from the state layer,
-//! run them all concurrently, and hand the answers back in one call. The batch
-//! is the unit because doc 08.5's whole design is batched, and because the
+//! One [`tick`](Crawler::tick) is a batch: take leases from the scheduler, run
+//! them all concurrently, and hand the answers back in one call. The batch is
+//! the unit because doc 08.5's whole design is batched, and because the
 //! alternative costs a database round trip per URL, which at 250 pages a second
 //! is 250 of them a second for no benefit.
+//!
+//! The leases come from [`Frontier`] rather than from the store, which is what
+//! makes doc 09.3's cap on a pay level domain real. The store schedules per
+//! host and cannot see the domain: a big site is dozens of hosts, each of them
+//! politely held to one request at a time, and all of them the same operator.
+//! The frontier picks the domains that have room, asks the store for work from
+//! each, and charges the domain for what it got.
 //!
 //! Concurrency inside a tick is a [`FuturesUnordered`] and not a join over
 //! fixed chunks. The difference matters more than it looks: fetch times on the
@@ -36,11 +43,9 @@ use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use umi_extract::extract;
 use umi_fetch::Outcome;
-use umi_state::{
-    Budget, Candidate, Discovery, FetchOutcome, FetchResult, LeaseRequest, Pace, Priority, State,
-    StateError,
-};
-use umi_types::{FetcherId, Revalidator, RowKey, Tier, Verification};
+use umi_frontier::{Ask, Config as FrontierConfig, Frontier, Rate};
+use umi_state::{Budget, Discovery, FetchOutcome, FetchResult, Pace, State, StateError};
+use umi_types::{FetcherId, Revalidator, Tier, Verification};
 
 use crate::clock::Clock;
 use crate::fetch::Fetch;
@@ -112,9 +117,39 @@ pub struct CrawlConfig {
     /// How doc 09.5's refresh classes divide a tick's capacity between new
     /// URLs and the ones already crawled.
     pub budget: Budget,
+    /// Doc 09.3's cap on one pay level domain, which is 20 requests a second.
+    ///
+    /// Separate from `max_per_host` and coarser. A big site is dozens of hosts
+    /// under one domain, and holding each host to its own polite delay still
+    /// adds up to a lot of traffic at one operator, so the cap that matters to
+    /// them is this one.
+    pub rate: Rate,
+    /// How many domains one tick may take work from.
+    ///
+    /// The scheduler asks the store once per domain, so this is also the most
+    /// round trips a tick can cost. See [`umi_frontier::Config::max_domains`].
+    pub max_domains: usize,
 }
 
 impl CrawlConfig {
+    /// The scheduler's half of this, for the frontier the loop runs on.
+    ///
+    /// Two config types over one set of knobs, because the scheduler is a crate
+    /// that knows nothing about fetching and the loop is a crate that has to
+    /// configure it. This is the seam, and it is a function rather than a field
+    /// so there is one place the two can disagree and it is here.
+    #[must_use]
+    pub fn frontier(&self) -> FrontierConfig {
+        FrontierConfig {
+            rate: self.rate,
+            max_domains: self.max_domains,
+            max_per_host: self.max_per_host,
+            lease_for: self.lease_for,
+            max_depth: self.max_depth,
+            budget: self.budget,
+        }
+    }
+
     /// How deep links from a page at `depth` may go.
     ///
     /// The lower of the process ceiling and the scope's, because a profile
@@ -146,6 +181,8 @@ impl Default for CrawlConfig {
             max_depth: umi_frontier::MAX_DEPTH,
             scope: Arc::new(Scope::general()),
             budget: Budget::DEFAULT,
+            rate: Rate::default(),
+            max_domains: FrontierConfig::default().max_domains,
         }
     }
 }
@@ -191,7 +228,7 @@ impl TickReport {
 /// The loop.
 pub struct Crawler<F, C> {
     fetch: F,
-    state: Arc<dyn State>,
+    frontier: Frontier<Arc<dyn State>>,
     clock: C,
     robots: RobotsCache,
     config: CrawlConfig,
@@ -201,9 +238,10 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     /// Build a crawler.
     #[must_use]
     pub fn new(fetch: F, state: Arc<dyn State>, clock: C, config: CrawlConfig) -> Self {
+        let frontier = Frontier::new(state, config.frontier());
         Self {
             fetch,
-            state,
+            frontier,
             clock,
             robots: RobotsCache::new(),
             config,
@@ -214,6 +252,40 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     #[must_use]
     pub const fn fetcher(&self) -> &F {
         &self.fetch
+    }
+
+    /// The store underneath, for the callers that go straight to it.
+    ///
+    /// Segment rows, host records and checkpoints do not concern the scheduler,
+    /// and neither do completions: the domain was charged when the lease was
+    /// issued, so there is nothing for the frontier to do when the answer comes
+    /// back.
+    #[must_use]
+    pub const fn state(&self) -> &Arc<dyn State> {
+        self.frontier.state()
+    }
+
+    /// The scheduler, so a caller can look at what is being scheduled.
+    #[must_use]
+    pub const fn frontier(&self) -> &Frontier<Arc<dyn State>> {
+        &self.frontier
+    }
+
+    /// Rebuild the domain schedule from what the store holds, per doc 09.8.
+    ///
+    /// Call it once after the seeds are in and before the first
+    /// [`tick`](Self::tick). The schedule is in memory and the urls are not, so
+    /// a coordinator that comes back up has every url and no idea which domains
+    /// they belong to until this runs, and a tick before it leases nothing.
+    ///
+    /// Returns how many domains are being scheduled afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`CrawlError::State`] if the store could not be read. The schedule is
+    /// left untouched.
+    pub async fn resume(&self) -> Result<usize, CrawlError> {
+        Ok(self.frontier.resume().await?)
     }
 
     /// The robots cache, so a caller can prime it on startup or measure it.
@@ -253,18 +325,33 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     /// than released, because an error here means we do not know what happened
     /// and the safe reading of that is that the work was not done.
     pub async fn tick(&self, sink: &dyn Sink) -> Result<TickReport, CrawlError> {
+        // The schedule lives in memory and the urls do not, so a crawler whose
+        // gate is empty has no domains to take work from and leases nothing
+        // however full the store is. Seeds go in through `umi seed` and through
+        // the store directly, which is the case this covers.
+        //
+        // Here rather than in `resume`, so that a caller who forgets to call it
+        // gets a working crawl instead of a silent stall. It costs a `resident`
+        // on a tick that found no domains, which is a store that is empty or a
+        // crawl that is over, and nothing at all once anything is scheduled.
+        if self.frontier.domains() == 0 {
+            self.frontier.resume().await?;
+        }
+
         let now_ms = self.clock.now_ms();
+        // Through the scheduler and not straight to the store. The store hands
+        // out work per host; doc 09.3's cap is per pay level domain, and the
+        // two are not the same thing. A site on fifty hosts under one domain is
+        // fifty polite hosts and one operator wondering why fifty of our
+        // connections turned up at once, and the frontier is where that is
+        // counted.
         let leases = self
-            .state
-            .lease(&LeaseRequest {
+            .frontier
+            .tick(&Ask {
                 fetcher: self.config.fetcher,
                 now_ms,
                 max_urls: self.config.batch,
-                max_per_host: self.config.max_per_host,
                 max_tier: self.config.max_tier,
-                lease_for: self.config.lease_for,
-                plds: &[],
-                budget: self.config.budget,
             })
             .await?;
 
@@ -335,7 +422,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         if !rows.is_empty() {
             sink.take(&rows).await?;
         }
-        self.state.complete(&outcomes).await?;
+        self.state().complete(&outcomes).await?;
 
         report.links_admitted = self.admit(&candidates, now_ms).await?;
         Ok(report)
@@ -513,29 +600,34 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
 
     /// Put the links found this tick into the frontier.
     ///
-    /// Doc 08.5's batch, in chunks, because a page with ten thousand links is
-    /// a real page and a state backend is allowed to refuse a batch that size.
+    /// Grouped by depth, because [`Frontier::admit_at`] takes one depth for a
+    /// batch and doc 13.2's one hop policy admits an out of scope link at the
+    /// ceiling rather than at the parent's depth plus one. A general crawl has
+    /// one group and a one hop crawl has two, so the grouping is a partition of
+    /// a vector rather than anything that shows up in a profile.
+    ///
+    /// Through the frontier rather than straight to the store, so that a domain
+    /// we have just discovered starts being scheduled now instead of at the
+    /// next restart, and so that a link gets doc 09.7's depth score rather than
+    /// the default priority every other link also has.
     async fn admit(&self, links: &[(String, u8)], now_ms: u64) -> Result<usize, CrawlError> {
-        let mut admitted = 0;
-        for chunk in links.chunks(umi_state::BATCH) {
-            let batch: Vec<Candidate<'_>> = chunk
-                .iter()
-                .filter_map(|(url, depth)| {
-                    let key = RowKey::for_url(url, None).ok()?;
-                    Some(Candidate {
-                        key,
-                        url,
-                        depth: *depth,
-                        priority: Priority::default(),
-                        discovered_ms: now_ms,
-                        discovery: Discovery::Trusted,
-                    })
-                })
-                .collect();
-            if batch.is_empty() {
-                continue;
+        let mut by_depth: Vec<(u8, Vec<&str>)> = Vec::new();
+        for (url, depth) in links {
+            match by_depth.iter_mut().find(|(d, _)| d == depth) {
+                Some((_, group)) => group.push(url),
+                None => by_depth.push((*depth, vec![url])),
             }
-            admitted += self.state.admit(&batch).await?.admitted as usize;
+        }
+
+        let mut admitted = 0;
+        for (depth, group) in by_depth {
+            for chunk in group.chunks(umi_state::BATCH) {
+                let report = self
+                    .frontier
+                    .admit_at(chunk, depth, now_ms, Discovery::Trusted)
+                    .await?;
+                admitted += report.admitted.admitted as usize;
+            }
         }
         Ok(admitted)
     }
