@@ -420,7 +420,14 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 if learned.signal == TierSignal::Blocked && row.is_none() {
                     report.challenged += 1;
                 }
-                learn(&mut signals, learned);
+                // The `teaches` check belongs here and not in `relearn`, even
+                // though `relearn` would reach the same answer. `learn` is a
+                // scan of what the tick has collected so far, so folding in a
+                // page that cannot teach anything costs a pass over the batch
+                // per page, and a healthy crawl is nothing but those pages.
+                if learned.teaches() {
+                    learn(&mut signals, learned);
+                }
             }
             if let Some(row) = row {
                 match row.outcome {
@@ -463,13 +470,14 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     /// this is where the learning is written down. It is also the one part of
     /// a tick that touches the host table for a reason other than pacing, and
     /// the cost of it has to stay near zero on a crawl where nothing is going
-    /// wrong. Two things keep it there: [`Learned::teaches`] drops the hosts
-    /// whose answer cannot have changed anything before any I/O happens, and
+    /// wrong. Two things keep it there: [`Learned::teaches`] drops the answers
+    /// that cannot have changed anything as the tick collects them, so on a
+    /// healthy crawl `signals` is empty and this is a function call, and
     /// [`TierPolicy::observe`] reports whether it actually moved, so a host
     /// that is read and found unchanged is not written back.
     async fn relearn(&self, signals: &[Learned], now_ms: u64) -> Result<usize, CrawlError> {
         let mut moved = 0;
-        for learned in signals.iter().filter(|l| l.teaches()) {
+        for learned in signals {
             let Some(mut host) = self.state().host(learned.host).await? else {
                 continue;
             };
