@@ -12,11 +12,13 @@
 //! assumes a plain client answers about 90 percent of everything that is not a
 //! revalidate, and the crawl should keep being mostly that.
 //!
-//! [`Emulated`] is T2 from section 5.5, which is a browser's TLS and HTTP/2
+//! `Emulated` is T2 from section 5.5, which is a browser's TLS and HTTP/2
 //! fingerprint for the hosts whose bot management refuses a plain client even
 //! though robots.txt allows us. It is behind the non default `emulation`
 //! feature, because it links BoringSSL and BoringSSL cannot share a process
-//! with `openssl-sys`.
+//! with `openssl-sys`, so it is named here rather than linked: the type is not
+//! in this build unless the feature is on, and a link that resolves only half
+//! the time is a broken build on the other half.
 //!
 //! [`Ladder`] is what a crawl actually holds: every tier that got compiled in,
 //! picked between by the tier the scheduler leased the URL at.
