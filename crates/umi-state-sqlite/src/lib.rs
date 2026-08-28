@@ -1218,18 +1218,47 @@ impl State for SqliteState {
     }
 
     async fn evict(&self, plds: &[PldId]) -> Result<EvictReport> {
-        // Nothing is resident in the sense doc 08.6 means, so nothing can be
-        // evicted. Reporting them as `not_resident` rather than `evicted` is
-        // the honest answer: a scheduler under disk pressure needs to know that
-        // asking this backend to free memory did not free any.
-        Ok(EvictReport {
-            not_resident: u32::try_from(plds.len()).unwrap_or(u32::MAX),
-            ..EvictReport::default()
+        // There is no cold tier here, so the local copy is the only copy and
+        // dropping it would be losing the crawl rather than freeing a cache.
+        // A domain the ledger holds is kept, which is what `in_use` means, and
+        // one it has never seen is `not_resident`. Neither is `evicted`, and a
+        // scheduler under disk pressure needs to see that so it knows asking
+        // this backend to free space did not free any.
+        blocking(|| {
+            let guard = self.lock();
+            let mut stmt = guard.conn.prepare_cached(sql::LEDGER_HAS_PLD).state()?;
+            let mut report = EvictReport::default();
+            for pld in plds {
+                if stmt.exists(params![&pld.as_bytes()[..]]).state()? {
+                    report.in_use += 1;
+                } else {
+                    report.not_resident += 1;
+                }
+            }
+            Ok(report)
         })
     }
 
     async fn resident(&self) -> Result<Vec<PldId>> {
-        Ok(Vec::new())
+        // Every domain in the ledger, because on a backend with no cold tier
+        // every domain it knows about is local by definition. It used to answer
+        // nothing on the grounds that a store which does not shard has no
+        // residency to report, and that reading made the scheduler in
+        // umi-frontier unusable across a restart: the domain rate limits are
+        // rebuilt from this, so a store that reports nothing comes back up with
+        // nothing scheduled and a resumed crawl sits there leasing zero urls.
+        //
+        // In key order already, since that is the order the scan walks, so
+        // nothing here sorts.
+        blocking(|| {
+            let guard = self.lock();
+            let mut stmt = guard.conn.prepare_cached(sql::SELECT_RESIDENT).state()?;
+            let found = stmt
+                .query_map([], |row| row::pld(row, "pld"))
+                .state()?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            found.state()
+        })
     }
 
     async fn checkpoint(&self, now_ms: u64) -> Result<Checkpoint> {

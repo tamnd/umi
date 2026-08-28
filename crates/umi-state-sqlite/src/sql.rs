@@ -321,6 +321,38 @@ INSERT INTO etags (etag) VALUES (?1)
 ON CONFLICT(etag) DO UPDATE SET etag = excluded.etag
 RETURNING id";
 
+/// Every pay level domain the ledger holds a url for, in key order.
+///
+/// The obvious spelling is `SELECT DISTINCT pld FROM ledger`, and the obvious
+/// spelling reads the whole table. `ledger` is `WITHOUT ROWID` on
+/// `(pld, host, url_key)`, so `MIN(pld) WHERE pld > ?` is a seek to the front
+/// of the next domain, and repeating it walks the domains while skipping the
+/// urls. That is one b-tree descent per domain rather than one page read per
+/// url, which is the difference between a cost that grows as a crawl deepens
+/// and one that grows only as it widens.
+///
+/// Measured on server3 against two million rows in page cache. Over a hundred
+/// thousand domains, where a domain is twenty urls and there is nothing much
+/// to skip, the two are the same: 270 ms against 280 ms. Over a thousand
+/// domains of two thousand urls each, which is the shape a coordinator that
+/// owns whole sites actually has, `DISTINCT` is 290 ms and this is 10 ms.
+///
+/// The `IS NOT NULL` guards are the termination condition. The subquery
+/// returns null once there is no domain past the last one, and the recursive
+/// term stops on it rather than looping forever, so the outer filter is only
+/// dropping that final null row.
+pub const SELECT_RESIDENT: &str = "
+WITH RECURSIVE domains(pld) AS (
+    SELECT MIN(pld) FROM ledger
+    UNION ALL
+    SELECT (SELECT MIN(pld) FROM ledger WHERE pld > domains.pld)
+      FROM domains WHERE domains.pld IS NOT NULL
+)
+SELECT pld FROM domains WHERE pld IS NOT NULL";
+
+/// Whether the ledger holds anything at all for one domain.
+pub const LEDGER_HAS_PLD: &str = "SELECT 1 FROM ledger WHERE pld = ?1 LIMIT 1";
+
 /// The maintained counters, for [`stats`](crate::SqliteState::stats).
 ///
 /// One row of one page, which is what makes the crawl loop's idle tick and doc

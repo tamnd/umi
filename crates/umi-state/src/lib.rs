@@ -372,9 +372,11 @@ pub trait State: Send + Sync + 'static {
 
     /// Which domains are local right now.
     ///
-    /// Sorted, so two calls with nothing in between compare equal. Empty on a
-    /// backend that does not shard, which is not the same as "no domains
-    /// known" and is why nothing schedules off this alone.
+    /// Sorted, so two calls with nothing in between compare equal. A backend
+    /// with no cold tier answers with every domain it holds a URL for, because
+    /// on such a backend local is the only place anything is. Empty means the
+    /// store is empty and nothing else, which is what lets doc 09.8's restart
+    /// rebuild the domain schedule from this and trust the answer.
     ///
     /// # Errors
     ///
