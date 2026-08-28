@@ -147,6 +147,8 @@ The difference is the stop rule. `umi resume` stops when the frontier is empty, 
 
 Two things make it survivable over days rather than minutes. It backs off between empty ticks, from one second to a minute, and drops back to a second the moment a tick leases anything, because a command that is meant to be idle most of the time should not wake up once a second for a fortnight to prove it. And it stops on the first interrupt rather than dying on it: ctrl-c lets the fetches in flight finish, seals the open segment, converts it like any other, and exits 0, because the operator asked it to stop and it stopped. A second interrupt is the escape hatch for a slow origin holding the last fetch, and that one is the shell's 130.
 
+SIGTERM is the same stop as ctrl-c. A command built to run for a fortnight spends almost all of its life under something that starts it and stops it, and systemd, docker, kubernetes and a plain `kill` all stop it that way rather than by sending an interrupt. Taking the default handler there would lose the open segment on every ordinary restart, which is the one thing the graceful stop exists to prevent.
+
 While it is quiet it says so every five minutes, with what the frontier holds and how long it has been up. A watch with a healthy schedule and a watch that has hung look exactly alike otherwise, and the log is the difference.
 
 ## 14.4 `umi fetch`
