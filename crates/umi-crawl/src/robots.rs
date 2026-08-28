@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, OnceCell};
 use umi_robots::{Decision, Provenance, Robots};
-use umi_types::HostId;
+use umi_types::{HostId, Tier};
 
 use crate::fetch::Fetch;
 
@@ -84,15 +84,23 @@ impl RobotsCache {
     /// The decision and the entry it came from, because the caller wants the
     /// crawl delay and the `Content-Usage` value off the same entry and going
     /// back for them would be a second lock.
+    ///
+    /// `tier` is the tier the lease that triggered this asked for, and it has
+    /// to be honoured rather than pinned to T1. A host whose bot management
+    /// refuses a plain client refuses it on robots.txt too, and fetching that
+    /// file at T1 on a host doc 05.8 has already moved to T2 would come back
+    /// unreachable, disallow the whole host, and make T2 unreachable for the
+    /// hosts it exists for.
     pub async fn decide<F: Fetch + ?Sized>(
         &self,
         fetch: &F,
         host: HostId,
         origin: &str,
         url: &str,
+        tier: Tier,
         now_ms: u64,
     ) -> (Decision, Entry) {
-        let entry = self.entry(fetch, host, origin, now_ms).await;
+        let entry = self.entry(fetch, host, origin, tier, now_ms).await;
         (entry.robots.allows_url(url), entry)
     }
 
@@ -102,6 +110,7 @@ impl RobotsCache {
         fetch: &F,
         host: HostId,
         origin: &str,
+        tier: Tier,
         now_ms: u64,
     ) -> Entry {
         // Two locks on purpose. The map lock is held only long enough to find
@@ -124,7 +133,7 @@ impl RobotsCache {
         };
 
         cell.get_or_init(|| async {
-            let robots = fetch_robots(fetch, origin).await;
+            let robots = fetch_robots(fetch, origin, tier).await;
             Entry {
                 robots: Arc::new(robots),
                 fetched_ms: now_ms,
@@ -161,9 +170,12 @@ impl RobotsCache {
 /// failed. RFC 9309 section 2.3.1 says what each case means and umi-robots
 /// already encodes it, so the job here is only to get the status and the body
 /// into [`Robots::for_status`] without inventing a fourth answer.
-async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str) -> Robots {
+async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) -> Robots {
     let url = format!("{origin}/robots.txt");
-    match fetch.fetch(&url, None).await {
+    // Never conditional. A stale robots.txt that a 304 confirmed is still a
+    // file we are about to re-read from a cache we already dropped, so the
+    // saving is nothing and the code path is one more thing to get wrong.
+    match fetch.fetch(&url, None, tier).await {
         Ok(umi_fetch::Outcome::Ok(page)) => Robots::for_status(page.status, page.body.as_ref()),
         // A 304 cannot happen because nothing above sends a conditional
         // request for robots.txt, and a redirect off the origin is not this

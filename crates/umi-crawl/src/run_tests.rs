@@ -80,6 +80,7 @@ impl Fetch for Canned {
         &self,
         url: &str,
         _revalidate: Option<&Revalidator>,
+        _tier: umi_types::Tier,
     ) -> Result<Outcome, FetchError> {
         self.asked
             .lock()
@@ -127,12 +128,13 @@ impl Fetch for Timed {
         &self,
         url: &str,
         revalidate: Option<&Revalidator>,
+        tier: umi_types::Tier,
     ) -> Result<Outcome, FetchError> {
         self.sent
             .lock()
             .expect("not poisoned")
             .push((url.to_owned(), self.clock.now_ms()));
-        self.inner.fetch(url, revalidate).await
+        self.inner.fetch(url, revalidate, tier).await
     }
 }
 
@@ -170,11 +172,12 @@ impl Fetch for Flip {
         &self,
         url: &str,
         revalidate: Option<&Revalidator>,
+        tier: umi_types::Tier,
     ) -> Result<Outcome, FetchError> {
         if url == self.url && self.blocking.load(std::sync::atomic::Ordering::Relaxed) {
             return Ok(blocked());
         }
-        self.inner.fetch(url, revalidate).await
+        self.inner.fetch(url, revalidate, tier).await
     }
 }
 
@@ -228,9 +231,10 @@ impl Fetch for Cache {
         &self,
         url: &str,
         revalidate: Option<&Revalidator>,
+        tier: umi_types::Tier,
     ) -> Result<Outcome, FetchError> {
         if url != self.url {
-            return self.inner.fetch(url, revalidate).await;
+            return self.inner.fetch(url, revalidate, tier).await;
         }
         let sent = revalidate.is_some_and(|r| !r.is_empty());
         let first = {

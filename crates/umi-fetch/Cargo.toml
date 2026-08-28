@@ -23,3 +23,11 @@ reqwest = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
+wreq = { workspace = true, optional = true }
+wreq-util = { workspace = true, optional = true }
+
+[features]
+# Doc 05.5's T2. Off by default, and it has to stay off by default: wreq links
+# BoringSSL, which shares symbol prefixes with openssl-sys, and a tree holding
+# both either fails to link or links and segfaults.
+emulation = ["dep:wreq", "dep:wreq-util"]

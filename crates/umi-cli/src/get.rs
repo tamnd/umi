@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use umi_extract::Extracted;
-use umi_fetch::{FetchConfig, Fetcher, Outcome};
+use umi_fetch::{FetchConfig, Ladder, Outcome, Tier};
 use url::Url;
 
 use crate::Error;
@@ -44,26 +44,34 @@ pub struct Show {
 pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
     let parsed = Url::parse(url).map_err(|_| Error::BadUrl(url.to_owned()))?;
 
-    if let Some(tier) = tier
-        && tier > 1
+    // Honest rather than silently doing something else. T2 is behind a cargo
+    // feature and T3 and T4 are not written, so pretending a `--tier 3`
+    // request was served would make this command useless for the exact
+    // question it exists to answer.
+    let highest = Ladder::highest();
+    if let Some(byte) = tier
+        && byte > highest.as_u8()
     {
-        // Honest rather than silently doing something else. Doc 05's T2 and T3
-        // are milestone 2 and milestone 3, and pretending a `--tier 3` request
-        // was served would make this command useless for the exact question it
-        // exists to answer.
-        eprintln!("tier {tier} is not built yet, doing tier 1: see docs/spec/16-roadmap.md");
+        eprintln!(
+            "tier {byte} is not built here, doing tier {}: see docs/spec/16-roadmap.md",
+            highest.as_u8()
+        );
     }
+    let asked = tier
+        .and_then(Tier::from_u8)
+        .unwrap_or(Tier::Plain)
+        .min(highest);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(Error::Io)?;
-    let fetcher = Fetcher::with_config(FetchConfig::default())?;
-    let outcome = runtime.block_on(fetcher.fetch(parsed.as_str(), None))?;
+    let fetcher = Ladder::with_config(FetchConfig::default())?;
+    let outcome = runtime.block_on(fetcher.fetch(parsed.as_str(), None, asked))?;
 
     match outcome {
         Outcome::Ok(page) => {
-            report(&page, &parsed);
+            report(&page, &parsed, asked);
             if show.headers {
                 section("headers");
                 for (name, value) in &page.headers_kept {
@@ -125,8 +133,13 @@ fn header<'a>(page: &'a umi_fetch::Page, wanted: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-fn report(page: &umi_fetch::Page, requested: &Url) {
-    println!("tier 1  http  {}  {}", page.status, millis(page.elapsed));
+fn report(page: &umi_fetch::Page, requested: &Url, tier: Tier) {
+    println!(
+        "tier {}  http  {}  {}",
+        tier.as_u8(),
+        page.status,
+        millis(page.elapsed)
+    );
     if page.final_url != requested.as_str() {
         println!("final   {}", page.final_url);
     }

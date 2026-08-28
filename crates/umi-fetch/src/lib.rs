@@ -1,27 +1,34 @@
-//! Tier 1, the plain HTTP client.
+//! The fetch tiers, and the one pipeline they share.
 //!
-//! Specified in `docs/spec/05-fetch-tiers.md` section 5.4. Hyper over rustls,
-//! HTTP/2 preferred with an HTTP/1.1 fallback, an honest and fixed identity, a
-//! connection cap per host, a timeout at every stage and a hard cap on the
-//! body. It does not try to look like a browser and it should not: sending
-//! Chrome's header set from a rustls stack produces a mismatch between the TLS
-//! fingerprint and the HTTP layer that is more suspicious than being honestly
-//! a bot, and it is exactly what JA4 plus JA4H correlation is built to catch.
+//! Specified in `docs/spec/05-fetch-tiers.md`. [`Fetcher`] is T1 from section
+//! 5.4: hyper over rustls, HTTP/2 preferred with an HTTP/1.1 fallback, an
+//! honest and fixed identity, a connection cap per host, a timeout at every
+//! stage and a hard cap on the body. It does not try to look like a browser
+//! and it should not, because sending Chrome's header set from a rustls stack
+//! produces a mismatch between the TLS fingerprint and the HTTP layer that is
+//! more suspicious than being honestly a bot.
 //!
-//! This is deliberately the boring rung and deliberately the first one. Doc
-//! 05.2 assumes a plain client answers about 90 percent of everything that is
-//! not a revalidate, and building the ladder before measuring whether the
-//! bottom rung is enough would be optimising against a guess.
+//! T1 is deliberately the boring rung and deliberately the first one. Doc 05.2
+//! assumes a plain client answers about 90 percent of everything that is not a
+//! revalidate, and the crawl should keep being mostly that.
+//!
+//! `Emulated` is T2 from section 5.5, which is a browser's TLS and HTTP/2
+//! fingerprint for the hosts whose bot management refuses a plain client even
+//! though robots.txt allows us. It is behind the non default `emulation`
+//! feature, because it links BoringSSL and BoringSSL cannot share a process
+//! with `openssl-sys`, so it is named here rather than linked: the type is not
+//! in this build unless the feature is on, and a link that resolves only half
+//! the time is a broken build on the other half.
+//!
+//! [`Ladder`] is what a crawl actually holds: every tier that got compiled in,
+//! picked between by the tier the scheduler leased the URL at.
 //!
 //! # What is not here
 //!
-//! T0 revalidation as a policy is milestone 2, though the mechanism is here:
-//! give [`Fetcher::fetch`] a [`Revalidator`] and it sends the conditional
-//! headers and reports a 304 as [`Outcome::NotModified`]. T2, T3 and T4 are
-//! milestone 2 as well. So is Web Bot Auth request signing from doc 07.2 and
-//! the escalation state machine from doc 05.8, and this crate deliberately
-//! makes no scheduling decision at all: it reports what happened and doc 09
-//! decides what that means.
+//! T3 and T4, Web Bot Auth request signing from doc 07.2, and the escalation
+//! state machine from doc 05.8. This crate deliberately makes no scheduling
+//! decision at all: it reports what happened and doc 09 decides what that
+//! means.
 //!
 //! robots.txt is not consulted here either, and that is doc 04.7's rule rather
 //! than an omission. The robots decision belongs to the coordinator, a
@@ -30,43 +37,51 @@
 //!
 //! # No clock
 //!
-//! Nothing here reads a wall clock. Elapsed time comes from [`Instant`], which
+//! Nothing here reads a wall clock. Elapsed time comes from `Instant`, which
 //! is monotonic, and anything that needs to be stamped with a date is stamped
 //! by the caller. That is gate 1.2's rule and it is what lets a fetch be
 //! replayed.
 //!
-//! # rustls only
+//! # rustls only, unless somebody asks
 //!
-//! There is no `openssl-sys` anywhere in the tree, and the test named
-//! `the_tree_is_rustls_only` asserts that against the lockfile. It matters now
-//! because a static binary that dynamically links OpenSSL is not a static
-//! binary, and it will matter more in milestone 2 when `wreq` arrives with
-//! BoringSSL and the two would otherwise be in the same process.
+//! The default build has no `openssl-sys` and no BoringSSL anywhere in its
+//! tree. `the_tree_is_rustls_only` asserts the first half against the
+//! lockfile, and `scripts/check-tls.sh` asserts the whole of it against
+//! `cargo tree` on a default build, which is gate 2.2. The lockfile alone
+//! stopped being enough the moment `wreq` became an optional dependency,
+//! because an optional dependency is still locked.
+//!
+//! It matters because a static binary that dynamically links OpenSSL is not a
+//! static binary, and because BoringSSL and OpenSSL share symbol prefixes: a
+//! tree holding both either fails to link or links and segfaults.
 //!
 //! Roots come from the platform store through rustls-platform-verifier, which
 //! is reqwest's own default. A volunteer running a fetcher behind a corporate
 //! root should not have to configure anything, and pinning a root set here
 //! would mean shipping a way to unpin it.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-
-use bytes::{Bytes, BytesMut};
-use futures_util::StreamExt;
-use http::HeaderMap;
-use tokio::sync::Semaphore;
-use url::Url;
+use std::sync::Arc;
+use std::time::Duration;
 
 pub mod challenge;
 pub mod date;
+mod engine;
 pub mod headers;
 pub mod outcome;
+mod plain;
 pub mod sniff;
+
+#[cfg(feature = "emulation")]
+mod emulated;
+
+use engine::Engine;
 
 pub use outcome::{Failure, Hop, Outcome, OutcomeCode, Page, RetryAfter, Stage, Version};
 pub use sniff::Media;
-pub use umi_types::Revalidator;
+pub use umi_types::{Revalidator, Tier};
+
+#[cfg(feature = "emulation")]
+pub use emulated::{ECHO_URL, EXPECTED_JA4, PLATFORM, PROFILE};
 
 /// The user agent from `docs/spec/07-politeness-and-identity.md` section 7.1.
 ///
@@ -142,6 +157,12 @@ pub enum FetchError {
     /// platform has no usable certificate store.
     #[error("could not build the http client: {0}")]
     Client(String),
+    /// Doc 05.5's T2 self check could not be run at all, which is different
+    /// from running and finding a mismatch. A mismatch is a value the caller
+    /// compares; this is the echo endpoint being down or answering something
+    /// that is not the JSON it documents.
+    #[error("could not read the tls fingerprint: {0}")]
+    SelfCheck(String),
 }
 
 type Result<T> = std::result::Result<T, FetchError>;
@@ -155,14 +176,7 @@ type Result<T> = std::result::Result<T, FetchError>;
 /// connections to one site.
 #[derive(Clone, Debug)]
 pub struct Fetcher {
-    inner: Arc<Inner>,
-}
-
-#[derive(Debug)]
-struct Inner {
-    client: reqwest::Client,
-    config: FetchConfig,
-    hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
+    inner: Arc<Engine<plain::Plain>>,
 }
 
 impl Fetcher {
@@ -181,31 +195,16 @@ impl Fetcher {
     ///
     /// [`FetchError::Client`] when the TLS backend will not initialise.
     pub fn with_config(config: FetchConfig) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .connect_timeout(config.connect_timeout)
-            // Redirects are followed by hand, in `fetch`, because doc 04.7
-            // stops at the first one that leaves the registrable domain and a
-            // policy closure cannot report which URL it stopped at.
-            .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(config.per_host)
-            .https_only(false)
-            .build()
-            .map_err(|e| FetchError::Client(e.to_string()))?;
-
+        let transport = plain::Plain::build(&config)?;
         Ok(Self {
-            inner: Arc::new(Inner {
-                client,
-                config,
-                hosts: Mutex::new(HashMap::new()),
-            }),
+            inner: Arc::new(Engine::new(transport, config)),
         })
     }
 
     /// The configuration this client was built with.
     #[must_use]
     pub fn config(&self) -> &FetchConfig {
-        &self.inner.config
+        self.inner.config()
     }
 
     /// Fetch one URL.
@@ -220,391 +219,190 @@ impl Fetcher {
     /// [`FetchError::Url`] when the URL does not parse or is not http(s).
     /// Nothing else.
     pub async fn fetch(&self, url: &str, revalidate: Option<&Revalidator>) -> Result<Outcome> {
-        let parsed = Url::parse(url).map_err(|e| FetchError::Url(format!("{url}: {e}")))?;
-        if !matches!(parsed.scheme(), "http" | "https") {
-            return Err(FetchError::Url(format!(
-                "{url}: scheme is not http or https"
+        self.inner.fetch(url, revalidate).await
+    }
+}
+
+/// T2, the browser shaped client from doc 05.5.
+///
+/// Same pipeline as [`Fetcher`] and the same rules applied to what comes back.
+/// The difference is the socket: a BoringSSL handshake and an HTTP/2 SETTINGS
+/// frame that match a real Chrome build, which is what gets past bot
+/// management that refuses a plain client.
+///
+/// The user agent is still ours. Doc 07.1 is why, and the module this type
+/// lives in spells out why that is the only thing about the profile that is
+/// changed.
+///
+/// Cheap to clone, for the same reason [`Fetcher`] is.
+#[cfg(feature = "emulation")]
+#[derive(Clone, Debug)]
+pub struct Emulated {
+    inner: Arc<Engine<emulated::Browser>>,
+}
+
+#[cfg(feature = "emulation")]
+impl Emulated {
+    /// A T2 client with doc 05.4's defaults.
+    ///
+    /// The timeouts and the body cap are T1's on purpose. A browser
+    /// fingerprint is not a reason to be more patient with an origin.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Client`] when BoringSSL will not initialise.
+    pub fn new() -> Result<Self> {
+        Self::with_config(FetchConfig::default())
+    }
+
+    /// A T2 client with the knobs turned.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Client`] when BoringSSL will not initialise.
+    pub fn with_config(config: FetchConfig) -> Result<Self> {
+        let transport = emulated::Browser::build(&config)?;
+        Ok(Self {
+            inner: Arc::new(Engine::new(transport, config)),
+        })
+    }
+
+    /// The configuration this client was built with.
+    #[must_use]
+    pub fn config(&self) -> &FetchConfig {
+        self.inner.config()
+    }
+
+    /// Fetch one URL at T2.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Url`] when the URL does not parse or is not http(s).
+    /// Nothing else.
+    pub async fn fetch(&self, url: &str, revalidate: Option<&Revalidator>) -> Result<Outcome> {
+        self.inner.fetch(url, revalidate).await
+    }
+
+    /// The JA4 an echo endpoint says we just presented.
+    ///
+    /// Doc 05.5 asks for this as a startup check rather than an assumption,
+    /// and the reason is worth restating: a dependency bump that changed the
+    /// cipher list or dropped an extension would leave T2 with a fingerprint
+    /// that is neither Chrome's nor rustls's, which is a worse thing to be
+    /// than either. Nothing about the failure would be visible, because the
+    /// requests would keep succeeding on the hosts that were never the problem.
+    ///
+    /// Compare what comes back against [`EXPECTED_JA4`]. This
+    /// returns the observed value rather than a boolean so that a mismatch can
+    /// be logged with both halves in it, which is the only form of the message
+    /// anyone can act on.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::SelfCheck`] when the endpoint does not answer or does not
+    /// answer with the JSON it documents, and [`FetchError::Url`] when `echo`
+    /// is not a URL.
+    pub async fn observed_ja4(&self, echo: &str) -> Result<String> {
+        let outcome = self.fetch(echo, None).await?;
+        let Outcome::Ok(page) = outcome else {
+            return Err(FetchError::SelfCheck(format!(
+                "{echo} answered {outcome:?}"
             )));
-        }
-        let host = parsed
-            .host_str()
-            .ok_or_else(|| FetchError::Url(format!("{url}: no host")))?
-            .to_owned();
-
-        let permits = self.permits(&host);
-        // The semaphore is never closed, so the only way to fail here is a
-        // poisoned lock, which would already have panicked.
-        let _permit = permits.acquire().await.expect("the semaphore is open");
-
-        let started = Instant::now();
-        let deadline = self.inner.config.total_timeout;
-        match tokio::time::timeout(deadline, self.walk(parsed, revalidate, started)).await {
-            Ok(outcome) => Ok(outcome),
-            Err(_) => Ok(Outcome::Failed {
-                status: None,
-                failure: Failure::Timeout(Stage::Total),
-                retry_after: None,
-            }),
-        }
-    }
-
-    /// One request, then any same domain redirects, then the body.
-    async fn walk(
-        &self,
-        mut url: Url,
-        revalidate: Option<&Revalidator>,
-        started: Instant,
-    ) -> Outcome {
-        let origin_domain = registrable_domain(&url);
-        let mut redirects = Vec::new();
-
-        loop {
-            let response = match self.send(&url, revalidate).await {
-                Ok(response) => response,
-                Err(failure) => {
-                    return Outcome::Failed {
-                        status: None,
-                        failure,
-                        retry_after: None,
-                    };
-                }
-            };
-
-            let status = response.status().as_u16();
-            let version = Version::from(response.version());
-            let head = response.headers().clone();
-            // Read once, at the top, so that every way out of this loop that
-            // has a response behind it carries what the origin asked for. A
-            // `Retry-After` on a 429 is the whole message and the 429 has no
-            // body to put it in.
-            let retry_after = headers::retry_after(&head);
-
-            // 304 is a 3xx and is not a redirect, so it has to be answered
-            // before the `Location` handling below ever looks at it.
-            if status == 304 {
-                return Outcome::NotModified {
-                    revalidate: revalidator(&head),
-                    headers_kept: headers::kept(&head),
-                    headers_digest: headers::digest(&head),
-                    elapsed: started.elapsed(),
-                };
-            }
-
-            if let Some(target) = redirect_target(&url, &head, status) {
-                if redirects.len() >= self.inner.config.max_redirects {
-                    return Outcome::Failed {
-                        status: Some(status),
-                        failure: Failure::Malformed,
-                        retry_after,
-                    };
-                }
-                if registrable_domain(&target) != origin_domain {
-                    return Outcome::RedirectedOffDomain {
-                        redirects,
-                        target: target.to_string(),
-                        status,
-                    };
-                }
-                redirects.push(Hop {
-                    from: url.to_string(),
-                    to: target.to_string(),
-                    status,
-                });
-                url = target;
-                continue;
-            }
-
-            let verdict = classify(status, &head);
-            match verdict {
-                Verdict::Page | Verdict::Suspect(_) => {}
-                Verdict::Gone => return Outcome::Gone,
-                Verdict::Failed(failure) => {
-                    return Outcome::Failed {
-                        status: Some(status),
-                        failure,
-                        retry_after,
-                    };
-                }
-            }
-
-            // Believing `Content-Length` is how a crawler gets talked into
-            // buffering a gigabyte, so it is only ever used to decline early.
-            // The real cap is enforced against the bytes that arrive.
-            if declared_length(&head).is_some_and(|len| len > self.inner.config.body_cap as u64) {
-                return Outcome::Failed {
-                    status: Some(status),
-                    failure: Failure::TooLarge,
-                    retry_after,
-                };
-            }
-
-            let content_type = header(&head, "content-type");
-            let body = match self.read_body(response).await {
-                Ok(body) => body,
-                Err(failure) => {
-                    return Outcome::Failed {
-                        status: Some(status),
-                        failure,
-                        retry_after,
-                    };
-                }
-            };
-
-            // The suspect statuses come back here with their body in hand.
-            // An interstitial makes it a block, which doc 05.8 answers with a
-            // tier, and anything else is the plain failure the status already
-            // said it was.
-            if let Verdict::Suspect(fallback) = verdict {
-                let failure = if challenge::interstitial(&body).is_some() {
-                    Failure::Blocked
-                } else {
-                    fallback
-                };
-                return Outcome::Failed {
-                    status: Some(status),
-                    failure,
-                    retry_after,
-                };
-            }
-
-            let head_bytes = &body[..body.len().min(sniff::SNIFF_BYTES)];
-            return Outcome::Ok(Box::new(Page {
-                final_url: url.to_string(),
-                status,
-                version,
-                redirects,
-                headers_kept: headers::kept(&head),
-                headers_digest: headers::digest(&head),
-                media: sniff::decide(content_type.as_deref(), head_bytes),
-                content_type,
-                body_digest: *blake3::hash(&body).as_bytes(),
-                body,
-                revalidate: revalidator(&head),
-                elapsed: started.elapsed(),
-            }));
-        }
-    }
-
-    async fn send(
-        &self,
-        url: &Url,
-        revalidate: Option<&Revalidator>,
-    ) -> std::result::Result<reqwest::Response, Failure> {
-        let mut request = self
-            .inner
-            .client
-            .get(url.clone())
-            .header(http::header::ACCEPT, ACCEPT);
-
-        // Doc 05.3 sends both when both are known, because origins are
-        // inconsistent about which one they honour and sending the pair costs
-        // about sixty bytes.
-        if let Some(revalidate) = revalidate {
-            if let Some(etag) = &revalidate.etag {
-                request = request.header(http::header::IF_NONE_MATCH, etag);
-            }
-            if let Some(ms) = revalidate.last_modified_ms {
-                request = request.header(http::header::IF_MODIFIED_SINCE, date::format(ms));
-            }
-        }
-
-        request.send().await.map_err(transport_failure)
-    }
-
-    /// Read the body with the cap and the idle timeout both live.
-    async fn read_body(&self, response: reqwest::Response) -> std::result::Result<Bytes, Failure> {
-        let cap = self.inner.config.body_cap;
-        let idle = self.inner.config.read_timeout;
-        let mut stream = response.bytes_stream();
-        let mut body = BytesMut::new();
-
-        loop {
-            let next = match tokio::time::timeout(idle, stream.next()).await {
-                Ok(next) => next,
-                Err(_) => return Err(Failure::Timeout(Stage::Read)),
-            };
-            let Some(chunk) = next else { break };
-            let chunk = chunk.map_err(transport_failure)?;
-
-            if body.len() + chunk.len() > cap {
-                // Dropping the stream here closes the connection, which is the
-                // point: the alternative is draining a body we have already
-                // decided to throw away.
-                return Err(Failure::TooLarge);
-            }
-            body.extend_from_slice(&chunk);
-        }
-
-        Ok(body.freeze())
-    }
-
-    /// The permit set for a host, creating it if this is the first request.
-    fn permits(&self, host: &str) -> Arc<Semaphore> {
-        let mut hosts = self.inner.hosts.lock().unwrap_or_else(|e| e.into_inner());
-
-        if hosts.len() >= self.inner.config.host_table_cap {
-            // An entry nobody else holds a reference to has no requests in
-            // flight and no permits taken, so dropping it loses nothing. This
-            // is a sweep rather than an eviction policy because the table is
-            // only a leak and never a cache.
-            hosts.retain(|_, permits| Arc::strong_count(permits) > 1);
-        }
-
-        Arc::clone(
-            hosts
-                .entry(host.to_owned())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.inner.config.per_host))),
-        )
+        };
+        emulated::ja4_of(&page.body)
+            .ok_or_else(|| FetchError::SelfCheck(format!("{echo} sent no ja4 field")))
     }
 }
 
-/// Where a redirect points, resolved against the URL that served it.
+/// Every tier this binary was built with, picked between by lease.
 ///
-/// A `Location` that does not parse is not a redirect, and treating it as one
-/// would turn a broken origin into a fetch of the wrong page.
-fn redirect_target(url: &Url, head: &HeaderMap, status: u16) -> Option<Url> {
-    if !matches!(status, 301 | 302 | 303 | 307 | 308) {
-        return None;
-    }
-    let location = header(head, "location")?;
-    url.join(&location)
-        .ok()
-        .filter(|target| matches!(target.scheme(), "http" | "https"))
-}
-
-/// What one status means, before the body has been read.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Verdict {
-    /// A success. Read the body, it is the page.
-    Page,
-    /// A 410, which is the one status that means never again.
-    Gone,
-    /// Settled on the headers alone.
-    Failed(Failure),
-    /// A refusal that might be a bot manager. Read the body to find out, and
-    /// fall back to this failure if it is an ordinary one.
-    Suspect(Failure),
-}
-
-/// What a status means, once it is not a redirect and not a 304.
-fn classify(status: u16, head: &HeaderMap) -> Verdict {
-    if (200..300).contains(&status) {
-        return Verdict::Page;
-    }
-    let marked = block_marker(head).is_some();
-    match status {
-        410 => Verdict::Gone,
-        403 | 429 | 503 if marked => Verdict::Failed(Failure::Blocked),
-        // Doc 05.8's four way split. A 403 from an origin that does not want
-        // us is a dead url and a 403 from something in front of it is a tier
-        // problem, and the only thing that tells them apart is the page. The
-        // body of a refusal is small and refusals are rare, so this is a read
-        // we can afford on the three statuses that carry a wall and on no
-        // others.
-        403 => Verdict::Suspect(Failure::NotFound),
-        429 => Verdict::Suspect(Failure::RateLimited),
-        503 => Verdict::Suspect(Failure::ServerError),
-        400..500 => Verdict::Failed(Failure::NotFound),
-        500..600 => Verdict::Failed(Failure::ServerError),
-        // 1xx never reaches here and a status above 599 is not HTTP.
-        _ => Verdict::Failed(Failure::Malformed),
-    }
-}
-
-/// The bot management vendors doc 05.8 names, recognised by the header they
-/// cannot help sending.
+/// Doc 05.8 stores a preferred tier per host and hands it to the fetcher on
+/// the lease. This is the thing that reads it. It is not the escalation state
+/// machine, which lives in `umi-state` and decides what a block means; this
+/// only routes a request to the rung it was asked for.
 ///
-/// Only the header side of the signal lives here. The body side, an
-/// interstitial page or a client rendered shell, needs the extracted text and
-/// is milestone 2. Presence is what is checked and not the value, because the
-/// values are opaque and change.
-fn block_marker(head: &HeaderMap) -> Option<&'static str> {
-    const MARKERS: [&str; 5] = [
-        "cf-mitigated",
-        "x-datadome",
-        "x-sucuri-block",
-        "x-iinfo",
-        "x-cdn-request-id",
-    ];
-    if let Some(name) = MARKERS.into_iter().find(|name| head.contains_key(*name)) {
-        return Some(name);
-    }
-    // Akamai's challenge is served by a named server rather than a header of
-    // its own, which is why this one is a value check.
-    header(head, "server")
-        .is_some_and(|server| server.starts_with("AkamaiGHost"))
-        .then_some("server")
-}
-
-/// `Content-Length`, when the origin sent one that parses.
-fn declared_length(head: &HeaderMap) -> Option<u64> {
-    header(head, "content-length")?.trim().parse().ok()
-}
-
-/// The conditional headers this response earns us next time.
-fn revalidator(head: &HeaderMap) -> Revalidator {
-    Revalidator {
-        etag: header(head, "etag"),
-        last_modified_ms: header(head, "last-modified")
-            .as_deref()
-            .and_then(date::parse),
-    }
-}
-
-/// One header as a string, dropping values that are not text.
-fn header(head: &HeaderMap, name: &str) -> Option<String> {
-    head.get(name)?.to_str().ok().map(str::to_owned)
-}
-
-/// The registrable domain a URL belongs to, for doc 04.7's redirect rule.
+/// # When a rung is missing
 ///
-/// An IP literal is its own domain, which is what falling back to the host
-/// string does. That is the right answer: a redirect from one address to
-/// another is off domain by any reading.
-fn registrable_domain(url: &Url) -> String {
-    url.host_str()
-        .map(|host| umi_types::pay_level_domain(host).to_string())
-        .unwrap_or_default()
+/// A build without the `emulation` feature has no T2, and a lease that asks
+/// for T2 is served by T1 instead. That is the honest failure mode rather than
+/// an error: the crawl keeps making progress, the host keeps getting blocked,
+/// the block count climbs and doc 05.8 backs it off to `refusing` on its own.
+/// [`Ladder::highest`] is how an operator finds out before that happens, and
+/// `umi crawl` logs it at startup.
+///
+/// T3 and T4 do not exist yet, and `TierPolicy::CEILING` is `Tier::Emulated`,
+/// so nothing leases above T2 today. When they arrive they land here.
+#[derive(Clone, Debug)]
+pub struct Ladder {
+    plain: Fetcher,
+    #[cfg(feature = "emulation")]
+    emulated: Emulated,
 }
 
-/// Turn a `reqwest` error into the failure class the scheduler acts on.
-///
-/// DNS, connect and TLS failures are one error type with one message, so the
-/// only way to tell them apart is the source chain, and the only thing in the
-/// source chain is text. That is fragile and it is written down rather than
-/// hidden: if a `reqwest` or `hyper` release changes the wording, these fall
-/// back to [`Failure::Connect`], which is the safe reading because it retries
-/// the URL rather than escalating a tier.
-fn transport_failure(error: reqwest::Error) -> Failure {
-    if error.is_timeout() {
-        return Failure::Timeout(if error.is_connect() {
-            Stage::Connect
+impl Ladder {
+    /// Build every tier that is compiled in, with doc 05.4's defaults.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Client`] when any tier's TLS backend will not initialise.
+    pub fn new() -> Result<Self> {
+        Self::with_config(FetchConfig::default())
+    }
+
+    /// Build every tier that is compiled in, with the knobs turned.
+    ///
+    /// One config for all of them. A per tier config would be a knob nobody
+    /// has asked for and a way for two tiers to disagree about the body cap.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Client`] when any tier's TLS backend will not initialise.
+    pub fn with_config(config: FetchConfig) -> Result<Self> {
+        Ok(Self {
+            #[cfg(feature = "emulation")]
+            emulated: Emulated::with_config(config.clone())?,
+            plain: Fetcher::with_config(config)?,
+        })
+    }
+
+    /// The highest rung this build actually has.
+    #[must_use]
+    pub const fn highest() -> Tier {
+        if cfg!(feature = "emulation") {
+            Tier::Emulated
         } else {
-            Stage::Read
-        });
-    }
-    if error.is_body() || error.is_decode() {
-        return Failure::Malformed;
+            Tier::Plain
+        }
     }
 
-    let mut text = String::new();
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
-    while let Some(current) = source {
-        text.push_str(&current.to_string().to_ascii_lowercase());
-        text.push(' ');
-        source = current.source();
+    /// The T1 client, for callers that want that rung by name.
+    #[must_use]
+    pub const fn plain(&self) -> &Fetcher {
+        &self.plain
     }
 
-    if text.contains("dns error") || text.contains("failed to lookup address") {
-        Failure::Dns
-    } else if text.contains("certificate")
-        || text.contains("handshake")
-        || text.contains("tls")
-        || text.contains("alert")
-    {
-        Failure::Tls
-    } else {
-        Failure::Connect
+    /// Fetch one URL at the tier the lease asked for.
+    ///
+    /// `Tier::Revalidate` and `Tier::Plain` are the same client and differ
+    /// only in whether `revalidate` is set, which is the caller's decision.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Url`] when the URL does not parse or is not http(s).
+    /// Nothing else.
+    pub async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+        tier: Tier,
+    ) -> Result<Outcome> {
+        match tier {
+            #[cfg(feature = "emulation")]
+            Tier::Emulated | Tier::Rendered | Tier::Supervised => {
+                self.emulated.fetch(url, revalidate).await
+            }
+            _ => self.plain.fetch(url, revalidate).await,
+        }
     }
 }
 

@@ -416,6 +416,7 @@ impl Fetch for Wire {
         &self,
         url: &str,
         _revalidate: Option<&Revalidator>,
+        _tier: umi_types::Tier,
     ) -> Result<Outcome, FetchError> {
         if self.latency {
             tokio::time::sleep(latency_of(host_index(url))).await;

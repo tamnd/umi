@@ -77,7 +77,7 @@ use std::time::Duration;
 use umi_crawl::{
     Clock, CrawlConfig, Crawler, Scope, SegmentInfo, SegmentSink, SystemClock, TickReport,
 };
-use umi_fetch::{FetchConfig, Fetcher};
+use umi_fetch::{FetchConfig, Ladder};
 use umi_file::{StreamKind, WriterConfig};
 use umi_publish::manifest::{FileEntry, Manifest, Verification};
 use umi_publish::repo::Corpus;
@@ -833,18 +833,18 @@ fn run(
 ) -> Result<Summary, Error> {
     let state: Arc<dyn State> =
         Arc::new(SqliteState::open(&layout.state).map_err(|e| Error::State(e.to_string()))?);
-    // The T1 client, which is the only tier that exists today. `--tier` is
-    // already on `CrawlConfig` and the loop honours it as a ceiling, so a
-    // crawl asking for tier 3 gets tier 1 rather than an error, which is the
-    // right behaviour when the ladder grows a rung: doc 05 escalates, and a
-    // ladder with one rung on it escalates to that rung.
+    // Every rung this binary was built with. `--tier` is already on
+    // `CrawlConfig` and the loop honours it as a ceiling, so a crawl asking
+    // for a tier above the top of the ladder gets the top of the ladder rather
+    // than an error, which is the right behaviour while the ladder is still
+    // growing rungs.
     let mut fetch_config = FetchConfig::default();
     // Doc 05.4's ceiling rather than the 512 KB the one page commands default
     // to. A crawl that truncated every large page would produce rows whose
     // `content_length` and body digest describe a prefix of what the origin
     // sent, which is worse than not having the page.
     fetch_config.body_cap = 8 << 20;
-    let fetcher = Fetcher::with_config(fetch_config)?;
+    let fetcher = Ladder::with_config(fetch_config)?;
     let clock = SystemClock;
     let started_ms = clock.now_ms();
 

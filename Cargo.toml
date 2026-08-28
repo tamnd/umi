@@ -87,6 +87,22 @@ unicode-normalization = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "brotli", "zstd", "deflate", "stream", "charset", "http2"] }
 http = "1"
 bytes = "1"
+
+# T2, doc 05.5. wreq links BoringSSL and exposes the TLS extensions and the
+# HTTP/2 settings a browser profile is actually made of, rather than trying to
+# reproduce a fingerprint from a hash. BoringSSL and openssl-sys share symbol
+# prefixes and cannot be in one process, so this is optional here and reaches
+# umi-fetch only through its non default `emulation` feature. Gate 2.2 asserts
+# the default tree has neither.
+#
+# The four decompression features are not optional in practice. A browser
+# profile sends Chrome's `Accept-Encoding`, so origins answer with brotli and
+# zstd whether or not we can read them, and a client that cannot decode its own
+# advertised encodings gets bytes it cannot parse. `stream` is what gives the
+# body as chunks rather than one buffer, which is how the body cap is enforced
+# before the bytes are in memory rather than after.
+wreq = { version = "0.16", features = ["stream", "gzip", "brotli", "zstd", "deflate"] }
+wreq-util = "0.2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 # Storage and publishing.

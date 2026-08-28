@@ -73,3 +73,9 @@ tempfile.workspace = true
 # `#[tokio::test]`. The crate itself builds its runtime by hand and does not
 # need the macros, so they are here rather than in the dependency above.
 tokio = { workspace = true, features = ["macros"] }
+
+[features]
+# Doc 05.5's T2. Off by default because it links BoringSSL, which cannot share
+# a process with openssl-sys, and because gate 2.2 asserts the default build
+# has neither. Build with `--features emulation` to get the rung.
+emulation = ["umi-crawl/emulation", "umi-fetch/emulation"]
