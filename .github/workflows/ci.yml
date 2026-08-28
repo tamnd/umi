@@ -183,6 +183,12 @@ jobs:
       # rate limiting us is a test people learn to ignore. Run it by hand after
       # a dependency bump, as the doc comment on it says.
       - run: cargo test -p umi-fetch --features emulation
+      # The doc comments on the T2 types only exist in this build, so the
+      # rustdoc job cannot see them and an intra doc link into the emulated
+      # module goes stale without anything saying so.
+      - env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc -p umi-fetch --features emulation --no-deps
 
   deny:
     name: cargo-deny

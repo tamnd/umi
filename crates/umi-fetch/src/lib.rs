@@ -230,8 +230,9 @@ impl Fetcher {
 /// frame that match a real Chrome build, which is what gets past bot
 /// management that refuses a plain client.
 ///
-/// The user agent is still ours. See [`emulated`] for why, and for why that
-/// is the only thing about the profile that is changed.
+/// The user agent is still ours. Doc 07.1 is why, and the module this type
+/// lives in spells out why that is the only thing about the profile that is
+/// changed.
 ///
 /// Cheap to clone, for the same reason [`Fetcher`] is.
 #[cfg(feature = "emulation")]
@@ -291,7 +292,7 @@ impl Emulated {
     /// than either. Nothing about the failure would be visible, because the
     /// requests would keep succeeding on the hosts that were never the problem.
     ///
-    /// Compare what comes back against [`emulated::EXPECTED_JA4`]. This
+    /// Compare what comes back against [`EXPECTED_JA4`]. This
     /// returns the observed value rather than a boolean so that a mismatch can
     /// be logged with both halves in it, which is the only form of the message
     /// anyone can act on.
