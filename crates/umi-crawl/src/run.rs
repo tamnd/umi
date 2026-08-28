@@ -674,6 +674,26 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             return Fetched::excluded(&lease, fetched_at_ms, reason).paced(pace);
         }
 
+        // Doc 07.5, both halves of it. AIPREF attaches a preference two ways,
+        // a `Content-Usage` line in robots.txt and a `Content-Usage` response
+        // header, and a site can use either or both. They are reconciled by
+        // the vocab draft's rule, which is most restrictive wins rather than
+        // most specific wins, and rendered once so that a reader building a
+        // training set filters on one column with one predicate.
+        //
+        // Against the lease URL rather than the final one, because that is the
+        // URL robots.txt was checked for and the URL this row is filed under.
+        let mut usage = entry.robots.usage_for_url(&lease.url);
+        if let Outcome::Ok(page) = &outcome
+            && let Some((_, value)) = page
+                .headers_kept
+                .iter()
+                .find(|(name, _)| name == "content-usage")
+        {
+            usage.merge(&umi_robots::Usage::parse(value));
+        }
+        let content_usage = usage.render();
+
         let row = PageRow::build(&Crawled {
             url: &lease.url,
             keys: lease.key,
@@ -684,7 +704,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             tier_used: lease.tier,
             tier_path: std::slice::from_ref(&lease.tier),
             robots_checked_ms,
-            content_usage: entry.robots.content_usage().first().map(String::as_str),
+            content_usage: content_usage.as_deref(),
             fetcher_id: self.config.fetcher,
             verification: Verification::Local,
             crawl_profile: self.config.scope.id,

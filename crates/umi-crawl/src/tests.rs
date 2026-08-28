@@ -497,6 +497,33 @@ fn the_columns_hold_what_the_rows_held() {
 }
 
 #[test]
+fn the_aipref_column_carries_what_the_row_carried() {
+    // Doc 07.5's whole payoff is a reader filtering on one column with one
+    // predicate, and that needs the value to survive the row builder and land
+    // in the column doc 10.5 names. The Parquet half of the same trip is
+    // covered by umi-publish's round trip over `umi_file::sample`, which fills
+    // this column too.
+    let body = html(&prose());
+    let url = url::Url::parse(URL).expect("parse");
+    let extracted = extract(body.as_bytes(), &url);
+    let outcome = Outcome::Ok(Box::new(page_of(&body)));
+    let mut crawled = crawled(&outcome, Some(&extracted));
+    crawled.content_usage = Some("train-ai=n, search=y");
+
+    let mut builder = PageBuilder::new();
+    builder.push(&PageRow::build(&crawled));
+    builder.push(&row_of(&body));
+    let batch = builder.finish();
+
+    let usage = batch
+        .column_by_name("content_usage")
+        .expect("doc 10.5 names this column")
+        .as_string::<i32>();
+    assert_eq!(usage.value(0), "train-ai=n, search=y");
+    assert!(usage.is_null(1), "no preference is null and not empty");
+}
+
+#[test]
 fn the_builder_counts_the_bytes_it_is_given() {
     let row = row_of(&html(&prose()));
     let mut builder = PageBuilder::new();

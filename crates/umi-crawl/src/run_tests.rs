@@ -290,6 +290,17 @@ fn ok_page(url: &str, body: &str) -> Outcome {
     }))
 }
 
+/// A 200 carrying a `Content-Usage` response header, which is the half of
+/// AIPREF that robots.txt does not carry.
+fn with_usage(url: &str, body: &str, usage: &str) -> Outcome {
+    let Outcome::Ok(mut page) = ok_page(url, body) else {
+        unreachable!("ok_page returns Ok")
+    };
+    page.headers_kept
+        .push(("content-usage".to_owned(), usage.to_owned()));
+    Outcome::Ok(page)
+}
+
 /// A 200 carrying an `ETag`, which is what a page has to send before there is
 /// anything for T0 to revalidate against.
 fn tagged(url: &str, body: &str) -> Outcome {
@@ -715,6 +726,97 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for("https://example.com/a"));
+}
+
+#[tokio::test]
+async fn aipref_reaches_the_row_from_both_sources_at_once() {
+    // Doc 07.5. AIPREF can arrive in robots.txt, in a response header, or in
+    // both, and a site using both is not a contradiction to resolve in the
+    // page's favour. The vocab draft reconciles most restrictive wins, so the
+    // header saying `train-ai=y` here does not undo the file saying no, and
+    // the header's `search=n` is added because the file said nothing about it.
+    let state = seeded(&["https://example.com/a"]).await;
+    let fetch = Canned::new()
+        .robots(
+            "https://example.com",
+            "User-agent: *\nAllow: /\nContent-Usage: train-ai=n\n",
+        )
+        .outcome(
+            "https://example.com/a",
+            with_usage(
+                "https://example.com/a",
+                &page("A", &[]),
+                "train-ai=y, search=n",
+            ),
+        );
+    let crawler = crawler(fetch, state);
+    let sink = Collected::default();
+
+    crawler.tick(&sink).await.expect("tick");
+    let rows = sink.rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].content_usage.as_deref(),
+        Some("train-ai=n, search=n")
+    );
+}
+
+#[tokio::test]
+async fn a_pattern_scoped_aipref_line_reaches_only_the_pages_it_names() {
+    // The attach draft lets a line carry a path pattern, and the pattern uses
+    // the same matcher as `Allow` and `Disallow`. A crawl that put every line
+    // on every row would file the whole site under a preference the site made
+    // about one directory.
+    let state = seeded(&[
+        "https://example.com/ai-ok/yes",
+        "https://example.com/blog/no",
+    ])
+    .await;
+    let fetch = Canned::new()
+        .robots(
+            "https://example.com",
+            "User-agent: *\nAllow: /\nContent-Usage: /ai-ok/ train-ai=y\n",
+        )
+        .html("https://example.com/ai-ok/yes", &page("Yes", &[]))
+        .html("https://example.com/blog/no", &page("No", &[]));
+    let crawler = crawler(fetch, state);
+    let sink = Collected::default();
+
+    crawler.tick(&sink).await.expect("tick");
+    let rows = sink.rows();
+    assert_eq!(rows.len(), 2);
+    for row in rows {
+        let want = if row.url.contains("/ai-ok/") {
+            Some("train-ai=y")
+        } else {
+            None
+        };
+        assert_eq!(row.content_usage.as_deref(), want, "{}", row.url);
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_aipref_value_is_recorded_rather_than_dropped() {
+    // AIPREF is two drafts and neither is an RFC. A directive from a later one
+    // is worth more in the corpus verbatim than it is worth guessed at, and a
+    // parser that dropped what it did not recognise would leave the reader who
+    // does recognise it with nothing.
+    let state = seeded(&["https://example.com/a"]).await;
+    let fetch = Canned::new()
+        .robots(
+            "https://example.com",
+            "User-agent: *\nAllow: /\nContent-Usage: ai-input=n\n",
+        )
+        .html("https://example.com/a", &page("A", &[]));
+    let crawler = crawler(fetch, state);
+    let sink = Collected::default();
+
+    crawler.tick(&sink).await.expect("tick");
+    assert_eq!(
+        sink.rows()[0].content_usage.as_deref(),
+        Some("ai-input=n"),
+        "an unknown directive was thrown away"
+    );
 }
 
 #[tokio::test]
