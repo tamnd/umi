@@ -1,0 +1,28 @@
+# The scope for doc 16's gate 2.1, tier share on 100000 stratified urls.
+#
+# No include matchers, which doc 13.2 reads as everything. That is deliberate
+# and it is the only way to say it: the sample is 100000 urls spread over about
+# eight thousand domains drawn from every decade of the rank distribution, so
+# any scope narrower than the whole web would throw away most of the sample and
+# with it the stratification that makes the number mean anything.
+#
+# `max_depth = 0` is what keeps that honest. Seeds are at depth zero and doc
+# 11's rule is `depth <= max_depth`, so the crawl fetches exactly the urls in
+# the seed file and enqueues nothing it finds on them. The gate asks what
+# fraction of a stratified sample needs a browser, and a crawl that followed
+# links would answer a different question: it would drift towards whichever
+# sites link the most, which is the sampling bias the stratification exists to
+# remove.
+name = "gate-2-1"
+max_depth = 0
+
+[seed]
+# The urls come from --seed, not from here, and a sitemap fetch on eight
+# thousand domains would add eight thousand requests that measure nothing.
+sitemaps = false
+robots_sitemaps = false
+
+[budget]
+# Stop when the frontier drains, which for a depth zero crawl is when the last
+# seed has been answered.
+stop_when_idle = true

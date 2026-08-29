@@ -474,10 +474,22 @@ fn cat_parquet(
         let schema = builder.parquet_schema();
         let mut indices = Vec::new();
         for name in list {
-            let at = (0..schema.num_columns())
-                .find(|&i| leaf_name(schema.column(i).path().string().as_str()) == *name)
-                .ok_or_else(|| Error::NoColumn((*name).to_owned()))?;
-            indices.push(at);
+            // Every leaf under the column, not one leaf. A list in parquet is
+            // three levels deep, so `tier_path` is stored as a leaf called
+            // `tier_path.list.element` and a `links` column is a leaf per
+            // field of the struct inside it. Asking for the leaf whose last
+            // path segment matches the name finds neither, which is why
+            // `--columns tier_path` used to say the column was not in the
+            // file while the same name worked on a segment holding the same
+            // rows. Doc 14.9 says `umi cat` reads a segment and a published
+            // parquet the same way, so the match is on the top of the path.
+            let found: Vec<usize> = (0..schema.num_columns())
+                .filter(|&i| root_name(schema.column(i).path().string().as_str()) == *name)
+                .collect();
+            if found.is_empty() {
+                return Err(Error::NoColumn((*name).to_owned()));
+            }
+            indices.extend(found);
         }
         let mask = ProjectionMask::leaves(schema, indices);
         builder = builder.with_projection(mask);
@@ -537,7 +549,7 @@ fn list_one(path: &Path) -> Result<Listing, Error> {
             for group in 0..meta.num_row_groups() {
                 let row_group = meta.row_group(group);
                 for column in row_group.columns() {
-                    if leaf_name(column.column_path().string().as_str()) != "fetched_at_ms" {
+                    if root_name(column.column_path().string().as_str()) != "fetched_at_ms" {
                         continue;
                     }
                     // Statistics are what doc 12.3 turns on so a consumer can
@@ -594,8 +606,14 @@ fn walk(root: &Path) -> Result<Vec<PathBuf>, Error> {
 
 /// The last component of a dotted Parquet column path. `links.href` is one
 /// column to a consumer and three leaves to Parquet.
-fn leaf_name(path: &str) -> &str {
-    path.rsplit('.').next().unwrap_or(path)
+/// The column a parquet leaf belongs to.
+///
+/// A leaf path is dotted and the part that names the column is the first one.
+/// For a plain column the whole path is the name, and for anything nested the
+/// rest of the path is parquet's own list and struct scaffolding, which is not
+/// something a caller of `umi cat` has ever heard of.
+fn root_name(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
 }
 
 fn trim(text: &str, width: usize) -> String {
