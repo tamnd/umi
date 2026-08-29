@@ -179,6 +179,26 @@ impl RenderBudget {
         Slot::At(at)
     }
 
+    /// Give a slot back, for a render that never happened.
+    ///
+    /// What is being rationed is browser time, so a grant that never reached
+    /// the browser is not time spent and should not be charged. One thing
+    /// reaches this: doc 07.6 makes the lease that finds a host's robots.txt
+    /// missing spend its slot on that file, and that file is fetched over
+    /// plain HTTP whatever tier the page was going to want.
+    ///
+    /// The interval comes off `next_ms` because that is exactly what the grant
+    /// put on it. A process with no browser has nothing to give back, which is
+    /// also the answer for a caller whose slot was [`Slot::NoBrowser`].
+    pub fn refund(&self) {
+        let mut bucket = self.lock();
+        let Some(interval) = bucket.interval_ms else {
+            return;
+        };
+        bucket.next_ms = bucket.next_ms.saturating_sub(interval);
+        bucket.granted = bucket.granted.saturating_sub(1);
+    }
+
     /// The budget in pages a second, which is zero for a process that cannot
     /// render.
     #[must_use]

@@ -26,10 +26,14 @@ LOG="${LOG:-/tmp/adversarial-origin.tsv}"
 # past the front page and into the backoff, short enough that the second half of
 # the run is still most of the run.
 FIRST_SECS="${FIRST_SECS:-45}"
-# A ceiling on the second crawler, not a plan. The site is small and the run
-# ends when the frontier drains; this is only here so a hang is a failure rather
-# than a machine left running.
-SECOND_SECS="${SECOND_SECS:-1500}"
+# How long the second crawler gets. This one is a plan and not a ceiling. The
+# origin fails one request in five and doc 07.6 is asymmetric, four times up
+# against a ninth down, so a site like this pins the crawler at the sixty
+# second ceiling and stays there. The frontier never drains and it is not meant
+# to: what the log needs is every behaviour, a restart in the middle of it, and
+# long enough after the ceiling to show the rate holding. Ten minutes is about
+# three times what that takes.
+SECOND_SECS="${SECOND_SECS:-600}"
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root"
@@ -60,9 +64,8 @@ for _ in $(seq 1 100); do
 done
 
 # The same crawl twice, so the restart is a restart rather than a second
-# experiment. No --max-pages: the site is small and the run ends when the
-# frontier drains, which is also the only way to be sure every behaviour was
-# reached.
+# experiment. No --max-pages: what ends the run is the clock, and a page budget
+# would end it somewhere that depends on how the backoff happened to land.
 args=(crawl "http://127.0.0.1:$PORT/" --out "$OUT" --no-sitemaps --no-render --depth 8)
 
 echo "first crawler, $FIRST_SECS seconds then SIGKILL"
@@ -75,8 +78,9 @@ restart_at="$(python3 -c 'import time; print(int(time.time() * 1000))')"
 echo "killed at $restart_at"
 
 echo "second crawler, on the same state"
+# The timeout is the normal way this ends, so its exit status is not news.
 timeout "$SECOND_SECS" "$umi" "${args[@]}" >"$OUT/second.log" 2>&1 \
-    || echo "second crawler exited non zero, checking the log anyway"
+    || echo "second crawler stopped on the clock, which is what was meant to happen"
 
 kill "$origin_pid" 2>/dev/null || true
 trap - EXIT
