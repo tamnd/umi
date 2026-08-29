@@ -11,7 +11,7 @@ use std::time::Duration;
 use super::{
     Backoff, HEARTBEAT, Heartbeat, IDLE_WAIT, Layout, Log, Options, Publishing, Settings, Stall,
     Stop, Summary, WATCH_MAX_WAIT, adopt, day, default_out, delay_ms, profile_toml, scope_for,
-    seed, seed_url, settings, sources, span, spent, tier,
+    seed, seed_url, settings, sitemap_sources, sources, span, spent, tier,
 };
 use crate::config::{Config, Flags, Paths};
 
@@ -327,6 +327,83 @@ fn a_target_seeds_itself_and_a_profile_does_not() {
         None,
         "a profile carries its own seeds and the path is not one of them"
     );
+}
+
+/// A profile with `[seed]` written out however the test wants it.
+fn profile_with_seed(body: &str) -> umi_crawl::Scope {
+    umi_crawl::Scope::from_toml(&format!("name = \"x\"\n[seed]\n{body}")).expect("profile parses")
+}
+
+#[test]
+fn a_profile_that_turns_sitemaps_off_is_obeyed_when_no_flag_was_given() {
+    let sources = sitemap_sources(
+        &options("x"),
+        &profile_with_seed("sitemaps = false\nrobots_sitemaps = false"),
+    );
+    assert!(!sources.well_known);
+    assert!(!sources.from_robots);
+}
+
+#[test]
+fn a_profile_that_says_nothing_gets_both_starting_points() {
+    let sources = sitemap_sources(&options("x"), &profile_with_seed("urls = []"));
+    assert!(sources.well_known);
+    assert!(sources.from_robots);
+}
+
+#[test]
+fn a_profile_can_drop_one_starting_point_and_keep_the_other() {
+    let sources = sitemap_sources(&options("x"), &profile_with_seed("sitemaps = false"));
+    assert!(!sources.well_known);
+    assert!(sources.from_robots, "only one key was written");
+}
+
+#[test]
+fn the_flag_beats_the_profile_in_both_directions() {
+    let off = Options {
+        sitemaps: Some(false),
+        ..options("x")
+    };
+    let profile_on = profile_with_seed("sitemaps = true\nrobots_sitemaps = true");
+    let sources = sitemap_sources(&off, &profile_on);
+    assert!(!sources.well_known);
+    assert!(!sources.from_robots);
+
+    let on = Options {
+        sitemaps: Some(true),
+        ..options("x")
+    };
+    let profile_off = profile_with_seed("sitemaps = false\nrobots_sitemaps = false");
+    let sources = sitemap_sources(&on, &profile_off);
+    assert!(sources.well_known);
+    assert!(sources.from_robots);
+}
+
+#[tokio::test]
+async fn a_profile_seeds_from_its_own_url_list() {
+    let scope = umi_crawl::Scope::from_toml(
+        "name = \"x\"\n\
+         [[include]]\n\
+         host_suffix = \"example.com\"\n\
+         [seed]\n\
+         urls = [\"https://example.com/start\", \"https://elsewhere.test/start\"]\n",
+    )
+    .expect("profile parses");
+    let state = umi_state::MemoryState::new();
+    let options = Options {
+        target: "profile.toml".to_owned(),
+        ..Options::default()
+    };
+
+    let seeded = seed(&state, &scope, &options, 0, 1000)
+        .await
+        .expect("the store is in memory");
+    assert_eq!(seeded.urls, 1);
+    assert_eq!(
+        seeded.outside, 1,
+        "the off scope url was counted, not hidden"
+    );
+    assert_eq!(seeded.origins, vec!["https://example.com".to_owned()]);
 }
 
 #[test]

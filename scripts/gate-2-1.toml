@@ -14,11 +14,6 @@
 # sites link the most, which is the sampling bias the stratification exists to
 # remove.
 #
-# The sitemap pass has to be turned off with --no-sitemaps on the command line
-# and not with a seed table here. Doc 13.4 defines one and doc 13.6 describes
-# what it does, but nothing reads it: see #162. A sitemap pass over eight
-# thousand origins would add eight thousand requests that measure nothing and
-# would take longer than the crawl it is seeding, so the flag matters.
 name = "gate-2-1"
 max_depth = 0
 
@@ -26,3 +21,11 @@ max_depth = 0
 # Stop when the frontier drains, which for a depth zero crawl is when the last
 # seed has been answered.
 stop_when_idle = true
+
+[seed]
+# No sitemap pass. Every url in the seed file was chosen by the sampler and a
+# sitemap would add urls nobody sampled, which is the same bias as following
+# links. It is also eight thousand origins worth of requests that measure
+# nothing and would take longer than the crawl they are seeding.
+sitemaps = false
+robots_sitemaps = false

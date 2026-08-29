@@ -197,7 +197,10 @@ pub struct Options {
     /// Any program that prints URLs, repeatable.
     pub seeder: Vec<String>,
     /// Follow the seed origins' sitemaps before the first tick, doc 13.6.
-    pub sitemaps: bool,
+    ///
+    /// Nothing when neither `--sitemaps` nor `--no-sitemaps` was given, which
+    /// hands the decision to doc 13.4's profile and then to the default.
+    pub sitemaps: Option<bool>,
     /// Where the directory goes. Defaults to `./<scope name>`.
     pub out: Option<String>,
     /// Doc 12's pipeline, or nothing when `--publish` was not given.
@@ -460,11 +463,18 @@ pub fn resume(
     // Publishing comes from the flags and the configuration rather than from
     // the profile, because the profile is checked into somebody's repository
     // and the two things `--publish` needs are secrets.
+    //
+    // Sitemaps off, and said out loud rather than left to the default. The
+    // profile's own `seed.urls` are read on a resume, so the origins are no
+    // longer empty here, and a full seeding pass over them on every restart
+    // would refetch sitemap files that can run to tens of thousands per host
+    // to learn nothing. Doc 09's polling pass is the one that revisits them.
     let options = Options {
         target: scope.name.clone(),
         watch,
         seed: None,
         seeder: Vec::new(),
+        sitemaps: Some(false),
         publish,
         identity,
         ..Options::default()
@@ -1115,19 +1125,24 @@ fn run(
 
         let seeded = seed(&*state, &scope, options, started_ms, settings.delay_ms).await?;
         log.line(&format!(
-            "seeded {} urls into {}",
+            "seeded {} urls into {}{}",
             seeded.urls,
-            layout.state.display()
+            layout.state.display(),
+            match seeded.outside {
+                0 => String::new(),
+                n => format!(", {n} outside the scope"),
+            }
         ))?;
 
         // Doc 13.6, and the difference between starting a site at its front
         // page and starting it with everything the site says it has. Before
         // `resume`, so that the domains these URLs are on are scheduled with
         // the rest rather than waiting for the loop to notice them.
-        if options.sitemaps {
+        let sitemaps = sitemap_sources(options, &scope);
+        if sitemaps.from_robots || sitemaps.well_known {
             for origin in &seeded.origins {
                 let found = crawler
-                    .seed_from_sitemaps(origin, umi_crawl::SitemapLimits::seeding())
+                    .seed_from_sitemaps(origin, sitemaps)
                     .await
                     .map_err(|e| Error::Crawl(e.to_string()))?;
                 if found.files == 0 {
@@ -1518,6 +1533,24 @@ fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), Error> {
     std::fs::write(path, json).map_err(Error::Io)
 }
 
+/// Which sitemaps doc 13.6's pass starts from, once the flags and doc 13.4's
+/// profile have both had their say.
+///
+/// Doc 14.7's precedence, applied to a pair of keys rather than to one: the
+/// flag wins over the profile, the profile wins over the default, and the
+/// default is to follow both. `--no-sitemaps` therefore turns the whole pass
+/// off whatever the profile asked for, which is what an operator typing it
+/// means, and a profile is free to turn off one starting point and keep the
+/// other.
+fn sitemap_sources(options: &Options, scope: &Scope) -> umi_crawl::SitemapLimits {
+    let seed = &scope.seed;
+    umi_crawl::SitemapLimits {
+        from_robots: options.sitemaps.or(seed.robots_sitemaps).unwrap_or(true),
+        well_known: options.sitemaps.or(seed.sitemaps).unwrap_or(true),
+        ..umi_crawl::SitemapLimits::seeding()
+    }
+}
+
 /// Put the starting URLs in the frontier.
 ///
 /// The target is always a seed, because `umi crawl example.com` that fetched
@@ -1535,6 +1568,12 @@ async fn seed(
     if let Some(url) = seed_url(&options.target) {
         urls.push(url);
     }
+    // Doc 13.4's `seed.urls`, which is where a profile that travels on its own
+    // says where to start. A resume reads them again, and that is fine rather
+    // than something to guard against: admission dedups against the seen set,
+    // so the ones already fetched cost one call and go nowhere, and a url
+    // added to the profile between two runs is picked up on the second.
+    urls.extend(scope.seed.urls.iter().cloned());
     for source in sources(options) {
         let stream = umi_seed::seed(source, umi_seed::Limits::default())
             .map_err(|e| Error::Crawl(e.to_string()))?;
@@ -1547,9 +1586,15 @@ async fn seed(
     // The scope filters the seeds too. A URL list that wandered off the target
     // would otherwise be a focused crawl that quietly is not one, and the seed
     // is exactly where that is cheapest to catch.
-    urls.retain(|url| scope.allows(url));
     urls.sort();
     urls.dedup();
+    let before = urls.len();
+    urls.retain(|url| scope.allows(url));
+    // Counted rather than passed over in silence. A seed list that the scope
+    // rejects in full leaves a crawl that starts, drains and exits zero, and
+    // the operator has nothing to go on. One number in the log is the whole
+    // difference between that and an obvious mistake.
+    let outside = u64::try_from(before - urls.len()).unwrap_or(u64::MAX);
 
     let candidates: Vec<Candidate<'_>> = urls
         .iter()
@@ -1560,7 +1605,10 @@ async fn seed(
         })
         .collect();
     if candidates.is_empty() {
-        return Ok(Seeded::default());
+        return Ok(Seeded {
+            outside,
+            ..Seeded::default()
+        });
     }
     let admitted = state
         .admit(&candidates)
@@ -1609,6 +1657,7 @@ async fn seed(
 
     Ok(Seeded {
         urls: u64::from(admitted.admitted),
+        outside,
         origins: origins(&urls),
     })
 }
@@ -1618,6 +1667,8 @@ async fn seed(
 struct Seeded {
     /// URLs admitted.
     urls: u64,
+    /// URLs the scope rejected before admission ever saw them.
+    outside: u64,
     /// The distinct origins they are on, which is what doc 13.6's sitemap pass
     /// runs against. Origins rather than hosts, because a sitemap lives at a
     /// scheme and a port as much as at a name.
@@ -1992,7 +2043,7 @@ impl Default for Options {
             tabs: 0,
             seed: None,
             seeder: Vec::new(),
-            sitemaps: true,
+            sitemaps: None,
             out: None,
             publish: None,
             identity: None,

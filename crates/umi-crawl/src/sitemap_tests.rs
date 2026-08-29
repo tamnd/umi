@@ -304,3 +304,91 @@ async fn a_date_later_than_our_last_fetch_brings_a_known_url_forward() {
     assert_eq!(report.admitted, 0, "a known url was admitted again");
     assert_eq!(report.refreshed, 1, "the date did not move the schedule");
 }
+
+#[tokio::test]
+async fn a_profile_can_take_the_well_known_path_out_and_keep_the_robots_lines() {
+    // Doc 13.4's `seed.sitemaps = false` with `robots_sitemaps` left alone.
+    // The site advertises a sitemap and also has one at the usual place, and
+    // only the advertised one is fetched.
+    let doc = urlset(&["https://example.com/news/1"], "2024-06-01");
+    let fetch = Canned::new()
+        .robots(
+            ORIGIN,
+            "User-agent: *\nSitemap: https://example.com/news.xml\n",
+        )
+        .html(&format!("{ORIGIN}/news.xml"), &doc)
+        .html(
+            &format!("{ORIGIN}/sitemap.xml"),
+            &urlset(&["https://example.com/a"], "2024-01-01"),
+        );
+    let crawler = crawler(fetch, empty().await);
+
+    let limits = SitemapLimits {
+        well_known: false,
+        ..SitemapLimits::seeding()
+    };
+    let report = crawler
+        .seed_from_sitemaps(ORIGIN, limits)
+        .await
+        .expect("the store is in memory");
+    assert_eq!(report.files, 1);
+    assert_eq!(report.admitted, 1);
+    assert!(crawler.fetcher().asked_for(&format!("{ORIGIN}/news.xml")));
+    assert!(
+        !crawler
+            .fetcher()
+            .asked_for(&format!("{ORIGIN}/sitemap.xml")),
+        "the well known path was fetched after the profile turned it off"
+    );
+}
+
+#[tokio::test]
+async fn a_profile_can_take_the_robots_lines_out_and_keep_the_well_known_path() {
+    let doc = urlset(&["https://example.com/a"], "2024-01-01");
+    let fetch = Canned::new()
+        .robots(
+            ORIGIN,
+            "User-agent: *\nSitemap: https://example.com/news.xml\n",
+        )
+        .html(
+            &format!("{ORIGIN}/news.xml"),
+            &urlset(&["https://example.com/news/1"], "2024-06-01"),
+        )
+        .html(&format!("{ORIGIN}/sitemap.xml"), &doc);
+    let crawler = crawler(fetch, empty().await);
+
+    let limits = SitemapLimits {
+        from_robots: false,
+        ..SitemapLimits::seeding()
+    };
+    let report = crawler
+        .seed_from_sitemaps(ORIGIN, limits)
+        .await
+        .expect("the store is in memory");
+    assert_eq!(report.files, 1);
+    assert_eq!(report.admitted, 1);
+    assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/news.xml")));
+}
+
+#[tokio::test]
+async fn turning_both_off_sends_no_requests_at_all() {
+    // Not even robots.txt. The pass exists to fetch sitemaps and a pass with
+    // no sitemaps to fetch has nothing to ask anybody.
+    let fetch = Canned::new().html(
+        &format!("{ORIGIN}/sitemap.xml"),
+        &urlset(&["https://example.com/a"], "2024-01-01"),
+    );
+    let crawler = crawler(fetch, empty().await);
+
+    let limits = SitemapLimits {
+        from_robots: false,
+        well_known: false,
+        ..SitemapLimits::seeding()
+    };
+    let report = crawler
+        .seed_from_sitemaps(ORIGIN, limits)
+        .await
+        .expect("the store is in memory");
+    assert_eq!(report, crate::SitemapReport::default());
+    assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/robots.txt")));
+}
