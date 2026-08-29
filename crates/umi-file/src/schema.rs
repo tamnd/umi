@@ -272,10 +272,14 @@ pub fn codec_for(name: &str, ty: &DataType) -> Codec {
         // Doc 10.6, small enums: the values repeat hard, so the dictionary is
         // most of the column and the codes are a couple of bits a row.
         DataType::Utf8 if is_low_cardinality(name) => Codec::Dict,
-        // Doc 10.6 wants FSST here, which is issue 90. Until then these are
-        // plain plus zstd, which is what doc 10.10 says the Parquet side
-        // already does with them and is the fallback doc 10.10 names if FSST
-        // conversion turns out to dominate.
+        // The short string columns are here too, which is not what doc 10.6
+        // says. It wants a symbol table on `url`, `canonical_url`,
+        // `links.item.href` and the two short text columns, and issue 90 built
+        // one and measured it: 36.5 bytes a URL against zstd's 20.5 on 15000
+        // real crawled URLs, and 1155 bytes a page against 673 over a whole
+        // segment. `codec.rs` has the table and the reason. Zstd is also what
+        // doc 10.10 says the Parquet side already does with them, so this is
+        // one compressor across both ends rather than a conversion.
         DataType::Utf8 => Codec::Zstd,
         // Doc 10.6, fixed width integers and timestamps: frame of reference
         // against the chunk minimum, then bit packing.

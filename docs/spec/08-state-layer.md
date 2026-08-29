@@ -181,7 +181,7 @@ Membership testing goes through a two level front line. In memory, per resident 
 
 Insertion never touches the packed array. New fingerprints go to an in memory sorted buffer, and when it reaches 64k entries it is merged into the shard's array by a sequential rewrite of that shard. This is the DRUM idea from IRLbot, and it is the reason nami can absorb 12500 candidates per second without random I/O.
 
-**The ledger** is a per PLD columnar block, one column per field, using the same encodings as doc 10: delta plus bit packing for the timestamps and counters, dictionary for the small enums, FSST for the interned ETags. Column layout rather than row layout because the scheduler reads `next_due_ms` and `priority` for a whole domain at once and does not care about the other fields, and reading 2 columns of 100k rows is 400 KB rather than 7.6 MB.
+**The ledger** is a per PLD columnar block, one column per field, using the same encodings as doc 10: delta plus bit packing for the timestamps and counters, dictionary for the small enums, and zstd for the interned ETags. Doc 10.6 wanted FSST for the short strings, measured it against zstd and dropped it, and there is no reason to think a per PLD ETag column answers differently. Column layout rather than row layout because the scheduler reads `next_due_ms` and `priority` for a whole domain at once and does not care about the other fields, and reading 2 columns of 100k rows is 400 KB rather than 7.6 MB.
 
 **The frontier index** is a per PLD min-heap over `next_due_ms` for pending URLs, plus a global heap over hosts keyed by next allowed fetch time. The global heap is small because it is per host, not per URL, and it is the Mercator structure from doc 09 almost unchanged.
 

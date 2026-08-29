@@ -228,9 +228,12 @@ impl SegmentWriter {
     ///
     /// Rows arrive in fetch completion order and are written in that order. Doc
     /// 10.5's reorder window, which groups by host inside 4096 rows to make URL
-    /// prefix elision pay, is not here: it only earns anything once FSST lands
-    /// in issue 90, and doc 10.5 says it comes out anyway if the win is under 5
-    /// percent.
+    /// prefix elision pay, is not here, and issue 90 measured what it would be
+    /// worth. Sorting 15000 real crawled URLs before encoding took the `url`
+    /// column from 20.5 bytes a URL to 16.3, which is 20 percent of a column
+    /// that is half a percent of a segment. Doc 10.5 says a change comes out if
+    /// the win is under 5 percent, and a tenth of a percent of a segment is not
+    /// worth holding 4096 rows back to sort them.
     ///
     /// # Errors
     ///
