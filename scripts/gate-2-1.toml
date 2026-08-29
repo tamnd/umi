@@ -13,14 +13,14 @@
 # links would answer a different question: it would drift towards whichever
 # sites link the most, which is the sampling bias the stratification exists to
 # remove.
+#
+# The sitemap pass has to be turned off with --no-sitemaps on the command line
+# and not with a seed table here. Doc 13.4 defines one and doc 13.6 describes
+# what it does, but nothing reads it: see #162. A sitemap pass over eight
+# thousand origins would add eight thousand requests that measure nothing and
+# would take longer than the crawl it is seeding, so the flag matters.
 name = "gate-2-1"
 max_depth = 0
-
-[seed]
-# The urls come from --seed, not from here, and a sitemap fetch on eight
-# thousand domains would add eight thousand requests that measure nothing.
-sitemaps = false
-robots_sitemaps = false
 
 [budget]
 # Stop when the frontier drains, which for a depth zero crawl is when the last
