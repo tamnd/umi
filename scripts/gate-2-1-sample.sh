@@ -38,11 +38,22 @@ OUT="${OUT:-$HOME/gate-2-1}"
 # doc 05's "under 1 percent" apart from the 5 percent that would break doc 01's
 # capacity plan. Ten thousand urls would not be.
 TOTAL="${TOTAL:-100000}"
-# More domains than strictly needed, because a domain in the rank table is a
-# node in the web graph and a node can be linked to without ever having been
-# fetched. Those contribute no urls and the shortfall has to come from
-# somewhere, so the draw is deliberately wide and the trim happens at the end.
-PER_STRATUM_DOMAINS="${PER_STRATUM_DOMAINS:-1200}"
+# Far more domains than the arithmetic needs, for two reasons.
+#
+# The first is that a domain in the rank table is a node in the web graph and a
+# node can be linked to without ever having been fetched, so plenty of them
+# contribute no urls at all. That is not spread evenly: at rank one thousand
+# four domains in five have urls in the index and out past ten million only one
+# in five does. A draw sized for the head leaves the tail strata half empty,
+# which is what the first full run did.
+#
+# The second is that tier behaviour is a property of a site rather than of a
+# page. Thirty urls from one domain almost always answer at the same tier, so
+# they are close to one observation and not thirty, and the sample size that
+# decides how precise the answer is, is the number of domains. Drawing wide and
+# trimming round robin at the end spends the same hundred thousand fetches
+# across many more sites, which is strictly a better measurement.
+PER_STRATUM_DOMAINS="${PER_STRATUM_DOMAINS:-7000}"
 # The cap that stops one site filling a stratum on its own.
 PER_DOMAIN_URLS="${PER_DOMAIN_URLS:-30}"
 # Well under what the box has, because the out of memory killer does not care
