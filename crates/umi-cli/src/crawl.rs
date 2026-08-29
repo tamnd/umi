@@ -1550,15 +1550,35 @@ async fn seed(
     // Doc 13.3 lets a profile lower a host's rate and never raise it, and the
     // adaptive delay in doc 07.6 takes over from here, so this is a starting
     // point rather than a setting.
+    //
+    // Read before writing. `put_host` is `INSERT OR REPLACE` and a `HostRow`
+    // covers the whole record, so building a fresh one here and handing it over
+    // resets everything the crawler had learned about the host: doc 05.8's tier
+    // ladder, doc 07.6's adaptive delay, the robots digest and expiry, the
+    // crawl delay the site published, the backoff we are currently serving, and
+    // the `blocked` and `refusing` flags. That last pair is the one that
+    // matters most, because `umi block` is meant to stop a domain permanently
+    // and on the record, and a later crawl of the same directory would have
+    // quietly undone it.
     let mut hosts: Vec<umi_state::HostRow> = Vec::new();
     let mut seen: Vec<umi_types::HostId> = Vec::new();
+    let floor = delay_ms.max(umi_state::HostRow::DEFAULT_FLOOR_MS);
     for candidate in &candidates {
         if seen.contains(&candidate.key.host) {
             continue;
         }
         seen.push(candidate.key.host);
-        let mut row = umi_state::HostRow::new(candidate.key.host, candidate.key.pld);
-        row.adaptive_delay_ms = delay_ms.max(umi_state::HostRow::DEFAULT_FLOOR_MS);
+        let known = state
+            .host(candidate.key.host)
+            .await
+            .map_err(|e| Error::State(e.to_string()))?;
+        let mut row =
+            known.unwrap_or_else(|| umi_state::HostRow::new(candidate.key.host, candidate.key.pld));
+        // The larger of the two delays, which is the smaller of the two rates.
+        // A host that has already been slowed down, by its own robots.txt or by
+        // doc 07.6 watching it struggle, keeps the slower number, and `--rps`
+        // can only ever make it slower still.
+        row.adaptive_delay_ms = row.adaptive_delay_ms.max(floor);
         hosts.push(row);
     }
     state
