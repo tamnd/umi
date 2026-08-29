@@ -31,6 +31,7 @@ umi-publish = { path = "crates/umi-publish", version = "0.0.1" }
 umi-seed = { path = "crates/umi-seed", version = "0.0.1" }
 umi-dedup = { path = "crates/umi-dedup", version = "0.0.1" }
 umi-crawl = { path = "crates/umi-crawl", version = "0.0.1" }
+umi-metrics = { path = "crates/umi-metrics", version = "0.0.1" }
 
 anyhow = "1"
 # The state trait is used through `Box<dyn State>`, because the backend is
