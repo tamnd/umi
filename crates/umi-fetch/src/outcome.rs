@@ -177,6 +177,14 @@ pub enum Failure {
     /// The response did not parse as HTTP, or the redirect chain did not
     /// terminate inside the hop limit.
     Malformed,
+    /// A browser was asked for a URL that is not a document, so the rung was
+    /// wrong rather than the response.
+    ///
+    /// Only T3 and T4 produce this and the ladder consumes it, by fetching the
+    /// URL again at T1 where bytes come back as bytes. It reaches a caller only
+    /// if one drives the renderer directly, which is why it still maps to a
+    /// published outcome code.
+    NotDocument,
 }
 
 /// Which timeout ran out, because the three mean different things.
@@ -269,7 +277,7 @@ impl Outcome {
                 Failure::Blocked => OutcomeCode::Blocked,
                 Failure::RateLimited => OutcomeCode::RateLimited,
                 Failure::TooLarge => OutcomeCode::TooLarge,
-                Failure::Malformed => OutcomeCode::Malformed,
+                Failure::Malformed | Failure::NotDocument => OutcomeCode::Malformed,
             },
         }
     }
@@ -342,6 +350,24 @@ mod tests {
             failures.len(),
             "two failures share a wire name, so a receipt cannot tell them apart"
         );
+    }
+
+    #[test]
+    fn a_non_document_is_malformed_on_the_wire() {
+        // Left out of the list above on purpose, because it shares a code with
+        // `Malformed` rather than being distinct from it. The ladder is the
+        // only thing that needs to tell the two apart, and it has the typed
+        // value. A receipt does not, and adding a code to the published set for
+        // something a caller never sees would be a format change for nothing.
+        let wire = |failure| {
+            Outcome::Failed {
+                status: None,
+                failure,
+                retry_after: None,
+            }
+            .wire()
+        };
+        assert_eq!(wire(Failure::NotDocument), wire(Failure::Malformed));
     }
 
     #[test]

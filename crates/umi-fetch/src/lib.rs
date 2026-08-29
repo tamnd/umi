@@ -537,7 +537,26 @@ impl Ladder {
         if matches!(tier, Tier::Rendered | Tier::Supervised)
             && let Some(rendered) = &self.rendered
         {
-            return rendered.fetch(url, revalidate).await;
+            let outcome = rendered.fetch(url, revalidate).await?;
+            // A browser handed a PDF, an image or a stylesheet says so rather
+            // than serialising the viewer around it, and the answer is the rung
+            // below, where those come back as the bytes they are. Without this
+            // the row is a failure with a status the fetch never really got and
+            // a length of zero, and the host wears the failure on its counter
+            // for a URL that would have fetched perfectly well at T1.
+            //
+            // One step down and no loop. T1 cannot return this, so the second
+            // attempt is the last one either way.
+            if !matches!(
+                outcome,
+                Outcome::Failed {
+                    failure: Failure::NotDocument,
+                    ..
+                }
+            ) {
+                return Ok(outcome);
+            }
+            return self.plain.fetch(url, revalidate).await;
         }
         match tier {
             #[cfg(feature = "emulation")]

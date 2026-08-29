@@ -1185,10 +1185,13 @@ impl Pool {
         // viewer's own markup is what `outerHTML` would return. Putting that in
         // the corpus as the page would be worse than not having the page, and
         // the URL belongs at T1 anyway, where the bytes come back as bytes.
+        //
+        // `NotDocument` rather than `Malformed` so the ladder can act on that
+        // last sentence. Nothing about the response was wrong, the rung was.
         if !markup(&response.mime_type) {
             return Ok(Outcome::Failed {
                 status: Some(status),
-                failure: Failure::Malformed,
+                failure: Failure::NotDocument,
                 retry_after,
             });
         }
