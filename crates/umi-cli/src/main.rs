@@ -321,10 +321,15 @@ impl CrawlArgs {
             tabs: config.tabs.value,
             seed: self.seed.clone(),
             seeder: self.seeder.clone(),
-            // Doc 14.9 has this on by default, so the flag that decides
-            // anything is the negative one and `--sitemaps` is there to say
-            // out loud what the default already is.
-            sitemaps: !self.no_sitemaps,
+            // Nothing when neither flag was given, because doc 13.4 lets the
+            // profile decide and a flag that was not typed must not outvote a
+            // key that was written. The two flags override each other, so at
+            // most one of these is true.
+            sitemaps: match (self.sitemaps, self.no_sitemaps) {
+                (true, _) => Some(true),
+                (_, true) => Some(false),
+                _ => None,
+            },
             out: self.out.clone(),
             publish: crawl::Publishing::resolve(config, self.publish)?,
             identity: crawl::Identity::resolve(config)?,

@@ -190,7 +190,7 @@ echo "now crawl it, on a box with chrome and the browser features built in:"
 echo "  cargo build --release -p umi-cli --features emulation,render"
 echo "  ./target/release/umi crawl scripts/gate-2-1.toml \\"
 echo "      --seed $OUT/seed.txt --out $OUT/crawl \\"
-echo "      --tabs 4 --concurrency 128 --no-sitemaps"
+echo "      --tabs 4 --concurrency 128"
 echo
 echo "then report it:"
 echo "  ./scripts/gate-2-1.py --crawl $OUT/crawl --strata $OUT/strata.csv"

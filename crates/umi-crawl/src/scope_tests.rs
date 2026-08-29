@@ -177,7 +177,8 @@ urls = ["https://doc.rust-lang.org/std/"]
     );
     assert!(scope.budget.stop_when_idle);
     assert_eq!(scope.rate.concurrency, 8);
-    assert!(scope.seed.sitemaps);
+    assert_eq!(scope.seed.sitemaps, Some(true));
+    assert_eq!(scope.seed.robots_sitemaps, Some(true));
     assert_eq!(scope.seed.urls.len(), 1);
     assert!(scope.allows("https://crates.io/crates/serde"));
 }
@@ -188,6 +189,18 @@ fn a_minimal_profile_is_a_name_and_nothing_else() {
     assert!(scope.is_general());
     assert!(scope.budget.stop_when_idle, "focused default is to stop");
     assert_eq!(scope.link_policy, LinkPolicy::InScopeOnly);
+    // Unset and not false. The caller turns these into a decision and it has
+    // to be able to see that the profile said nothing, because the pass is on
+    // when nobody asks for it either way.
+    assert_eq!(scope.seed.sitemaps, None);
+    assert_eq!(scope.seed.robots_sitemaps, None);
+}
+
+#[test]
+fn a_profile_that_says_no_to_sitemaps_is_not_a_profile_that_said_nothing() {
+    let scope = Scope::from_toml("name = \"x\"\n[seed]\nsitemaps = false").expect("profile parses");
+    assert_eq!(scope.seed.sitemaps, Some(false));
+    assert_eq!(scope.seed.robots_sitemaps, None);
 }
 
 #[test]

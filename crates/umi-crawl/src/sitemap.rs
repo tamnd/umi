@@ -111,6 +111,11 @@ pub struct SitemapLimits {
     /// is where depth is measured from, and doc 09.7's depth cap applies to
     /// what they link to rather than to them.
     pub depth: u8,
+    /// Start from the `Sitemap` lines in robots.txt, doc 13.4's
+    /// `seed.robots_sitemaps`.
+    pub from_robots: bool,
+    /// Start from `/sitemap.xml`, doc 13.4's `seed.sitemaps`.
+    pub well_known: bool,
 }
 
 impl Default for SitemapLimits {
@@ -128,6 +133,8 @@ impl SitemapLimits {
             max_urls: MAX_URLS,
             max_depth: MAX_DEPTH,
             depth: 0,
+            from_robots: true,
+            well_known: true,
         }
     }
 
@@ -145,7 +152,9 @@ impl SitemapLimits {
 ///
 /// The starting points are the `Sitemap` lines in robots.txt and
 /// `/sitemap.xml`, in that order, deduplicated. Most sites have one or the
-/// other and a fair number have both pointing at the same file.
+/// other and a fair number have both pointing at the same file. Doc 13.4's
+/// profile can turn either of them off, and turning both off means this makes
+/// no requests at all.
 ///
 /// # Errors
 ///
@@ -166,6 +175,12 @@ where
     S: State,
 {
     let mut report = SitemapReport::default();
+    // Before the robots fetch, because a profile that turned both starting
+    // points off has asked for no requests at all and one request for
+    // robots.txt is still a request.
+    if !limits.from_robots && !limits.well_known {
+        return Ok(report);
+    }
     let Ok(key) = RowKey::for_url(origin, None) else {
         return Ok(report);
     };
@@ -184,10 +199,14 @@ where
 
     let mut queue: Vec<(String, u8)> = Vec::new();
     let mut visited: HashSet<String> = HashSet::new();
-    for listed in entry.robots.sitemaps() {
-        push(&mut queue, &mut visited, listed.clone(), 0);
+    if limits.from_robots {
+        for listed in entry.robots.sitemaps() {
+            push(&mut queue, &mut visited, listed.clone(), 0);
+        }
     }
-    push(&mut queue, &mut visited, format!("{origin}/sitemap.xml"), 0);
+    if limits.well_known {
+        push(&mut queue, &mut visited, format!("{origin}/sitemap.xml"), 0);
+    }
 
     // The parser's own caps, tightened so that no single document can spend the
     // whole limits. A host whose first file lists fifty million URLs has said

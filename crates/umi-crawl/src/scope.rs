@@ -497,13 +497,20 @@ impl RateOverride {
 }
 
 /// Where the first URLs come from.
+///
+/// The two sitemap keys are options rather than plain booleans because the
+/// pass is on by default. A profile that does not mention sitemaps at all and
+/// a profile that says `sitemaps = false` have to be told apart, and a bare
+/// `bool` reads both of them as false, which would turn the pass off for every
+/// profile ever written.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Seed {
-    /// Follow `/sitemap.xml`.
-    pub sitemaps: bool,
-    /// Follow the `Sitemap` lines in robots.txt.
-    pub robots_sitemaps: bool,
+    /// Follow `/sitemap.xml`. Unset means the default, which is yes.
+    pub sitemaps: Option<bool>,
+    /// Follow the `Sitemap` lines in robots.txt. Unset means the default,
+    /// which is yes.
+    pub robots_sitemaps: Option<bool>,
     /// URLs written out in the profile.
     pub urls: Vec<String>,
 }
