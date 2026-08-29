@@ -558,7 +558,15 @@ impl Ladder {
                     ..
                 }
             ) {
-                return Ok(Served::at(tier, outcome));
+                // `descended` and not `at`, which matters only for T4 and
+                // matters a lot there. Doc 05.7's T4 is a real browser with a
+                // real profile driven by or with a human, and this is the T3
+                // engine: one incognito context, a temporary profile, nobody
+                // watching. It is the rung below and the path has to say so.
+                // Labelling this T4 would put the tier in the published column
+                // and in the row an operator gets shown, and the whole reason
+                // the allowlist is published is that those have to be true.
+                return Ok(Served::descended(tier, Tier::Rendered, outcome));
             }
             let outcome = self.plain.fetch(url, revalidate).await?;
             return Ok(Served {

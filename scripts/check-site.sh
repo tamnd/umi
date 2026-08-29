@@ -73,6 +73,34 @@ done
 grep -qF "\"user_agent\": \"$agent\"" "$site/bot/purpose.json" ||
 	note "purpose.json does not carry the user agent string $agent"
 
+echo "the supervised list says what the code does"
+# Doc 05.7's T4 is the one tier a person has to type a command to reach, and
+# the page promising that only holds while the code agrees. Two things can
+# drift and both are checked: an entry count on the page that is not the
+# length of the list beside it, and the claim that the supervised browser is
+# not built, which stops being true the day somebody builds it.
+supervised=$site/bot/supervised.json
+python3 - "$supervised" <<'PY' || fail=1
+import json, sys
+
+doc = json.load(open(sys.argv[1]))
+ok = True
+if doc["count"] != len(doc["entries"]):
+	print("  supervised.json says %d entries and lists %d" % (doc["count"], len(doc["entries"])))
+	ok = False
+for entry in doc["entries"]:
+	for field in ("domain", "operator", "reason", "added"):
+		if not str(entry.get(field, "")).strip():
+			print("  a supervised entry has no %s on it" % field)
+			ok = False
+sys.exit(0 if ok else 1)
+PY
+if grep -qF '"engine_built": false' "$supervised" &&
+	grep -rqF 'Tier::Supervised => ' crates/umi-fetch/src/lib.rs; then
+	note "supervised.json says the browser is not built and the ladder has a rung for it"
+fi
+grep -qF '/bot/supervised.json' "$bot" || note "the bot page does not link the supervised list"
+
 echo "the json parses"
 for f in "$site"/bot/*.json; do
 	python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" ||

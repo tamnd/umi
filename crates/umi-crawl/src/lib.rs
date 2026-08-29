@@ -29,6 +29,7 @@
 pub mod clock;
 pub mod digest;
 pub mod fetch;
+pub mod ledger;
 pub mod page;
 pub mod render;
 pub mod robots;
@@ -55,6 +56,7 @@ mod tests;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use digest::extract_digest;
 pub use fetch::Fetch;
+pub use ledger::{Recorded, SupervisedLedger};
 pub use page::{Crawled, PageBuilder, PageRow, Snippet, SnippetKind};
 pub use render::{RenderBudget, RenderPolicy, Slot};
 pub use robots::RobotsCache;

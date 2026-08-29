@@ -34,7 +34,7 @@
 use umi_state::BlockRow;
 
 use crate::hub::{Hub, Upload};
-use crate::{Error, Result};
+use crate::{Error, Result, domain_path};
 
 /// Where in `umi-meta` the block list lives.
 pub const BLOCK_DIR: &str = "blocks";
@@ -49,18 +49,7 @@ pub const BLOCK_DIR: &str = "blocks";
 /// dots in it did not come from there and is not going to be written into a
 /// repository path on trust.
 pub fn block_path(domain: &str) -> Result<String> {
-    let usable = !domain.is_empty()
-        && domain.len() <= 253
-        && domain
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
-        && !domain.contains("..");
-    if !usable {
-        return Err(Error::Manifest("a block names a domain that cannot be one"));
-    }
-    Ok(format!("{BLOCK_DIR}/{domain}.json"))
+    domain_path(BLOCK_DIR, domain)
 }
 
 /// One block, as it is written.

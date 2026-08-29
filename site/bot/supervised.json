@@ -1,0 +1,11 @@
+{
+  "about": "Domains umi is allowed to crawl at tier 4, which is a real browser on a written per domain allowlist. Nothing reaches this tier by learning. A domain is here only because a named person put it here.",
+  "page": "https://umi.dev/bot",
+  "published": "https://huggingface.co/datasets/open-index/umi-meta",
+  "published_prefix": "supervised/",
+  "removal_request": "tamnd87@gmail.com",
+  "engine_built": false,
+  "engine_note": "The allowlist, the opt in, the publishing and the per fetch record are built. The supervised browser is not, so a fetch requested at tier 4 today descends to tier 3 and the row says so.",
+  "count": 0,
+  "entries": []
+}

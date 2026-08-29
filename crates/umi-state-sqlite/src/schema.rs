@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6, V7];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6, V7, V8];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -449,5 +449,35 @@ CREATE TABLE blocks (
     blocked_ms    INTEGER NOT NULL,
     lifted_ms     INTEGER,
     lifted_reason TEXT    NOT NULL
+) WITHOUT ROWID;
+";
+
+/// Version 8: doc 05.7's T4 allowlist.
+///
+/// The same shape as `blocks` next door and for the same reasons, down to the
+/// removed entries staying in the table. The one extra column is `operator`,
+/// because doc 05.7 says the entry records who added it and a tier this
+/// expensive should have a name against it.
+///
+/// It is a separate table from `blocks` rather than a column on it. The two
+/// lists are opposites in effect but they are not opposites in structure: a
+/// domain can be on neither, and putting them in one table would mean a
+/// `NULL` in every row saying which kind of entry it is, plus a query that has
+/// to remember. They are also read at different moments, the block list to
+/// refuse and this one to raise a ceiling.
+///
+/// Like `blocks`, the whole table is read into memory at open. The enforcement
+/// point is `lease`, which cannot afford a query per url, and an allowlist
+/// large enough for the scan to cost anything would mean this tier had stopped
+/// being rare, which doc 05.7 says it will not.
+const V8: &str = r"
+CREATE TABLE supervision (
+    pld            BLOB PRIMARY KEY,
+    domain         TEXT    NOT NULL,
+    operator       TEXT    NOT NULL,
+    reason         TEXT    NOT NULL,
+    added_ms       INTEGER NOT NULL,
+    removed_ms     INTEGER,
+    removed_reason TEXT    NOT NULL
 ) WITHOUT ROWID;
 ";

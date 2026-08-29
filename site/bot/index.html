@@ -147,6 +147,14 @@ $ dig +short fetch-3.umi.dev
 
 <p>umi fetches nothing behind a login, solves no CAPTCHAs, bypasses no challenge, and uses no residential proxies and no proxy rotation. It crawls from the addresses listed above and nowhere else. Pages that require an account are pages umi does not have.</p>
 
+<h2>Browsers, and the one list that gets one</h2>
+
+<p>Most pages umi fetches are fetched with a plain HTTP client. A page that turns out to be an empty shell with the content loaded by script gets a headless browser instead, which is a decision umi makes per host from what it saw, and it is the highest tier anything reaches on its own.</p>
+
+<p>Above that there is one more tier, T4, and nothing reaches it by learning. A domain is on T4 only because a named person put it on a written allowlist, and both the entry and everything fetched under it are published. The current list is at <a href="/bot/supervised.json">umi.dev/bot/supervised.json</a> and the entries themselves are in the <a href="https://huggingface.co/datasets/open-index/umi-meta">umi-meta</a> dataset under <code>supervised/</code>. Every entry carries the domain, the person who added it, the date and the reason, in plain words.</p>
+
+<p>The list is empty today, and the supervised browser itself is not built yet. If your domain is ever on it you will know, because it will be on that page with somebody's name against it, and you can ask for it to come off at the address below. Coming off is a one line request and does not need a reason.</p>
+
 <h2>What umi publishes</h2>
 
 <p>Everything, openly. Crawled pages are converted to Parquet and uploaded to public datasets under <a href="https://huggingface.co/open-index">open-index</a> on Hugging Face, usually within ten minutes of being fetched, after which the local copy is deleted. The local disk is a cache and nothing else. Manifests are hash chained and signed so a stranger can verify that a published corpus is the one that was produced.</p>

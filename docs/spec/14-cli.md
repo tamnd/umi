@@ -45,6 +45,7 @@ umi verify <repo|dir>         re verify manifests, signatures and digests
 umi manifest <repo>           print or validate a manifest chain
 
 umi block [<domain>]          add to the block list, or print it, doc 07.7
+umi supervise [<domain>]      add to the T4 allowlist, or print it, doc 05.7
 umi scope check <profile>     evaluate a scope against a list of URLs
 
 umid                          the coordinator daemon, doc 03.2
@@ -53,7 +54,7 @@ umi peers                     coordinator peering state
 umi fetchers                  connected fetchers, reputation, rates, doc 06
 ```
 
-Twenty five commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
+Twenty six commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
 
 `--publish` is a flag on all three of `crawl`, `resume` and `watch`, and it means the same thing on each one. A crawl started with it and resumed without it keeps its next segments locally, which is deliberate: the flag is the operator saying what this run should do, not a property the directory remembers, because the two things it needs are secrets and secrets do not belong in a directory that gets moved around.
 
@@ -91,6 +92,7 @@ Rate
 Fetching
   --tier <max>                 highest tier allowed, default 3 in focused mode
   --no-render                  equivalent to --tier 2, and sets --tabs 0
+  --allow-supervised           doc 05.7's T4 opt in, off by default
   --tabs <n>                   doc 05.6's browser tab cap, default 0
   --timeout <duration>         per request, default 30s
 
@@ -218,6 +220,27 @@ The domain is widened to the registrable domain and the command says when it has
 Without a publishing token the block still applies locally and the command says the list was not published. That is a warning and not a failure: doc 07.7's promise is about stopping the crawling, and refusing to block a domain because a crawl directory has no write token near it would be the wrong answer to the wrong question.
 
 With no domain the command prints the list, in domain order, lifted entries included with both of their dates. Doc 14.9's exit 3 when there is nothing in it.
+
+### `umi supervise`
+
+```
+umi supervise <domain> --operator <who> --reason <text>   allow T4 on a domain
+umi supervise <domain> --remove --reason <text>           take it off the list
+umi supervise <domain> --show                             what T4 fetched there
+umi supervise                                             print the list
+```
+
+The block list next door is the one an operator reaches for when somebody asks us to stop. This is the opposite command and the rarer one: it is what an operator runs when somebody has asked us to do more than the ladder would do on its own, and doc 05.7's T4 is the only tier that exists because a person decided it rather than because the crawler learned it.
+
+`--operator` is required when adding, and it wants a person rather than a machine or a service account. The reason the field exists is that somebody can be asked about the entry later, and a service account cannot answer a question. `--reason` is required too, and it is published, so it has the same job the block list's reason has: explain itself to a stranger in a year.
+
+Adding a domain raises a ceiling and does nothing else. The lease still comes back at T3 unless the fetcher was started with `umi crawl --allow-supervised`, which is off by default and is the operator of one machine saying that machine is willing to run supervised work. Two switches, because one says which domains may be crawled that way and the other says who is willing to do it, and neither is any use on its own.
+
+Entries go to `open-index/umi-meta` under `supervised/`, one small file per domain, next to the blocks. A removal writes the removal onto the same entry and the entry stays, because a deleted record of a browser we once pointed at somebody's site is a record only we could describe.
+
+`--show` prints every T4 fetch under one domain out of `supervised.jsonl` in the crawl directory, in the order they happened, with the URL, the date, the status, the size and the rung that actually answered. That file is append only and it survives the pages themselves: doc 12 deletes the local copy of a segment once it is published, so a query over the crawled rows would answer this question for a shrinking window and then stop answering it. Doc 14.9's exit 3 when nothing has been fetched from the domain.
+
+The supervised browser is not built. The allowlist, the opt in, the publishing and the record are, and a fetch requested at T4 today descends to T3 and says so in `tier_path`, because a row that claimed T4 while a headless browser with a temporary profile did the work would be a false entry in the one column this whole tier exists to keep true.
 
 ## 14.6 Inspection
 

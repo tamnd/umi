@@ -21,8 +21,8 @@
 use rusqlite::Row;
 use rusqlite::types::Type;
 use umi_state::{
-    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Stream, TierPolicy,
-    UrlState,
+    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Stream,
+    SupervisionRow, TierPolicy, UrlState,
 };
 use umi_types::{Digest, HostId, PldId, Tier, Ulid, UrlKey, UrlKeyFull};
 
@@ -251,6 +251,23 @@ pub fn block(row: &Row<'_>) -> rusqlite::Result<BlockRow> {
         blocked_ms: from_ms(row.get("blocked_ms")?),
         lifted_ms: row.get::<_, Option<i64>>("lifted_ms")?.map(from_ms),
         lifted_reason: row.get("lifted_reason")?,
+    })
+}
+
+/// Read one of doc 05.7's allowlist entries.
+///
+/// `removed_ms` carries meaning by being null the same way `lifted_ms` does
+/// next door, and for the same reason: the row is a record of the entry and
+/// not only of its current state.
+pub fn supervision(row: &Row<'_>) -> rusqlite::Result<SupervisionRow> {
+    Ok(SupervisionRow {
+        pld: pld(row, "pld")?,
+        domain: row.get("domain")?,
+        operator: row.get("operator")?,
+        reason: row.get("reason")?,
+        added_ms: from_ms(row.get("added_ms")?),
+        removed_ms: row.get::<_, Option<i64>>("removed_ms")?.map(from_ms),
+        removed_reason: row.get("removed_reason")?,
     })
 }
 

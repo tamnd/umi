@@ -76,7 +76,7 @@ pub use types::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     ExcludeReason, FailureKind, FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest,
     LedgerRow, NackReason, Priority, RemoteCopy, Revalidator, RobotsRef, SegmentQuery, SegmentRow,
-    StateStats, Stream, TierPolicy, UrlState,
+    StateStats, Stream, SupervisionRow, TierPolicy, UrlState,
 };
 
 /// The batch size the whole design is tuned around, from doc 08.5.
@@ -321,6 +321,39 @@ pub trait State: Send + Sync + 'static {
     /// Whatever the store reports.
     async fn blocks(&self) -> Result<Vec<BlockRow>>;
 
+    /// Put domains on doc 05.7's T4 allowlist, or take them off it.
+    ///
+    /// Last write wins per domain, and within one batch the last occurrence of
+    /// a domain wins, as with [`put_host`](State::put_host).
+    ///
+    /// This is the only route to T4 in the system. Nothing escalates into it,
+    /// doc 05.8 caps learned escalation at T3, and the tier a lease asks for
+    /// is raised here or not at all, so an empty allowlist means a crawl that
+    /// cannot run a supervised fetch however it is configured.
+    ///
+    /// **Durability: durable before it returns.** The published list is what
+    /// makes this tier disclosed rather than secret, and an entry a crash can
+    /// undo is one the published list could disagree with.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports. An error means the batch may have been
+    /// partially applied, so the caller retries it whole: writing the same
+    /// entry twice changes nothing the second time.
+    async fn supervise(&self, rows: &[SupervisionRow]) -> Result<usize>;
+
+    /// The T4 allowlist, in domain order, removed entries included.
+    ///
+    /// Removed entries are in it for the same reason lifted blocks are: the
+    /// list is published and the record is the point. A consumer reads
+    /// [`in_force`](SupervisionRow::in_force) and a person auditing us reads
+    /// the dates.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn supervision(&self) -> Result<Vec<SupervisionRow>>;
+
     /// Write segment records, replacing any that exist.
     ///
     /// Called twice in a segment's life. Once when it is sealed, with the
@@ -502,6 +535,14 @@ impl<T: State + ?Sized> State for std::sync::Arc<T> {
 
     async fn blocks(&self) -> Result<Vec<BlockRow>> {
         (**self).blocks().await
+    }
+
+    async fn supervise(&self, rows: &[SupervisionRow]) -> Result<usize> {
+        (**self).supervise(rows).await
+    }
+
+    async fn supervision(&self) -> Result<Vec<SupervisionRow>> {
+        (**self).supervision().await
     }
 
     async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()> {

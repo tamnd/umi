@@ -91,7 +91,7 @@ A day folder holds about 3100 files, which is under Hugging Face's 10000 files p
 
 **`open-index/umi-dedup-<YYYY>w<WW>`** carries doc 11's exact digest to cluster mapping and the near duplicate cluster assignments. Roughly 48 bytes per page, so about 4.8 TB at full scale.
 
-**`open-index/umi-meta`** is one small repository that is the entry point for everything. It holds the registry of every other repository with its week, slice, row count and byte count, the manifest chain heads, the fetcher public key directory, the ban list from doc 06, the block list from doc 07.7, the tracking parameter list from doc 11.2, every schema version ever published, and the canonicalisation version history. A consumer starts here and discovers everything else. It is also the only repository we ever rewrite.
+**`open-index/umi-meta`** is one small repository that is the entry point for everything. It holds the registry of every other repository with its week, slice, row count and byte count, the manifest chain heads, the fetcher public key directory, the ban list from doc 06, the block list from doc 07.7, the T4 allowlist from doc 05.7, the tracking parameter list from doc 11.2, every schema version ever published, and the canonicalisation version history. A consumer starts here and discovers everything else. It is also the only repository we ever rewrite.
 
 We do not publish a separate link edge list. Fifty outlinks per page at 100 billion pages is five trillion edges, which is larger than the corpus that produced it, and the edges are already in the `links` column. Anyone building a link graph derives it, and Spec 2050 covers what to do with it after that.
 
