@@ -11,7 +11,7 @@ use std::time::Duration;
 use super::{
     Backoff, HEARTBEAT, Heartbeat, IDLE_WAIT, Layout, Log, Options, Publishing, Settings, Stall,
     Stop, Summary, WATCH_MAX_WAIT, adopt, day, default_out, delay_ms, profile_toml, scope_for,
-    seed_url, settings, sources, span, spent, tier,
+    seed, seed_url, settings, sources, span, spent, tier,
 };
 use crate::config::{Config, Flags, Paths};
 
@@ -438,6 +438,88 @@ async fn a_recorded_segment_is_one_the_publisher_will_pick_up() {
     // collectable. Getting this backwards would delete a segment nobody kept.
     assert!(due[0].remote.is_none());
     assert!(due[0].local());
+}
+
+#[tokio::test]
+async fn seeding_a_host_again_keeps_what_the_crawler_learned_about_it() {
+    // Measured on server3 before this was fixed: a host set to blocked and
+    // refusing, backed off, holding a published crawl delay and sitting at
+    // tier 3, came back from a single `umi crawl` on the same directory with
+    // every one of those at its default. `put_host` replaces the whole record,
+    // so seeding has to read before it writes.
+    let state = umi_state::MemoryState::default();
+    let options = options("https://example.com/a");
+    let scope = scope_for(&options).expect("scope");
+
+    // First seed: the host is new, so it is created and takes the delay floor.
+    let state_ref: &dyn umi_state::State = &state;
+    seed(state_ref, &scope, &options, 1_787_616_000_000, 1000)
+        .await
+        .expect("first seed");
+    let key = umi_state::Candidate::new("https://example.com/a", 0).expect("candidate");
+    let host = state_ref
+        .host(key.key.host)
+        .await
+        .expect("host")
+        .expect("the first seed created the row");
+    assert_eq!(host.adaptive_delay_ms, 1000);
+
+    // Now teach it everything a real crawl would have.
+    let mut learned = host;
+    learned.blocked = true;
+    learned.refusing = true;
+    learned.next_allowed_ms = 1_999_999_999_999;
+    learned.crawl_delay_ms = Some(30_000);
+    learned.adaptive_delay_ms = 8000;
+    learned.tier.preferred = umi_types::Tier::Rendered;
+    learned.tier.max = umi_types::Tier::Rendered;
+    state_ref.put_host(&[learned]).await.expect("put");
+
+    // Seed the same URL again, which is what running the command twice does.
+    seed(state_ref, &scope, &options, 1_787_616_001_000, 1000)
+        .await
+        .expect("second seed");
+
+    let after = state_ref
+        .host(key.key.host)
+        .await
+        .expect("host")
+        .expect("row");
+    assert!(after.blocked, "seeding unblocked a blocked host");
+    assert!(after.refusing, "seeding un-refused a refusing host");
+    assert_eq!(after.next_allowed_ms, 1_999_999_999_999);
+    assert_eq!(after.crawl_delay_ms, Some(30_000));
+    assert_eq!(after.tier.preferred, umi_types::Tier::Rendered);
+    // The larger delay wins, because doc 13.3 lets a profile lower a rate and
+    // never raise it, and `--rps` asked for a floor of 1000 against a learned
+    // 8000.
+    assert_eq!(after.adaptive_delay_ms, 8000);
+}
+
+#[tokio::test]
+async fn a_slower_rate_flag_still_slows_a_host_down() {
+    // The other direction of the same rule. `--rps` may only ever make a host
+    // slower, and a host that has not been slowed down further by anything
+    // else takes the flag's number.
+    let state = umi_state::MemoryState::default();
+    let state_ref: &dyn umi_state::State = &state;
+    let options = options("https://example.com/a");
+    let scope = scope_for(&options).expect("scope");
+
+    seed(state_ref, &scope, &options, 1_787_616_000_000, 1000)
+        .await
+        .expect("first seed");
+    seed(state_ref, &scope, &options, 1_787_616_001_000, 5000)
+        .await
+        .expect("second seed");
+
+    let key = umi_state::Candidate::new("https://example.com/a", 0).expect("candidate");
+    let after = state_ref
+        .host(key.key.host)
+        .await
+        .expect("host")
+        .expect("row");
+    assert_eq!(after.adaptive_delay_ms, 5000);
 }
 
 #[test]
