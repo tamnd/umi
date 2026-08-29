@@ -175,38 +175,63 @@ impl RobotsCache {
 /// failed. RFC 9309 section 2.3.1 says what each case means and umi-robots
 /// already encodes it, so the job here is only to get the status and the body
 /// into [`Robots::for_status`] without inventing a fourth answer.
+///
+/// The one thing this does beyond that is follow redirects that leave the
+/// registrable domain. Doc 04.7 says a fetcher stops at those and hands the
+/// target back, which is right for a page, and doc 07.5 accepts the extra
+/// round trip a robots.txt costs because of it. RFC 9309 2.3.1.2 asks for at
+/// least five hops followed "even across authorities", and the rules that come
+/// back apply to the origin we started from.
 async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) -> Robots {
-    let url = format!("{origin}/robots.txt");
-    // Never conditional. A stale robots.txt that a 304 confirmed is still a
-    // file we are about to re-read from a cache we already dropped, so the
-    // saving is nothing and the code path is one more thing to get wrong.
-    // The rungs it took are not this function's business. A robots.txt that
-    // came back over plain HTTP because the browser would not hand back a
-    // `text/plain` body is still this origin's robots.txt.
-    match fetch.fetch(&url, None, tier).await.map(|s| s.outcome) {
-        Ok(umi_fetch::Outcome::Ok(page)) => Robots::for_status(page.status, page.body.as_ref()),
-        // A 304 cannot happen because nothing above sends a conditional
-        // request for robots.txt, and a redirect off the origin is not this
-        // origin's robots.txt. Both are the unreachable case rather than the
-        // allow-all case: we asked and did not get an answer.
-        Ok(umi_fetch::Outcome::Gone) => Robots::allow_all(Provenance::NotFound),
-        Ok(
-            umi_fetch::Outcome::NotModified { .. } | umi_fetch::Outcome::RedirectedOffDomain { .. },
-        ) => Robots::disallow_all(Provenance::Unreachable),
-        Ok(umi_fetch::Outcome::Failed { failure, .. }) => match failure {
-            // A 4xx on robots.txt is the common case on the web: most sites do
-            // not have one. RFC 9309 2.3.1.3 says that means no restrictions.
-            umi_fetch::Failure::NotFound => Robots::allow_all(Provenance::NotFound),
-            umi_fetch::Failure::ServerError | umi_fetch::Failure::RateLimited => {
-                Robots::disallow_all(Provenance::ServerError)
+    let mut url = format!("{origin}/robots.txt");
+    let mut hops = 0u32;
+    loop {
+        // Never conditional. A stale robots.txt that a 304 confirmed is still
+        // a file we are about to re-read from a cache we already dropped, so
+        // the saving is nothing and the code path is one more thing to get
+        // wrong.
+        // The rungs it took are not this function's business. A robots.txt
+        // that came back over plain HTTP because the browser would not hand
+        // back a `text/plain` body is still this origin's robots.txt.
+        return match fetch.fetch(&url, None, tier).await.map(|s| s.outcome) {
+            Ok(umi_fetch::Outcome::Ok(page)) => Robots::for_status(page.status, page.body.as_ref()),
+            Ok(umi_fetch::Outcome::RedirectedOffDomain {
+                redirects, target, ..
+            }) => {
+                // Every hop counts, the ones the client already followed on
+                // the way to this one included, so a chain that crosses
+                // domains twice cannot buy itself a fresh budget each time.
+                hops += u32::try_from(redirects.len()).unwrap_or(u32::MAX);
+                hops += 1;
+                if hops > umi_robots::MAX_REDIRECTS {
+                    return Robots::disallow_all(Provenance::Unreachable);
+                }
+                url = target;
+                continue;
             }
-            _ => Robots::disallow_all(Provenance::Unreachable),
-        },
-        // `Outcome` is non_exhaustive, so a variant added later lands here.
-        // Disallow rather than allow: a fetch whose result this build cannot
-        // name is a fetch that did not answer the question, and the fail
-        // closed direction is the only safe one for a file whose whole job is
-        // to say no.
-        Ok(_) | Err(_) => Robots::disallow_all(Provenance::Unreachable),
+            // A 304 cannot happen because nothing above sends a conditional
+            // request for robots.txt. It is the unreachable case rather than
+            // the allow-all case: we asked and did not get an answer.
+            Ok(umi_fetch::Outcome::Gone) => Robots::allow_all(Provenance::NotFound),
+            Ok(umi_fetch::Outcome::NotModified { .. }) => {
+                Robots::disallow_all(Provenance::Unreachable)
+            }
+            Ok(umi_fetch::Outcome::Failed { failure, .. }) => match failure {
+                // A 4xx on robots.txt is the common case on the web: most sites
+                // do not have one. RFC 9309 2.3.1.3 says that means no
+                // restrictions.
+                umi_fetch::Failure::NotFound => Robots::allow_all(Provenance::NotFound),
+                umi_fetch::Failure::ServerError | umi_fetch::Failure::RateLimited => {
+                    Robots::disallow_all(Provenance::ServerError)
+                }
+                _ => Robots::disallow_all(Provenance::Unreachable),
+            },
+            // `Outcome` is non_exhaustive, so a variant added later lands here.
+            // Disallow rather than allow: a fetch whose result this build
+            // cannot name is a fetch that did not answer the question, and the
+            // fail closed direction is the only safe one for a file whose whole
+            // job is to say no.
+            Ok(_) | Err(_) => Robots::disallow_all(Provenance::Unreachable),
+        };
     }
 }

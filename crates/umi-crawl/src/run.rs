@@ -44,6 +44,7 @@ use futures_util::stream::FuturesUnordered;
 use umi_extract::extract;
 use umi_fetch::Outcome;
 use umi_frontier::{Ask, Config as FrontierConfig, Frontier, Rate};
+use umi_robots::Provenance;
 use umi_state::{
     Budget, Discovery, FetchOutcome, FetchResult, LeaseId, NackReason, Pace, State, StateError,
 };
@@ -53,7 +54,7 @@ use crate::clock::Clock;
 use crate::fetch::Fetch;
 use crate::page::{Crawled, PageRow};
 use crate::render::{RenderBudget, RenderPolicy, Slot};
-use crate::robots::RobotsCache;
+use crate::robots::{Entry as RobotsEntry, RobotsCache};
 use crate::scope::{LinkPolicy, Scope};
 
 /// How big a tick has to be before its T2 share is worth an alert.
@@ -681,6 +682,18 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 changed |= host.tier.saw_lie();
             }
 
+            // Doc 07.4's crawl delay, from the one lease a day that fetched
+            // the file. The pacer takes the larger of this and doc 07.6's
+            // adaptive delay, so a site asking for less than we were already
+            // giving it changes nothing and a site asking for more is
+            // honoured.
+            if let Some(facts) = learned.robots
+                && host.crawl_delay_ms != facts.crawl_delay_ms
+            {
+                host.crawl_delay_ms = facts.crawl_delay_ms;
+                changed = true;
+            }
+
             if learned.signal == Some(TierSignal::Blocked) {
                 // Doc 05.8's exponential backoff. Separate from doc 07.6's
                 // adaptive delay, which the completion has already applied,
@@ -729,6 +742,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             return Fetched::malformed(&lease, now());
         };
 
+        let asked_ms = now();
         let (decision, entry) = self
             .robots
             .decide(
@@ -737,13 +751,20 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 &origin,
                 &lease.url,
                 lease.tier,
-                now(),
+                asked_ms,
             )
             .await;
+        // Whether this lease is the one that paid for the robots.txt fetch,
+        // which is what makes the file worth writing anything down about. The
+        // cache stamps a new entry with the millisecond it was asked for, so
+        // the only other lease this can be true for is one that hit the same
+        // host in the same millisecond and lost the race, and that one writes
+        // the same value the winner does.
+        let robots = RobotsFacts::of(&entry).filter(|_| entry.fetched_ms == asked_ms);
         if !decision.is_allowed() {
             let mut out = Fetched::excluded(&lease, now(), umi_state::ExcludeReason::Robots);
             out.disallowed = true;
-            return out;
+            return out.taught(&lease, robots);
         }
 
         let robots_checked_ms = entry.fetched_ms;
@@ -754,7 +775,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             .await
         {
             Ok(served) => served,
-            Err(_) => return Fetched::malformed(&lease, now()),
+            Err(_) => return Fetched::malformed(&lease, now()).taught(&lease, robots),
         };
         // Doc 04.5's path, off the fetcher rather than off the lease. The two
         // differ whenever the ladder moved: a build with no browser serving a
@@ -783,7 +804,9 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             )
         {
             let reason = umi_state::ExcludeReason::ContentType;
-            return Fetched::excluded(&lease, fetched_at_ms, reason).paced(pace);
+            return Fetched::excluded(&lease, fetched_at_ms, reason)
+                .paced(pace)
+                .taught(&lease, robots);
         }
 
         // Doc 05.3: a 304 is not a page. No extraction runs and no row is
@@ -805,7 +828,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 lease.tier,
                 lease.probe,
             ));
-            return out;
+            return out.taught(&lease, robots);
         }
 
         let host = host_of(&lease.url).unwrap_or_default();
@@ -843,7 +866,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             };
             let mut out = Fetched::answered(&lease, fetched_at_ms, result).paced(pace);
             out.signal = learned;
-            return out;
+            return out.taught(&lease, robots);
         }
 
         // The second half, which needed the parse. A page filtered out by
@@ -853,7 +876,9 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             && !filter.accepts_lang(e.meta.declared_lang.as_deref())
         {
             let reason = umi_state::ExcludeReason::ContentType;
-            return Fetched::excluded(&lease, fetched_at_ms, reason).paced(pace);
+            return Fetched::excluded(&lease, fetched_at_ms, reason)
+                .paced(pace)
+                .taught(&lease, robots);
         }
 
         // Doc 07.5, both halves of it. AIPREF attaches a preference two ways,
@@ -933,14 +958,8 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         let learned = match reval_signal(&lease, &row, audited) {
             None => learned,
             Some(reval) => {
-                let mut learned = learned.unwrap_or(Learned {
-                    host: lease.key.host,
-                    signal: None,
-                    tier: lease.tier,
-                    probe: lease.probe,
-                    weak: 0,
-                    lie: false,
-                });
+                let mut learned = learned
+                    .unwrap_or_else(|| Learned::nothing(lease.key.host, lease.tier, lease.probe));
                 match reval {
                     Reval::Weak => learned.weak += 1,
                     Reval::Lie => learned.lie = true,
@@ -971,6 +990,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             disallowed: false,
             signal: learned,
         }
+        .taught(&lease, robots)
     }
 
     /// Doc 05.3's sampled check on a 304, which is the only way to catch an
@@ -1120,18 +1140,71 @@ struct Learned {
     /// Whether the host was caught saying 304 about content that had moved.
     /// Doc 05.3's second trap, which takes one.
     lie: bool,
+    /// What the host's robots.txt asked for, on the one lease a day that
+    /// fetched the file. `None` on every other lease, including the ones that
+    /// read the same file out of the cache, which is what keeps this off the
+    /// per page bill.
+    robots: Option<RobotsFacts>,
+}
+
+/// What one robots.txt fetch said about the host that owns it, beyond the
+/// allow and disallow rules the cache already holds.
+///
+/// Doc 07.4 puts the crawl delay in the host record rather than in the robots
+/// cache, because doc 07.6's pacer reads the host record and never sees a
+/// parsed file. Until this existed the pacer never saw a site's `Crawl-delay`
+/// at all, so a site asking for one request every ten seconds got one every
+/// second, which is the request the file was written to stop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RobotsFacts {
+    /// The delay the file asked for, already clamped by umi-robots to doc
+    /// 07.4's bounds of 100 ms to 300 s. `None` is a file with no
+    /// `Crawl-delay` line on it, and it clears a delay the host used to have
+    /// rather than leaving the old number in place, because a site that took
+    /// the line out asked for exactly that.
+    crawl_delay_ms: Option<u32>,
+}
+
+impl RobotsFacts {
+    /// What a cache entry teaches, if it is a file the origin actually served.
+    ///
+    /// Nothing is learned from the three provenances that are not a parse. A
+    /// 5xx disallows the host for a day under RFC 9309 2.3.1.4 and carries no
+    /// delay, and writing its empty delay into the host record would throw
+    /// away a number the site published, so that the day the file came back
+    /// the site would be crawled at the default pace instead of its own.
+    fn of(entry: &RobotsEntry) -> Option<Self> {
+        if entry.robots.provenance() != Provenance::Parsed {
+            return None;
+        }
+        let crawl_delay_ms = entry
+            .robots
+            .crawl_delay()
+            .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
+        Some(Self { crawl_delay_ms })
+    }
 }
 
 impl Learned {
-    /// The tier half of one answer, with nothing learned about revalidation.
-    const fn tiered(host: umi_types::HostId, signal: TierSignal, tier: Tier, probe: bool) -> Self {
+    /// One answer that has taught nothing yet, which is where the paths that
+    /// learn one thing at a time start.
+    const fn nothing(host: umi_types::HostId, tier: Tier, probe: bool) -> Self {
         Self {
             host,
-            signal: Some(signal),
+            signal: None,
             tier,
             probe,
             weak: 0,
             lie: false,
+            robots: None,
+        }
+    }
+
+    /// The tier half of one answer, with nothing learned about revalidation.
+    const fn tiered(host: umi_types::HostId, signal: TierSignal, tier: Tier, probe: bool) -> Self {
+        Self {
+            signal: Some(signal),
+            ..Self::nothing(host, tier, probe)
         }
     }
 
@@ -1154,7 +1227,7 @@ impl Learned {
     /// that wants more than T1. There is nothing to learn from it and nothing
     /// to write, so it never becomes a lookup.
     const fn teaches(&self) -> bool {
-        if self.weak > 0 || self.lie {
+        if self.weak > 0 || self.lie || self.robots.is_some() {
             return true;
         }
         match self.signal {
@@ -1184,6 +1257,9 @@ fn learn(signals: &mut Vec<Learned>, learned: Learned) {
     }
     seen.weak = seen.weak.saturating_add(learned.weak);
     seen.lie |= learned.lie;
+    // First one wins, and there is only ever one: the cache fetches a host's
+    // robots.txt once and every other lease in the tick reads that entry.
+    seen.robots = seen.robots.or(learned.robots);
 }
 
 /// Which of doc 05.3's two traps this answer walked into, if either.
@@ -1272,6 +1348,21 @@ impl Fetched {
     /// it, and the request still happened, so the politeness timer still moves.
     fn paced(mut self, pace: Pace) -> Self {
         self.outcome.pace = pace;
+        self
+    }
+
+    /// Attach what this lease's robots.txt fetch taught about the host.
+    ///
+    /// Every exit out of [`Crawler::one`] past the robots check goes through
+    /// here, including the ones that failed, because what the file said about
+    /// the host is true whatever happened to the URL afterwards. A lease that
+    /// read the file out of the cache passes `None` and this does nothing.
+    fn taught(mut self, lease: &umi_state::Lease, robots: Option<RobotsFacts>) -> Self {
+        if robots.is_some() {
+            self.signal
+                .get_or_insert_with(|| Learned::nothing(lease.key.host, lease.tier, lease.probe))
+                .robots = robots;
+        }
         self
     }
 }

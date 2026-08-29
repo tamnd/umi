@@ -378,7 +378,7 @@ fn not_modified() -> Outcome {
 /// Rows in a vector, which is what a test wants and what `umi crawl --dry-run`
 /// wants for a different reason.
 #[derive(Default)]
-struct Collected(Mutex<Vec<PageRow>>);
+pub(crate) struct Collected(Mutex<Vec<PageRow>>);
 
 #[async_trait::async_trait]
 impl Sink for Collected {
@@ -392,7 +392,7 @@ impl Sink for Collected {
 }
 
 impl Collected {
-    fn rows(&self) -> Vec<PageRow> {
+    pub(crate) fn rows(&self) -> Vec<PageRow> {
         self.0.lock().expect("not poisoned").clone()
     }
 }
@@ -429,7 +429,7 @@ fn config() -> CrawlConfig {
 }
 
 /// A state layer with `urls` already in the frontier.
-async fn seeded(urls: &[&str]) -> Arc<dyn State> {
+pub(crate) async fn seeded(urls: &[&str]) -> Arc<dyn State> {
     let state = Arc::new(MemoryState::new());
     let batch: Vec<Candidate<'_>> = urls
         .iter()
@@ -504,7 +504,7 @@ async fn drain<F: Fetch>(
     panic!("the crawl did not drain in 64 ticks: {total:?}");
 }
 
-fn page(title: &str, links: &[&str]) -> String {
+pub(crate) fn page(title: &str, links: &[&str]) -> String {
     let mut out = format!(
         "<html lang='en'><head><title>{title}</title></head><body><h1>{title}</h1><p>Some prose about the subject, at a length that extracts to something.</p>"
     );
@@ -757,27 +757,6 @@ async fn a_disallowed_url_is_never_fetched() {
         crawler.fetcher().asked()
     );
     assert!(sink.rows().is_empty());
-}
-
-#[tokio::test]
-async fn a_server_error_on_robots_disallows_the_whole_host() {
-    // RFC 9309 section 2.3.1.4. A 5xx is not an empty file.
-    let state = seeded(&["https://example.com/a"]).await;
-    let fetch = Canned::new()
-        .outcome(
-            "https://example.com/robots.txt",
-            Outcome::Failed {
-                failure: umi_fetch::Failure::ServerError,
-                status: Some(503),
-                retry_after: None,
-            },
-        )
-        .html("https://example.com/a", &page("A", &[]));
-    let crawler = crawler(fetch, state);
-
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(report.disallowed, 1);
-    assert!(!crawler.fetcher().asked_for("https://example.com/a"));
 }
 
 #[tokio::test]
