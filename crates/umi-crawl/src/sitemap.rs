@@ -174,7 +174,7 @@ where
     // One entry, read once. It gives the starting points, the crawl delay and
     // the decision for every request below, and refetching it per sitemap would
     // be three requests for one file on a host that has done nothing wrong.
-    let entry = robots
+    let (entry, _) = robots
         .entry(fetch, host, origin, Tier::Plain, clock.now_ms())
         .await;
     let default_ms = u64::from(HostRow::INITIAL_DELAY_MS);

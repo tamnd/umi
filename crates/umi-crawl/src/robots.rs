@@ -81,9 +81,13 @@ impl RobotsCache {
     /// What robots.txt says about `url`, fetching the file first if we do not
     /// have a fresh copy.
     ///
-    /// The decision and the entry it came from, because the caller wants the
-    /// crawl delay and the `Content-Usage` value off the same entry and going
-    /// back for them would be a second lock.
+    /// The decision, the entry it came from, and whether this call is the one
+    /// that fetched the file. The entry comes back because the caller wants
+    /// the crawl delay and the `Content-Usage` value off it and going back for
+    /// them would be a second lock. The flag comes back because doc 07.4's
+    /// crawl delay belongs in the host record, and writing it there on every
+    /// lease that read the file out of the cache would put a host lookup in
+    /// the hot loop for an answer that changes once a day.
     ///
     /// `tier` is the tier the lease that triggered this asked for, and it has
     /// to be honoured rather than pinned to T1. A host whose bot management
@@ -99,9 +103,9 @@ impl RobotsCache {
         url: &str,
         tier: Tier,
         now_ms: u64,
-    ) -> (Decision, Entry) {
-        let entry = self.entry(fetch, host, origin, tier, now_ms).await;
-        (entry.robots.allows_url(url), entry)
+    ) -> (Decision, Entry, bool) {
+        let (entry, fetched) = self.entry(fetch, host, origin, tier, now_ms).await;
+        (entry.robots.allows_url(url), entry, fetched)
     }
 
     /// The entry for a host, fetching it if it is missing or stale.
@@ -117,7 +121,7 @@ impl RobotsCache {
         origin: &str,
         tier: Tier,
         now_ms: u64,
-    ) -> Entry {
+    ) -> (Entry, bool) {
         // Two locks on purpose. The map lock is held only long enough to find
         // or install the cell, and the fetch happens inside the cell, so a
         // slow origin blocks the hosts waiting on that origin and nothing
@@ -137,16 +141,24 @@ impl RobotsCache {
             Arc::clone(existing)
         };
 
-        cell.get_or_init(|| async {
-            let robots = fetch_robots(fetch, origin, tier).await;
-            Entry {
-                robots: Arc::new(robots),
-                fetched_ms: now_ms,
-                expires_ms: now_ms + TTL_MS,
-            }
-        })
-        .await
-        .clone()
+        // Set from inside the cell, which is the only place that knows. An
+        // entry restored by a coordinator on boot, or put there by a test, has
+        // a `fetched_ms` on it and did not cost a request, so a caller cannot
+        // tell the two apart by looking at the entry.
+        let mut fetched = false;
+        let entry = cell
+            .get_or_init(|| async {
+                fetched = true;
+                let robots = fetch_robots(fetch, origin, tier).await;
+                Entry {
+                    robots: Arc::new(robots),
+                    fetched_ms: now_ms,
+                    expires_ms: now_ms + TTL_MS,
+                }
+            })
+            .await
+            .clone();
+        (entry, fetched)
     }
 
     /// Put an entry in without fetching, which is how a coordinator restores

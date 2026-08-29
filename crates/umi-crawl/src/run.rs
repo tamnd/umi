@@ -742,8 +742,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             return Fetched::malformed(&lease, now());
         };
 
-        let asked_ms = now();
-        let (decision, entry) = self
+        let (decision, entry, robots_fetched) = self
             .robots
             .decide(
                 &self.fetch,
@@ -751,16 +750,17 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 &origin,
                 &lease.url,
                 lease.tier,
-                asked_ms,
+                now(),
             )
             .await;
-        // Whether this lease is the one that paid for the robots.txt fetch,
-        // which is what makes the file worth writing anything down about. The
-        // cache stamps a new entry with the millisecond it was asked for, so
-        // the only other lease this can be true for is one that hit the same
-        // host in the same millisecond and lost the race, and that one writes
-        // the same value the winner does.
-        let robots = RobotsFacts::of(&entry).filter(|_| entry.fetched_ms == asked_ms);
+        // Only the lease that paid for the fetch writes anything down. Every
+        // other lease on this host today read the same entry out of the cache
+        // and has nothing to say the host record does not already hold.
+        let robots = if robots_fetched {
+            RobotsFacts::of(&entry)
+        } else {
+            None
+        };
         if !decision.is_allowed() {
             let mut out = Fetched::excluded(&lease, now(), umi_state::ExcludeReason::Robots);
             out.disallowed = true;
