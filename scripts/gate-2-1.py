@@ -35,6 +35,12 @@ rows with paths of length one rather than one row with a path of length two.
 That is why the same url can appear twice, and why the join keeps the delivered
 row when there is one.
 
+That is also why the answer is reported twice, by page and by site. A tier is
+a property of a site rather than of a page, and the first url fetched on a host
+is always answered at T1 because the host record has not learned anything yet.
+This sample averages four urls a domain, so the page share is short by roughly
+the one url in four that paid for the lesson, and the site share is not.
+
 Reads the crawl through `umi cat`, so it needs no parquet library.
 """
 
@@ -64,7 +70,7 @@ def main():
     ap.add_argument("--json", help="write the numbers here as well")
     args = ap.parse_args()
 
-    strata = load_strata(args.strata)
+    strata, domains = load_strata(args.strata)
     if not strata:
         die("the strata file is empty")
     rows = load_crawl(args.umi, args.crawl)
@@ -83,9 +89,11 @@ def main():
     print()
     overall(delivered, refused)
     print()
+    sites = by_site(rows, strata, domains)
+    print()
     by_stratum(rows, strata)
     print()
-    verdict(delivered, refused)
+    verdict(delivered, refused, sites)
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
@@ -95,6 +103,7 @@ def main():
                 "delivered_by_tier": delivered,
                 "refused_by_tier": refused,
                 "statuses": statuses,
+                "sites": sites,
             }, f, indent=2, sort_keys=True)
 
     # The gate is about T3 and nothing else. A T2 share above doc 05's range is
@@ -106,12 +115,13 @@ def main():
 
 
 def load_strata(path):
-    """url to stratum, as the sampler drew it."""
-    out = {}
+    """url to stratum and url to domain, as the sampler drew them."""
+    strata, domains = {}, {}
     with open(path, "r", encoding="utf-8", newline="") as f:
         for row in csv.DictReader(f):
-            out[row["url"]] = int(row["stratum"])
-    return out
+            strata[row["url"]] = int(row["stratum"])
+            domains[row["url"]] = row["domain"]
+    return strata, domains
 
 
 def load_crawl(umi, directory):
@@ -218,6 +228,58 @@ def overall(delivered, refused):
     print("  succeeded, so those pages are demand this run could not measure")
 
 
+def by_site(rows, strata, domains):
+    """The same answer counted by domain, which is what a tier belongs to.
+
+    A host record learns and every url after that on the same host is leased at
+    what it learned, so the first url on a site that needs a browser is always
+    answered at T1 and only the ones after it reach T3. At four urls a domain
+    that is a quarter of the sample answering at the wrong tier for a reason
+    that has nothing to do with the site, and the page share above wears all of
+    it.
+
+    Counting by domain does not have that problem. A domain where anything
+    reached T3 is a domain that needs a browser, and the share of urls sitting
+    on those domains is where the page share would settle once every host
+    record is warm, which is the state a real crawl spends its life in.
+    """
+    best = collections.defaultdict(int)
+    urls = collections.Counter()
+    for url, row in rows.items():
+        if url not in strata:
+            continue
+        domain = domains[url]
+        urls[domain] += 1
+        if row["status"] == 200:
+            best[domain] = max(best[domain], row["tier_used"])
+        else:
+            best.setdefault(domain, 0)
+
+    total_sites = len(best)
+    total_urls = sum(urls.values())
+    browser = [d for d, tier in best.items() if tier >= 3]
+    on_browser = sum(urls[d] for d in browser)
+    print("by site over %d domains" % total_sites)
+    print("  %-22s %8s %9s" % ("", "domains", "share"))
+    for tier in sorted(set(best.values())):
+        count = sum(1 for t in best.values() if t == tier)
+        # Tier zero here is not T0 revalidate, it is a domain that delivered
+        # nothing at all, because the running maximum starts at zero and a
+        # domain whose every url was refused never moves it.
+        name = "nothing delivered" if tier == 0 else TIER_NAMES[tier]
+        print("  %-22s %8d %8.2f%%"
+              % (name, count, 100.0 * count / total_sites))
+    print("  %d of %d urls sit on a domain that needed a browser, %.2f%%"
+          % (on_browser, total_urls,
+             100.0 * on_browser / total_urls if total_urls else 0.0))
+    return {
+        "domains": total_sites,
+        "domains_needing_a_browser": len(browser),
+        "urls_on_those_domains": on_browser,
+        "urls": total_urls,
+    }
+
+
 def by_stratum(rows, strata):
     """The same share per rank decade, which is the point of stratifying.
 
@@ -260,7 +322,7 @@ def label(stratum):
             "1M-10M", "10M-100M", "100M+")[stratum - 1]
 
 
-def verdict(delivered, refused):
+def verdict(delivered, refused, sites):
     total = sum(delivered.values())
     if not total:
         print("VERDICT: nothing was delivered, so the gate is not measured")
@@ -287,6 +349,16 @@ def verdict(delivered, refused):
           % lost)
     print("         the true share is between %.2f%% and %.2f%%"
           % (100.0 * t3, 100.0 * ceiling))
+    # The site number, which is the one to quote when sizing a pool. It counts
+    # the first url on each host at the tier the host ended up on rather than
+    # the tier it was leased at before anything was known, so it is what the
+    # share settles at on a crawl whose host records are already warm.
+    if sites["urls"]:
+        warm = sites["urls_on_those_domains"] / sites["urls"]
+        print("         %d of %d domains needed a browser and %.2f%% of urls"
+              % (sites["domains_needing_a_browser"], sites["domains"],
+                 100.0 * warm))
+        print("         sit on one, which is the share to plan the pool from")
 
 
 def die(message):
