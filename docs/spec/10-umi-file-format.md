@@ -22,10 +22,10 @@ Take a median index worthy HTML page at about 150 KB of raw bytes. Doc 11 extrac
 
 ```
 column group          logical    encoded   notes
-url + final_url          120 B      28 B   FSST, plus prefix elision within a host run
+url + final_url          120 B      28 B   zstd-3, which sees the whole column at once
 markdown                7000 B    2000 B   zstd-3 with a per shoal trained dictionary
-outlink targets         4000 B     900 B   50 links, FSST, heavy prefix sharing
-outlink anchors         1000 B     300 B   FSST
+outlink targets         4000 B     900 B   50 links, zstd-3, heavy prefix sharing
+outlink anchors         1000 B     300 B   zstd-3
 snippets                 400 B     150 B   title, description, og, h1..h3
 headers kept             300 B      60 B   dictionary, the values repeat hard
 scalar metadata          120 B      25 B   delta plus bit packing
@@ -154,7 +154,7 @@ The `snippets` list repeats what `title`, `description` and `headings` already h
 
 `receipts` is the doc 04 `Receipt` flattened, one row per delivery, including the signature, so that anyone can re verify our published corpus against the fetcher keys without trusting us. `robots` is host, fetch time, status, raw text, and the parsed decision summary from doc 07.4.
 
-Rows arrive in fetch completion order and are written in that order. We do not sort within a shoal, with one exception: the writer holds a small reorder window of 4096 rows and groups by host inside it, because host adjacency is what makes URL prefix elision pay and the window costs 25 MB of buffer for a compression win measured in doc 16's milestone 3 gate. If the win is under 5 percent the window comes out.
+Rows arrive in fetch completion order and are written in that order and there is no sorting within a shoal at all. This spec originally kept one exception, a reorder window of 4096 rows grouped by host, because host adjacency is what makes URL prefix elision pay, and said the window comes out if the win is under 5 percent. It was measured with the rest of 10.6. Sorting 15000 real crawled URLs before encoding took the `url` column from 20.5 bytes a URL to 16.3, and the `url` column is half a percent of a segment, so the whole window buys a tenth of a percent of the file for 25 MB of buffer and a hold on rows that have already been fetched. It came out.
 
 ## 10.6 Encodings
 
@@ -164,7 +164,13 @@ One cascade, applied per column chunk, chosen by the writer from a fixed set. No
 
 **Small enums.** `outcome`, `tier_used`, `status`, `lang`, `content_type`, `verification` are dictionary encoded with the dictionary in the chunk header and the codes bit packed. `status` in a healthy crawl is 200 more than 90 percent of the time, so the code column is under 2 bits per row.
 
-**Short high cardinality strings.** `url`, `final_url`, `links.href`, `links.anchor`, `title` use FSST with a symbol table trained per chunk on a 16 KiB sample. FSST gives random access at roughly memcpy speed and 2 to 3 times compression on URL shaped data, and it composes with what comes next. URLs additionally get prefix elision against the previous value, which inside a host run reduces most URLs to their differing tail. Together these two are the reason a URL costs 28 bytes and not 120.
+**Short high cardinality strings.** `url`, `final_url`, `links.href`, `links.anchor` and `title` take plain plus zstd level 3, the same as long text.
+
+This spec originally called for FSST here, with a symbol table trained per chunk, and said that FSST plus prefix elision against the previous value was the reason a URL costs 28 bytes and not 120. It was implemented and measured against zstd on server3 and it lost badly. On 15000 real crawled URLs a symbol table cost 36.5 bytes a URL against zstd's 20.5. On the sample `links.href` column it cost 10.1 bytes a link against 2.6. Over a whole segment it took 673 bytes a page to 1155.
+
+The reason is chunk size, and it is not something a better symbol table fixes. A symbol table holds 255 symbols of at most 8 bytes, so the longest thing it can notice is eight characters. zstd is looking at a megabyte of one column at once, and in a megabyte of URLs the repeated thing is not `https://`, it is the whole host and most of the path, over and over. FSST is measured in the literature against decompressing one value without touching its neighbours, which is a real problem for a database doing random access into a string column and is not a problem this format has: 10.1 says the only reader is a sequential converter.
+
+The one axis the symbol table won on is decode, 214 ms against 247 ms for a whole segment, which is under a tenth of a percent of doc 12's 30 second conversion budget. That is not worth 72 percent more disk on a box where doc 01 says disk is the binding constraint. Prefix elision was measured on its own by sorting the column first, which is the best case for it, and took the `url` column from 20.5 bytes to 16.3, which is 20 percent of a column that is half a percent of a segment. Both are gone.
 
 **Long text.** `markdown` is the only column where a general purpose compressor earns its keep. Plain zstd level 3, no dictionary. Level 3 rather than higher because doc 01 gives us 2 vCPU and level 3 compresses at around 300 MB/s per core against level 9 at 25 MB/s, and the ratio difference on already extracted markdown is under 8 percent.
 
@@ -172,7 +178,7 @@ This spec originally called for a zstd dictionary trained per shoal over a 2 MiB
 
 **Digests, minhash and simhash.** Stored raw. They are uniformly random by construction and any attempt to compress them costs CPU to produce a slightly larger output. The writer skips them explicitly rather than discovering this per chunk.
 
-**Lists and maps.** The Arrow layout, and a child column encoded by its own rule. Arrow holds a list's shape as absolute offsets, but what goes on disk is the per row lengths, because the deltas of a monotonic offsets column are exactly those lengths and storing them directly saves the reader a subtraction pass and saves the writer from having to decide what to do about an offsets column that does not start at zero. The reader runs a prefix sum to get Arrow's offsets back. `links` decomposes into four sibling child columns rather than an interleaved struct, which is what lets `links.href` share a FSST symbol table across all links in the shoal.
+**Lists and maps.** The Arrow layout, and a child column encoded by its own rule. Arrow holds a list's shape as absolute offsets, but what goes on disk is the per row lengths, because the deltas of a monotonic offsets column are exactly those lengths and storing them directly saves the reader a subtraction pass and saves the writer from having to decide what to do about an offsets column that does not start at zero. The reader runs a prefix sum to get Arrow's offsets back. `links` decomposes into four sibling child columns rather than an interleaved struct, which is what lets `links.href` be compressed as one run of URLs across all links in the shoal instead of interleaved with anchors and flags.
 
 **Nulls.** A validity bitmap per chunk, omitted entirely when the chunk has no nulls, which is the common case for most columns.
 
@@ -206,11 +212,10 @@ The writer holds one shoal being filled in unencoded column builders and one sho
 default budget          256 MB
   filling shoal          ~90 MB
   encoding shoal         ~90 MB
-  FSST symbol training    ~4 MB
-  slack                   ~71 MB
+  slack                   ~75 MB
 ```
 
-Doc 03.4 caps `umid` on server1 at 1.5 GB RSS and doc 01 says server1 has essentially no free memory. So the writer takes a floor of 64 MB, and under the floor the shoal cap drops to 8 MiB and only one shoal is in flight at a time. That costs compression ratio, because symbol tables are trained on a quarter as much data and prefix elision has less to work with. The expected cost is 8 to 12 percent more bytes, and the measured cost is a milestone 3 number. It is the correct trade on a box with zero free RAM and it must be a configuration value, not a rebuild.
+Doc 03.4 caps `umid` on server1 at 1.5 GB RSS and doc 01 says server1 has essentially no free memory. So the writer takes a floor of 64 MB, and under the floor the shoal cap drops to 8 MiB and only one shoal is in flight at a time. That costs compression ratio, because zstd gets a quarter as much of a column to find repeats in, and 10.6 is clear that the size of the chunk is where nearly all of the ratio comes from. The expected cost is 8 to 12 percent more bytes, and the measured cost is a milestone 3 number. It is the correct trade on a box with zero free RAM and it must be a configuration value, not a rebuild.
 
 Encoding is done on a rayon pool, one column chunk per task, because columns are independent and the encode of a full shoal is around 120 ms of single core work that we would rather not add to the fetch loop's latency.
 
@@ -218,7 +223,7 @@ Encoding is done on a rayon pool, one column chunk per task, because columns are
 
 The reader opens the file, parses the footer, and hands out shoals. There is no buffer pool, no page cache management and no eviction policy, because the whole file is 128 MB and the only reader is a converter that walks it once.
 
-This spec originally said the reader mmaps the file and exposes uncompressed fixed width columns as slices into the mapping with no copy at all. That is not reachable here. The workspace denies `unsafe_code`, and every safe mmap wrapper is unsound by construction, because another process truncating the file turns a live slice into a SIGBUS with no way for the type system to have stopped it. So the reader does positioned reads instead: one `read_exact_at` per shoal into a reusable buffer, then decode out of that buffer. The read is a single sequential 32 MiB call rather than a page fault storm, the kernel's readahead does the work mmap would have done, and the cost against the mmap plan is one memcpy per shoal, which is under a percent of a decode that has to run zstd and FSST anyway. Digest and minhash columns still cost nothing to decode, they just get sliced out of the shoal buffer rather than out of a mapping. Bit packed columns decode into a caller supplied reusable buffer, one shoal's worth at a time. FSST and zstd columns must be decompressed, and that is unavoidable and is most of the read cost.
+This spec originally said the reader mmaps the file and exposes uncompressed fixed width columns as slices into the mapping with no copy at all. That is not reachable here. The workspace denies `unsafe_code`, and every safe mmap wrapper is unsound by construction, because another process truncating the file turns a live slice into a SIGBUS with no way for the type system to have stopped it. So the reader does positioned reads instead: one `read_exact_at` per shoal into a reusable buffer, then decode out of that buffer. The read is a single sequential 32 MiB call rather than a page fault storm, the kernel's readahead does the work mmap would have done, and the cost against the mmap plan is one memcpy per shoal, which is under a percent of a decode that has to run zstd anyway. Digest and minhash columns still cost nothing to decode, they just get sliced out of the shoal buffer rather than out of a mapping. Bit packed columns decode into a caller supplied reusable buffer, one shoal's worth at a time. zstd columns must be decompressed, and that is unavoidable and is most of the read cost.
 
 The API is deliberately small:
 
@@ -250,9 +255,9 @@ Doc 12 owns the schemas and the upload. What belongs here is why the conversion 
 
 A shoal becomes a Parquet row group, one to one. The logical values never change, so there is no re extraction, no re canonicalisation, and no schema mapping beyond names.
 
-Column by column: dictionary encoded columns map onto Parquet `RLE_DICTIONARY` with the dictionary carried over and the codes re emitted, which is cheap. zstd compressed `markdown` passes through byte for byte, since the Parquet page compression codec is also zstd and the frame is already valid, so the single largest column costs zero CPU to convert. Bit packed integer columns are unpacked and re emitted as Parquet's own bit packing, which is a decode and encode but on cheap data. FSST columns are the real cost, because Parquet has no FSST, so `url`, `links.href` and friends decode from FSST and re encode as plain plus zstd, which loses some ratio and spends most of the conversion's CPU.
+Column by column: dictionary encoded columns map onto Parquet `RLE_DICTIONARY` with the dictionary carried over and the codes re emitted, which is cheap. zstd compressed `markdown` passes through byte for byte, since the Parquet page compression codec is also zstd and the frame is already valid, so the single largest column costs zero CPU to convert. Bit packed integer columns are unpacked and re emitted as Parquet's own bit packing, which is a decode and encode but on cheap data. The short string columns pass through the same way `markdown` does, because 10.6 settled on zstd for them too and a zstd frame is a zstd frame.
 
-Measured expectation is around 40 percent of one core to convert a 128 MB segment in under 30 seconds, which fits inside doc 12's 10 minute seal to deleted budget with the remainder going to upload and verification. If FSST conversion turns out to dominate, the fallback is to store `url` as plain plus zstd in `.umi` too and accept a larger local file, which trades disk we barely have for CPU we barely have. That trade gets made on measurement, not now.
+Measured expectation is around 40 percent of one core to convert a 128 MB segment in under 30 seconds, which fits inside doc 12's 10 minute seal to deleted budget with the remainder going to upload and verification. This got easier than the spec first thought it would be. The original plan had `url` and `links.href` in FSST, which Parquet has no encoding for, so they would have been decoded and re encoded and would have spent most of the conversion's CPU. 10.6 measured FSST out, so those columns now pass through as zstd frames like everything else textual.
 
 ## 10.11 What this format is not
 

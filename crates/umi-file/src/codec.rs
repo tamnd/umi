@@ -12,13 +12,38 @@
 //! because a segment a reader cannot decode is a bug to fix within the hour and
 //! not a compatibility problem to route around.
 //!
-//! # What is not here yet
+//! # Why there is no FSST here
 //!
-//! FSST, which doc 10.6 wants for `url`, `final_url`, `links.href`,
-//! `links.anchor` and `title`, and which is most of the reason a URL costs 28
-//! bytes in doc 10.2's table rather than 120. Those columns take zstd for now,
-//! which is the fallback doc 10.10 names for the other direction, and issue 90
-//! carries the work with the ratio measured either way.
+//! Doc 10.6 puts a symbol table at the top of the cascade for the short string
+//! columns and says it is most of the reason a URL costs 28 bytes in doc 10.2's
+//! table rather than 120. Issue 90 built it and measured it against zstd, and
+//! zstd won by so much that the symbol table does not go in. The numbers, on
+//! server3, pinned, with `fsst-rs` 0.6 and zstd at level 3:
+//!
+//! ```text
+//! corpus                     zstd        symbol table
+//! 15000 real crawled URLs     20.5 B/url   36.5 B/url
+//! the sample url column        3.3 B/url   10.3 B/url
+//! the sample links.item.href   2.6 B/link  10.1 B/link
+//! a whole segment            673 B/page  1155 B/page
+//! ```
+//!
+//! The reason is the chunk size and it is not a tuning problem. A symbol table
+//! holds 255 symbols of at most 8 bytes, so the longest thing it can notice is
+//! eight characters. zstd is looking at a megabyte of one column at once, and
+//! in a megabyte of URLs the repeated thing is not `https://` but the whole
+//! host and most of the path, over and over. FSST is measured in the paper
+//! against decompressing one value without its neighbours, which is a real
+//! problem for a database doing random access into a string column and is not
+//! a problem umi has: doc 10.1 says the only reader is a sequential converter.
+//!
+//! The one axis the symbol table did win on is decode, at 214 ms against 247 ms
+//! for a whole segment. Doc 12 gives the converter 30 seconds a segment, so
+//! that is under a tenth of a percent of the budget, against 72 percent more
+//! disk on a box where doc 01 says disk is the binding constraint. Issue 90's
+//! rule was 5 percent either way, so this is not close.
+//!
+//! # What is not here yet
 //!
 //! The bit packing here is a plain LSB first layout rather than doc 10.6's
 //! FastLanes 1024 value interleaved one. Same bit width, same bytes per value,
@@ -46,9 +71,9 @@ pub enum Codec {
     /// `fetched_at_ms` deltas fit in 20 bits and the column costs about 2.5
     /// bytes a row rather than 8.
     Frame = 3,
-    /// zstd level 3 with a dictionary trained per shoal. The only place a
-    /// general purpose compressor earns its keep, and for now also the stand in
-    /// for FSST.
+    /// zstd level 3 with a dictionary trained per shoal. Everything textual,
+    /// which is the long documents doc 10.6 names and also the short string
+    /// columns it does not, for the reason in this module's header.
     Zstd = 4,
 }
 
