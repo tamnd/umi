@@ -35,7 +35,7 @@ use umi_crawl::render::RenderPolicy;
 use umi_crawl::robots::{Entry, TTL_MS};
 use umi_crawl::run::{CrawlConfig, CrawlError, Crawler, Sink, TickReport};
 use umi_fetch::outcome::{Page, Version};
-use umi_fetch::{FetchError, Media, Outcome};
+use umi_fetch::{FetchError, Media, Outcome, Served};
 use umi_state::{Budget, Candidate, MemoryState, State};
 use umi_types::{FetcherId, Revalidator, RowKey, Tier};
 
@@ -417,8 +417,8 @@ impl Fetch for Wire {
         &self,
         url: &str,
         _revalidate: Option<&Revalidator>,
-        _tier: umi_types::Tier,
-    ) -> Result<Outcome, FetchError> {
+        tier: umi_types::Tier,
+    ) -> Result<Served, FetchError> {
         if self.latency {
             tokio::time::sleep(latency_of(host_index(url))).await;
         }
@@ -433,7 +433,7 @@ impl Fetch for Wire {
         if let Outcome::Ok(page) = &mut out {
             page.final_url = url.to_owned();
         }
-        Ok(out)
+        Ok(Served::at(tier, out))
     }
 }
 

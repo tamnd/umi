@@ -301,7 +301,7 @@ fn push(queue: &mut Vec<(String, u8)>, visited: &mut HashSet<String>, url: Strin
 /// Never conditional. A sitemap is polled rather than stored, so there is no
 /// revalidator to send and a 304 would leave us with no document to read.
 async fn get<F: Fetch + ?Sized>(fetch: &F, url: &str) -> Option<Vec<u8>> {
-    match fetch.fetch(url, None, Tier::Plain).await {
+    match fetch.fetch(url, None, Tier::Plain).await.map(|s| s.outcome) {
         Ok(umi_fetch::Outcome::Ok(page)) if (200..300).contains(&page.status) => {
             Some(page.body.to_vec())
         }

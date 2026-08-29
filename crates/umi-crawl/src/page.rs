@@ -170,9 +170,15 @@ pub struct Crawled<'a> {
     pub extracted: Option<&'a Extracted>,
     /// The tier that produced this answer.
     pub tier_used: Tier,
-    /// Every tier that was tried, cheapest first, ending in `tier_used`. Doc
-    /// 05.10 publishes the distribution of these and it is the statistic the
-    /// whole ladder exists to justify.
+    /// Every tier that was tried, starting at the one the lease asked for and
+    /// ending at `tier_used`. Doc 05.10 publishes the distribution of these
+    /// and it is the statistic the whole ladder exists to justify, so it has
+    /// to be the rungs that ran rather than the rung that was wanted.
+    ///
+    /// Usually one entry. Two when the fetcher moved, which it does when this
+    /// build has no browser for a host that wants one, and when a browser
+    /// hands back something that is not a document and the plain client
+    /// finishes the job.
     pub tier_path: &'a [Tier],
     /// When robots was last checked for this host, from doc 07.
     pub robots_checked_ms: u64,

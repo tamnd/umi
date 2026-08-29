@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use umi_fetch::outcome::{Page, Version};
-use umi_fetch::{FetchError, Media, Outcome};
+use umi_fetch::{FetchError, Media, Outcome, Served};
 use umi_state::{Budget, Candidate, MemoryState, State};
 use umi_types::{FetcherId, Revalidator, Tier};
 
@@ -91,17 +91,21 @@ impl Fetch for Canned {
         &self,
         url: &str,
         _revalidate: Option<&Revalidator>,
-        _tier: umi_types::Tier,
-    ) -> Result<Outcome, FetchError> {
+        tier: umi_types::Tier,
+    ) -> Result<Served, FetchError> {
         self.asked
             .lock()
             .expect("not poisoned")
             .push(url.to_owned());
-        Ok(self.pages.get(url).cloned().unwrap_or(Outcome::Failed {
+        // Every canned answer comes off the rung it was asked for, since there
+        // is no ladder here to move between them. The tests that care about a
+        // path that moved build it themselves.
+        let outcome = self.pages.get(url).cloned().unwrap_or(Outcome::Failed {
             failure: umi_fetch::Failure::NotFound,
             status: Some(404),
             retry_after: None,
-        }))
+        });
+        Ok(Served::at(tier, outcome))
     }
 
     fn render_capacity(&self) -> Option<f64> {
@@ -144,7 +148,7 @@ impl Fetch for Timed {
         url: &str,
         revalidate: Option<&Revalidator>,
         tier: umi_types::Tier,
-    ) -> Result<Outcome, FetchError> {
+    ) -> Result<Served, FetchError> {
         self.sent
             .lock()
             .expect("not poisoned")
@@ -188,11 +192,37 @@ impl Fetch for Flip {
         url: &str,
         revalidate: Option<&Revalidator>,
         tier: umi_types::Tier,
-    ) -> Result<Outcome, FetchError> {
+    ) -> Result<Served, FetchError> {
         if url == self.url && self.blocking.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(blocked());
+            return Ok(Served::at(tier, blocked()));
         }
         self.inner.fetch(url, revalidate, tier).await
+    }
+}
+
+/// A fetcher with no browser, answering leases that wanted one.
+///
+/// Doc 05.4 says a missing rung is served from the rung below rather than
+/// being an error, and doc 04.5 says the answer carries the rungs it took.
+/// Everything a lease asks for above T1 comes back off T1 here, with the path
+/// saying so, which is the shape a build without the `render` feature has on
+/// every host doc 05.8 has escalated.
+struct NoBrowser(Canned);
+
+#[async_trait::async_trait]
+impl Fetch for NoBrowser {
+    async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+        tier: umi_types::Tier,
+    ) -> Result<Served, FetchError> {
+        let served = self.0.fetch(url, revalidate, tier).await?;
+        Ok(Served::descended(tier, Tier::Plain, served.outcome))
+    }
+
+    fn render_capacity(&self) -> Option<f64> {
+        self.0.render_capacity()
     }
 }
 
@@ -247,7 +277,7 @@ impl Fetch for Cache {
         url: &str,
         revalidate: Option<&Revalidator>,
         tier: umi_types::Tier,
-    ) -> Result<Outcome, FetchError> {
+    ) -> Result<Served, FetchError> {
         if url != self.url {
             return self.inner.fetch(url, revalidate, tier).await;
         }
@@ -258,14 +288,17 @@ impl Fetch for Cache {
             log.push(sent);
             first
         };
-        Ok(match (self.mode, sent) {
-            (Mode::Honest | Mode::Lying, true) => not_modified(),
-            // A lying origin has to serve the real page once before it can lie
-            // about it, because the lie is a claim that the page has not
-            // changed since the copy we hold.
-            (Mode::Lying, false) if !first => tagged(url, &page("Moved on", &[])),
-            _ => tagged(url, &self.body),
-        })
+        Ok(Served::at(
+            tier,
+            match (self.mode, sent) {
+                (Mode::Honest | Mode::Lying, true) => not_modified(),
+                // A lying origin has to serve the real page once before it can lie
+                // about it, because the lie is a claim that the page has not
+                // changed since the copy we hold.
+                (Mode::Lying, false) if !first => tagged(url, &page("Moved on", &[])),
+                _ => tagged(url, &self.body),
+            },
+        ))
     }
 }
 
@@ -1936,6 +1969,62 @@ async fn a_page_deferred_for_a_busy_browser_is_not_a_failure() {
         assert_eq!(row.consecutive_failures, 0);
         assert_eq!(row.tier.preferred, Tier::Rendered, "the ladder moved");
     }
+}
+
+#[tokio::test]
+async fn a_row_records_the_rungs_that_ran_and_not_the_rung_it_asked_for() {
+    // Doc 05.5 publishes `tier_used` and `tier_path` as the record of which
+    // fraction of the web needs which tier. The host here has escalated to a
+    // browser and this build has no browser, so doc 05.4 serves the page from
+    // T1 and the row has to say T1. A row that repeated the lease back would
+    // put a rendered page in that dataset for a page nothing rendered, and the
+    // dataset is the whole reason for the column.
+    let url = "https://example.com/a";
+    let memory = Arc::new(MemoryState::new());
+    let mut seed = Candidate::new(url, T0).expect("a crawlable url");
+    seed.discovery = umi_state::Discovery::Seed;
+    memory.admit(&[seed]).await.expect("admit");
+    let state: Arc<dyn State> = Arc::clone(&memory) as Arc<dyn State>;
+    wants_rendering(&state, &[url]).await;
+
+    let inner = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html(url, &page("A", &[]));
+    let clock = Arc::new(FixedClock::at(T0));
+    let crawler = Crawler::new(
+        Arc::new(NoBrowser(inner)),
+        Arc::clone(&state),
+        Arc::clone(&clock),
+        CrawlConfig {
+            max_tier: Tier::Rendered,
+            ..config()
+        },
+    );
+
+    let sink = Collected::default();
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.rows, 1);
+
+    let row = sink.rows().remove(0);
+    assert_eq!(row.tier_used, Tier::Plain.as_u8(), "T1 answered");
+    assert_eq!(
+        row.tier_path,
+        vec![Tier::Rendered.as_u8(), Tier::Plain.as_u8()],
+        "the lease wanted a browser and did not get one"
+    );
+
+    // The ledger keeps the same answer, since its field is documented as the
+    // tier that produced the answer too.
+    let key = umi_types::RowKey::for_url(url, None).expect("a crawlable url");
+    let ledger = memory.row(&key).expect("a ledger row");
+    assert_eq!(ledger.tier_used, Tier::Plain);
+
+    // The host ladder is the one thing that does not move. Doc 05.8 learns
+    // from the tier the lease was for, because this page came back off T1 only
+    // because there is no browser here, which is not evidence that the host
+    // stopped needing one.
+    let host = state.host(key.host).await.expect("host").expect("a record");
+    assert_eq!(host.tier.preferred, Tier::Rendered, "the ladder stayed put");
 }
 
 #[tokio::test]

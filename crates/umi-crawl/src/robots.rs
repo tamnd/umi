@@ -180,7 +180,10 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
     // Never conditional. A stale robots.txt that a 304 confirmed is still a
     // file we are about to re-read from a cache we already dropped, so the
     // saving is nothing and the code path is one more thing to get wrong.
-    match fetch.fetch(&url, None, tier).await {
+    // The rungs it took are not this function's business. A robots.txt that
+    // came back over plain HTTP because the browser would not hand back a
+    // `text/plain` body is still this origin's robots.txt.
+    match fetch.fetch(&url, None, tier).await.map(|s| s.outcome) {
         Ok(umi_fetch::Outcome::Ok(page)) => Robots::for_status(page.status, page.body.as_ref()),
         // A 304 cannot happen because nothing above sends a conditional
         // request for robots.txt, and a redirect off the origin is not this

@@ -67,11 +67,15 @@ pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
         .enable_all()
         .build()
         .map_err(Error::Io)?;
-    let outcome = runtime.block_on(fetcher.fetch(parsed.as_str(), None, asked))?;
+    let served = runtime.block_on(fetcher.fetch(parsed.as_str(), None, asked))?;
+    // The rung that answered rather than the rung that was asked for. They
+    // are the same here, since `asked` is already clamped to what this build
+    // has, but reading it off the answer is how it stays that way.
+    let used = served.path.used();
 
-    match outcome {
+    match served.outcome {
         Outcome::Ok(page) => {
-            report(&page, &parsed, asked);
+            report(&page, &parsed, used);
             if show.headers {
                 section("headers");
                 for (name, value) in &page.headers_kept {

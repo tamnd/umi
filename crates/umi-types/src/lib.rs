@@ -249,6 +249,88 @@ impl Tier {
     }
 }
 
+/// The rungs one fetch climbed, in the order it tried them.
+///
+/// Doc 04.5 gives `[1, 2]` as the example, T1 blocked and T2 worked, and doc
+/// 05.5 sells the published column as the record of which fraction of the web
+/// needs which tier, per month, per TLD, per host. Both of those want the
+/// rungs that ran and not the rung the lease asked for, which is why this is a
+/// type rather than the caller writing down what it requested.
+///
+/// The last rung is the one that answered, so a path is never empty and the
+/// tier a row reports is [`used`](Self::used) rather than a separate field
+/// that could disagree with the path beside it.
+///
+/// Inline rather than a `Vec` because the ladder is five rungs tall, so the
+/// longest path there could ever be fits in five bytes, and a fetch in the 250
+/// pages a second loop should not allocate in order to say it used one rung.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct TierPath {
+    rungs: [Tier; Self::MAX],
+    len: u8,
+}
+
+impl TierPath {
+    /// The longest a path can be, which is the height of the ladder.
+    pub const MAX: usize = Tier::ALL.len();
+
+    /// A path with one rung on it, which is what nearly every fetch is.
+    #[must_use]
+    pub const fn new(first: Tier) -> Self {
+        Self {
+            rungs: [first; Self::MAX],
+            len: 1,
+        }
+    }
+
+    /// The same path with one more rung on the end.
+    ///
+    /// A path longer than the ladder cannot happen, since a fetch walks the
+    /// rungs in one direction, so a full path keeps what it has instead of
+    /// panicking. Losing a rung off the end of a column is a smaller harm than
+    /// taking a fetcher down over one.
+    #[must_use]
+    pub const fn then(mut self, next: Tier) -> Self {
+        if (self.len as usize) < Self::MAX {
+            self.rungs[self.len as usize] = next;
+            self.len += 1;
+        }
+        self
+    }
+
+    /// The rungs, in the order they were tried.
+    #[must_use]
+    pub fn as_slice(&self) -> &[Tier] {
+        &self.rungs[..self.len as usize]
+    }
+
+    /// The rung that answered, which is the last one tried.
+    #[must_use]
+    pub const fn used(&self) -> Tier {
+        self.rungs[self.len as usize - 1]
+    }
+
+    /// The rung the fetch started on, which is the one the lease asked for.
+    #[must_use]
+    pub const fn asked(&self) -> Tier {
+        self.rungs[0]
+    }
+
+    /// How many rungs are on it.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    /// Always false. Here because clippy asks for it next to `len`, and
+    /// because a path with no rungs on it would mean a fetch that never
+    /// happened, which the caller would have no outcome for.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        false
+    }
+}
+
 /// What one response said about the tier it was fetched at, from doc 05.8.
 ///
 /// Three answers rather than a status code, because the status is not the
@@ -664,6 +746,51 @@ mod tests {
         assert!(Tier::Emulated < Tier::Rendered);
         assert!(Tier::Rendered < Tier::Supervised);
         assert_eq!(Tier::default(), Tier::Plain);
+    }
+
+    #[test]
+    fn a_path_of_one_rung_says_that_rung_asked_and_answered() {
+        // The shape nearly every fetch has, and the reason a row does not need
+        // a separate tier_used field beside the path.
+        let path = TierPath::new(Tier::Plain);
+        assert_eq!(path.as_slice(), [Tier::Plain]);
+        assert_eq!(path.asked(), Tier::Plain);
+        assert_eq!(path.used(), Tier::Plain);
+        assert_eq!(path.len(), 1);
+    }
+
+    #[test]
+    fn a_path_that_moved_keeps_both_ends() {
+        // Doc 04.5's own example, and the one this crawler produces when a
+        // browser hands back something that is not a document and the ladder
+        // finishes the job at T1.
+        let up = TierPath::new(Tier::Plain).then(Tier::Emulated);
+        assert_eq!(up.as_slice(), [Tier::Plain, Tier::Emulated]);
+        assert_eq!(up.asked(), Tier::Plain);
+        assert_eq!(up.used(), Tier::Emulated);
+
+        let down = TierPath::new(Tier::Rendered).then(Tier::Plain);
+        assert_eq!(down.as_slice(), [Tier::Rendered, Tier::Plain]);
+        assert_eq!(down.used(), Tier::Plain);
+    }
+
+    #[test]
+    fn a_path_at_the_top_of_the_ladder_drops_the_next_rung() {
+        // Unreachable from the fetch side, since a fetch walks the rungs one
+        // way, but a fetcher that goes down over an off by one in a column
+        // nobody reads twice would be the worse bug.
+        let mut path = TierPath::new(Tier::Revalidate);
+        for tier in [
+            Tier::Plain,
+            Tier::Emulated,
+            Tier::Rendered,
+            Tier::Supervised,
+        ] {
+            path = path.then(tier);
+        }
+        assert_eq!(path.len(), TierPath::MAX);
+        let full = path;
+        assert_eq!(path.then(Tier::Plain), full);
     }
 
     #[test]
