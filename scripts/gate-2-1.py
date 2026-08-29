@@ -15,15 +15,25 @@ capacity plan sizes the browser pool for 1 percent, and at 5 percent the pool
 becomes the bottleneck for the whole project and the honest response is to
 narrow the scope rather than to buy more machines.
 
-Two things are reported and they are not the same:
+Two numbers, and the second one is the one people forget:
 
-    reached      the tier the row was finally served at, from `tier_used`
-    tried        every tier the ladder walked on the way, from `tier_path`
+    delivered    a row with status 200, counted by the tier that produced it
+    refused      a row with any other status, counted by the deepest tier tried
 
-A page that succeeded at T1 has a path of length one and cost one request. A
-page that was refused at T1 and served at T2 cost two, and the difference is
-what the capacity plan is actually made of. Reporting only `tier_used` would
-undercount the work by exactly the number of failed cheap attempts.
+The tier share is over delivered pages, because doc 05's table is about which
+tier produces a page and a 403 produces nothing. But a page the ladder gave up
+on is browser demand that this measurement cannot see, so the refused count is
+printed next to the share as the bound on how wrong it could be. A run that
+delivers 99 percent at T1 and refuses the other 1 percent has not shown that
+one percent of the web needs a browser, it has shown that at most one percent
+might.
+
+Escalation happens across leases and not inside one fetch. Doc 05.7's tier
+signal raises the floor on the host record and the next lease for that host
+starts higher, so a page that was refused at T1 and later served at T2 is two
+rows with paths of length one rather than one row with a path of length two.
+That is why the same url can appear twice, and why the join keeps the delivered
+row when there is one.
 
 Reads the crawl through `umi cat`, so it needs no parquet library.
 """
@@ -61,34 +71,37 @@ def main():
     if not rows:
         die("the crawl has no rows in it")
 
+    joined = [url for url in rows if url in strata]
     print("sample:  %d urls over %d strata"
           % (len(strata), len(set(strata.values()))))
-    print("crawled: %d rows, %d of them joined to a stratum"
-          % (len(rows), sum(1 for url in rows if url in strata)))
+    print("crawled: %d urls answered, %d of them joined to a stratum"
+          % (len(rows), len(joined)))
     print()
 
-    served, walked, refused = tally(rows, strata)
-    overall(served, walked, refused)
+    delivered, refused, statuses = tally(rows, strata)
+    outcomes(delivered, refused, statuses)
+    print()
+    overall(delivered, refused)
     print()
     by_stratum(rows, strata)
     print()
-    verdict(served)
+    verdict(delivered, refused)
 
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:
             json.dump({
                 "sample_urls": len(strata),
-                "crawled_rows": len(rows),
-                "served_by_tier": served,
-                "tried_by_tier": walked,
-                "refused": refused,
+                "answered_urls": len(joined),
+                "delivered_by_tier": delivered,
+                "refused_by_tier": refused,
+                "statuses": statuses,
             }, f, indent=2, sort_keys=True)
 
     # The gate is about T3 and nothing else. A T2 share above doc 05's range is
     # worth knowing and is not a reason to change the plan, because T2 is cheap
     # on cpu and its cost is a connection pool. T3 costs a browser.
-    total = sum(served.values())
-    t3 = (served.get(3, 0) + served.get(4, 0)) / total if total else 1.0
+    total = sum(delivered.values())
+    t3 = (delivered.get(3, 0) + delivered.get(4, 0)) / total if total else 1.0
     sys.exit(0 if t3 < 0.05 else 1)
 
 
@@ -102,11 +115,17 @@ def load_strata(path):
 
 
 def load_crawl(umi, directory):
-    """One record per url, the tier it was served at and the path it walked."""
+    """One record per url, and the best answer the ladder got for it.
+
+    A url can have two rows: refused at T1, then delivered at T2 on the lease
+    after the host record's floor went up. The delivered one is the answer, and
+    where there is no delivered one the deepest tier tried is what the ladder
+    got to before it gave up.
+    """
     rows = {}
     for path in files_in(directory):
         proc = subprocess.run(
-            [umi, "cat", path, "--columns", "url,status,tier_used,tier_path"],
+            [umi, "cat", path, "--columns", "url,status,tier_used"],
             capture_output=True, text=True)
         if proc.returncode != 0:
             print("umi cat %s: %s" % (path, proc.stderr.strip()),
@@ -119,12 +138,19 @@ def load_crawl(umi, directory):
                 continue
             if not row.get("url"):
                 continue
-            rows[row["url"]] = {
-                "status": row.get("status", 0),
-                "tier_used": row.get("tier_used", 0),
-                "tier_path": row.get("tier_path") or [],
-            }
+            new = {"status": row.get("status", 0),
+                   "tier_used": row.get("tier_used", 0)}
+            old = rows.get(row["url"])
+            if old is None or better(new, old):
+                rows[row["url"]] = new
     return rows
+
+
+def better(new, old):
+    """A 200 beats anything, and among failures the deeper tier is the answer."""
+    if (new["status"] == 200) != (old["status"] == 200):
+        return new["status"] == 200
+    return new["tier_used"] > old["tier_used"]
 
 
 def files_in(directory):
@@ -140,41 +166,56 @@ def files_in(directory):
 
 
 def tally(rows, strata):
-    """Served, tried and refused, over the rows that came from the sample."""
-    served = collections.Counter()
-    walked = collections.Counter()
+    """Delivered and refused by tier, plus the statuses behind the refusals."""
+    delivered = collections.Counter()
     refused = collections.Counter()
+    statuses = collections.Counter()
     for url, row in rows.items():
         if url not in strata:
             continue
-        served[row["tier_used"]] += 1
-        path = row["tier_path"] or [row["tier_used"]]
-        for tier in path:
-            walked[tier] += 1
-        # Every tier on the path except the last one was tried and did not
-        # produce the page. That count is the wasted work, and it is the part
-        # of the capacity plan that a tier share on its own does not show.
-        for tier in path[:-1]:
-            refused[tier] += 1
-    return dict(served), dict(walked), dict(refused)
+        if row["status"] == 200:
+            delivered[row["tier_used"]] += 1
+        else:
+            refused[row["tier_used"]] += 1
+            statuses[row["status"]] += 1
+    return dict(delivered), dict(refused), dict(statuses)
 
 
-def overall(served, walked, refused):
-    total = sum(served.values())
-    print("tier share over %d pages" % total)
+def outcomes(delivered, refused, statuses):
+    """What happened, before any of it is divided into tiers.
+
+    Read this first. A tier share computed over delivered pages says nothing
+    about the pages that were never delivered, and those are the ones the ladder
+    was built for.
+    """
+    got = sum(delivered.values())
+    lost = sum(refused.values())
+    total = got + lost
+    print("outcomes over %d urls" % total)
+    print("  delivered %d, %.1f%%" % (got, 100.0 * got / total if total else 0))
+    print("  refused   %d, %.1f%%" % (lost, 100.0 * lost / total if total else 0))
+    if statuses:
+        common = sorted(statuses.items(), key=lambda kv: -kv[1])[:8]
+        print("  %s" % ", ".join(
+            "%s x%d" % ("no answer" if code == 0 else code, count)
+            for code, count in common))
+
+
+def overall(delivered, refused):
+    total = sum(delivered.values())
+    print("tier share over %d delivered pages" % total)
     print("  %-16s %10s %10s %10s %10s"
-          % ("", "served", "share", "doc 05", "refused"))
-    for tier in sorted(set(served) | set(walked)):
-        count = served.get(tier, 0)
+          % ("", "delivered", "share", "doc 05", "refused"))
+    for tier in sorted(set(delivered) | set(refused)):
+        count = delivered.get(tier, 0)
         share = count / total if total else 0.0
         assumed = ASSUMED.get(tier)
         print("  %-16s %10d %9.2f%% %10s %10d"
               % (TIER_NAMES.get(tier, "T%d" % tier), count, 100.0 * share,
                  "-" if assumed is None else "%.0f%%" % (100.0 * assumed),
                  refused.get(tier, 0)))
-    attempts = sum(walked.values())
-    print("  %d fetches for %d pages, %.2f attempts a page"
-          % (attempts, total, attempts / total if total else 0.0))
+    print("  the refused column is where the ladder stopped, not where it")
+    print("  succeeded, so those pages are demand this run could not measure")
 
 
 def by_stratum(rows, strata):
@@ -186,22 +227,31 @@ def by_stratum(rows, strata):
     stratum it came from is meaningless.
     """
     per = collections.defaultdict(collections.Counter)
+    lost = collections.Counter()
     for url, row in rows.items():
-        if url in strata:
+        if url not in strata:
+            continue
+        if row["status"] == 200:
             per[strata[url]][row["tier_used"]] += 1
+        else:
+            lost[strata[url]] += 1
     print("by rank stratum")
-    print("  %-8s %8s %8s %8s %8s %8s"
-          % ("stratum", "pages", "T0+T1", "T2", "T3", "T4"))
-    for stratum in sorted(per):
+    print("  %-10s %8s %8s %8s %8s %8s %9s"
+          % ("stratum", "pages", "T0+T1", "T2", "T3", "T4", "refused"))
+    for stratum in sorted(set(per) | set(lost)):
         counts = per[stratum]
         total = sum(counts.values())
+        if not total:
+            print("  %-10s %8d" % (label(stratum), 0))
+            continue
         cheap = counts.get(0, 0) + counts.get(1, 0)
-        print("  %-8s %8d %7.1f%% %7.2f%% %7.2f%% %7.2f%%"
+        print("  %-10s %8d %7.1f%% %7.2f%% %7.2f%% %7.2f%% %9d"
               % (label(stratum), total,
                  100.0 * cheap / total,
                  100.0 * counts.get(2, 0) / total,
                  100.0 * counts.get(3, 0) / total,
-                 100.0 * counts.get(4, 0) / total))
+                 100.0 * counts.get(4, 0) / total,
+                 lost.get(stratum, 0)))
 
 
 def label(stratum):
@@ -210,14 +260,14 @@ def label(stratum):
             "1M-10M", "10M-100M", "100M+")[stratum - 1]
 
 
-def verdict(served):
-    total = sum(served.values())
+def verdict(delivered, refused):
+    total = sum(delivered.values())
     if not total:
-        print("VERDICT: nothing joined, so the gate is not measured")
+        print("VERDICT: nothing was delivered, so the gate is not measured")
         return
-    t3 = (served.get(3, 0) + served.get(4, 0)) / total
-    print("VERDICT: %.2f%% of pages needed a browser, against doc 05's 1 "
-          "percent" % (100.0 * t3))
+    t3 = (delivered.get(3, 0) + delivered.get(4, 0)) / total
+    print("VERDICT: %.2f%% of delivered pages needed a browser, against doc "
+          "05's 1 percent" % (100.0 * t3))
     if t3 < 0.05:
         print("         under the 5 percent that would break doc 01's "
               "capacity plan, so the plan stands")
@@ -226,6 +276,17 @@ def verdict(served):
         print("         by roughly %.0f times and section 16.8 says the answer"
               % (t3 / 0.01))
         print("         is to narrow the scope rather than to buy machines")
+    # The honest upper bound. Every refused page is one the ladder did not
+    # deliver, and there is no way from here to tell which of them a browser
+    # would have got. If that number is large next to the T3 share then the
+    # verdict above is not the whole answer and the run should say so rather
+    # than let a reader take the first line on its own.
+    lost = sum(refused.values())
+    ceiling = (delivered.get(3, 0) + delivered.get(4, 0) + lost) / (total + lost)
+    print("         %d pages were refused at every tier the ladder reached, so"
+          % lost)
+    print("         the true share is between %.2f%% and %.2f%%"
+          % (100.0 * t3, 100.0 * ceiling))
 
 
 def die(message):
