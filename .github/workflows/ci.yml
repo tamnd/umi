@@ -290,6 +290,17 @@ jobs:
           done
           exit $missing
 
+  # The bot page states the robots token, the addresses and the user agent
+  # string, and every one of those is also a constant in the code. A page
+  # that has drifted from the binary is worse than no page, because an
+  # operator acts on it.
+  site:
+    name: site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: ./scripts/check-site.sh
+
   # Nothing here has an implementation yet, so the one runtime claim worth
   # making is that the command line parses and that an unbuilt command
   # says so rather than pretending. `umi --help` also has to work on a

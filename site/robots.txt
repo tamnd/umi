@@ -1,0 +1,8 @@
+# umi.dev is a handful of static files. Everything here is meant to be read, by
+# people and by machines, so nothing is disallowed.
+#
+# If you are looking for how to keep the umi crawler off your own site, the
+# answer is at https://umi.dev/bot and the token is `umi`.
+
+User-agent: *
+Allow: /

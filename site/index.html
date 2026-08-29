@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>umi</title>
+<meta name="description" content="An internet scale web crawler that publishes everything it collects as open data.">
+<link rel="canonical" href="https://umi.dev/">
+<style>
+:root {
+  color-scheme: light dark;
+  --fg: #16181d;
+  --bg: #ffffff;
+  --dim: #5b6270;
+  --rule: #dfe2e8;
+  --code: #f4f5f7;
+  --link: #0b57d0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e7e9ee;
+    --bg: #14161a;
+    --dim: #9aa2b1;
+    --rule: #2b2f37;
+    --code: #1d2027;
+    --link: #7fb0ff;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  padding: 3.5rem 1.25rem 5rem;
+  max-width: 40rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+h1 { font-size: 2.1rem; margin: 0 0 .25rem; letter-spacing: -0.01em; }
+p { margin: .9rem 0; }
+a { color: var(--link); }
+code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: .9em; background: var(--code); padding: .1em .35em; border-radius: 3px; }
+.lede { color: var(--dim); margin-top: 0; }
+.links { margin: 2rem 0 0; padding: 0; list-style: none; }
+.links li { margin: .5rem 0; }
+footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--rule); color: var(--dim); font-size: .9rem; }
+</style>
+</head>
+<body>
+
+<h1>umi</h1>
+<p class="lede">An internet scale web crawler, in Rust.</p>
+
+<p>umi fetches the open web continuously and publishes everything it collects as open data under <a href="https://huggingface.co/open-index">open-index</a> on Hugging Face. The local disk is a cache. Once a batch of pages is published and verified, the local copy is deleted.</p>
+
+<p>It is the acquisition layer for an open index. Crawling is the part of a search engine that nobody can borrow, so it is the part that has to exist first.</p>
+
+<ul class="links">
+<li><a href="/bot">If umi is crawling your site</a>, that page has the robots token, the addresses it crawls from, and how to make it stop.</li>
+<li><a href="https://github.com/tamnd/umi">The source and the specification</a>.</li>
+<li><a href="https://huggingface.co/open-index">The published corpus</a>.</li>
+</ul>
+
+<footer>
+<p>Apache 2.0. Run by Tam Nguyen. Contact <a href="mailto:tamnd87@gmail.com">tamnd87@gmail.com</a>.</p>
+</footer>
+
+</body>
+</html>

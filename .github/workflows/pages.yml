@@ -1,0 +1,48 @@
+name: Site
+
+# umi.dev is static. It is the bot page, the published address list, the
+# purpose declaration and a short front page, and doc 07.1 says the bot page
+# ships before the first crawl outside our own domains. Hosting it on Pages
+# rather than on a crawling box is deliberate: the page an angry operator
+# reaches at 2am should not share a failure domain with the thing that made
+# them angry, and it should stay up when a VPS does not.
+on:
+  push:
+    branches: [main]
+    paths:
+      - site/**
+      - identity/**
+      - .github/workflows/pages.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time, and a queued one waits rather than being cancelled,
+# because cancelling a deploy half way through is how a site ends up serving
+# a mix of two commits.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v7
+      # The same check the pull request ran. The published address list is
+      # copied into the site rather than generated, so this is what stops a
+      # page that names addresses the binary no longer crawls from.
+      - run: ./scripts/check-site.sh
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,22 @@
+{
+  "operator": "Tam Nguyen",
+  "project": "umi",
+  "page": "https://umi.dev/bot",
+  "source": "https://github.com/tamnd/umi",
+  "user_agent": "umi/1.0 (+https://umi.dev/bot)",
+  "robots_token": "umi",
+  "purpose": "search-index",
+  "purpose_text": "Building a public, openly licensed web index.",
+  "trains_models": false,
+  "acts_as_agent": false,
+  "resells_access": false,
+  "corpus": "https://huggingface.co/open-index",
+  "corpus_licence": "open",
+  "addresses": "https://umi.dev/bot/umi.json",
+  "key_directory": "https://umi.dev/.well-known/http-message-signatures-directory",
+  "contact": "tamnd87@gmail.com",
+  "block_request": "tamnd87@gmail.com",
+  "block_list": "https://huggingface.co/datasets/open-index/umi-meta",
+  "response_commitment_business_days": 1,
+  "block_commitment_hours": 1
+}
