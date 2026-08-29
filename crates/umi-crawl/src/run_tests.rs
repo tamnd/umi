@@ -2194,3 +2194,74 @@ async fn the_budget_only_holds_back_the_tier_it_is_for() {
     assert_eq!(report.rendered, 0);
     assert_eq!(report.emulated, 0);
 }
+
+#[tokio::test]
+async fn a_lease_scale_of_zero_leases_nothing_and_says_it_was_the_ladder() {
+    // Doc 15.3's rung three. The distinction the flag carries is the whole
+    // point: an idle report on its own is what a finished crawl looks like,
+    // and `umi crawl` stops on one of those.
+    let state = seeded(&["https://example.com/a"]).await;
+    let crawler = crawler(Canned::new(), state);
+    crawler.restrain(crate::Allowance {
+        lease_scale: 0.0,
+        ..crate::Allowance::default()
+    });
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert!(report.idle());
+    assert!(report.restrained);
+
+    // And it comes back. Nothing about the pause is recorded against the url,
+    // so the tick after the pressure lifts fetches what the paused one would
+    // have.
+    crawler.restrain(crate::Allowance::default());
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert!(!report.restrained);
+    assert_eq!(report.leased, 1);
+}
+
+#[tokio::test]
+async fn a_half_lease_scale_takes_half_the_batch() {
+    // Rung two. Sixteen urls on sixteen hosts so that nothing but the batch
+    // size is holding the tick back, and a scale of a half over a batch of
+    // eight is four.
+    let urls: Vec<String> = (0..16).map(|n| format!("https://s{n}.example/a")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let crawler = Crawler::new(
+        Arc::new(Canned::new()),
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            batch: 8,
+            ..CrawlConfig::default()
+        },
+    );
+    crawler.restrain(crate::Allowance {
+        lease_scale: 0.5,
+        ..crate::Allowance::default()
+    });
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.leased, 4);
+    // Smaller than the configured batch, which is the thing the caller has to
+    // know so that it does not read the short tick as a drained frontier.
+    assert!(report.restrained);
+}
+
+#[tokio::test]
+async fn the_allowance_lowers_the_tier_ceiling_and_never_raises_it() {
+    // Doc 15.3 caps at T2 on rung one, and a process configured for T1 stays
+    // at T1. The ladder is a ceiling on a ceiling, and a config that never
+    // wanted a browser does not get one because the disk filled up.
+    let state = seeded(&[]).await;
+    let crawler = crawler(Canned::new(), state);
+    assert_eq!(crawler.config().max_tier, Tier::Plain);
+    crawler.restrain(crate::Allowance {
+        max_tier: Tier::Emulated,
+        ..crate::Allowance::default()
+    });
+    assert_eq!(crawler.allowance().max_tier, Tier::Emulated);
+    assert_eq!(
+        crawler.config().max_tier.min(crawler.allowance().max_tier),
+        Tier::Plain
+    );
+}

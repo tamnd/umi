@@ -75,8 +75,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use umi_crawl::{
-    Clock, CrawlConfig, Crawler, Recorded, Scope, SegmentInfo, SegmentSink, SupervisedLedger,
-    SystemClock, TickReport,
+    Backpressure, Clock, CrawlConfig, Crawler, Recorded, Scope, SegmentInfo, SegmentSink, Signals,
+    SupervisedLedger, SystemClock, TickReport, probe,
 };
 use umi_fetch::webbotauth::Signer;
 use umi_fetch::{FetchConfig, Ladder};
@@ -84,7 +84,7 @@ use umi_file::{StreamKind, WriterConfig};
 use umi_publish::manifest::{FileEntry, Manifest, Verification};
 use umi_publish::repo::Corpus;
 use umi_publish::{BlockEntry, Hub, PublishConfig, Published, Publisher, Role, SigningKey};
-use umi_state::{Candidate, SegmentRow, State, StateStats, Stream};
+use umi_state::{Candidate, SegmentQuery, SegmentRow, State, StateStats, Stream};
 use umi_state_sqlite::SqliteState;
 use umi_types::{Digest, FetcherId, Tier, Ulid};
 
@@ -1171,7 +1171,25 @@ fn run(
         let mut backoff = Backoff::default();
         let mut heartbeat = Heartbeat::default();
         let mut interrupt = interrupt();
+        let mut pressure = Pressure::new(layout);
         loop {
+            // Before the tick, so a box that has just filled up is restrained
+            // on the next batch rather than after one more.
+            let tick_ms = clock.now_ms();
+            if pressure.due(tick_ms) {
+                for moved in pressure.observe(&*state, tick_ms).await? {
+                    log.line(&moved.to_string())?;
+                }
+                crawler.restrain(pressure.ladder.allowance());
+                // Rung four. The open segment is the only thing on this box
+                // holding rows that the publisher cannot see, and sealing it
+                // is the one move left that turns disk into something that
+                // can leave.
+                if pressure.ladder.allowance().seal_open_segments {
+                    sink.finish().map_err(|e| Error::Crawl(e.to_string()))?;
+                }
+            }
+
             let report = crawler
                 .tick(&Recorded::new(&ledger, &sink))
                 .await
@@ -1235,7 +1253,16 @@ fn run(
                 if waiting == 0 && !settings.watch {
                     break;
                 }
-                if !settings.watch && stall.stuck(waiting, now_ms) {
+                // A tick the ladder held back is not a stall. The counts do not
+                // move because nothing was leased, which is the ladder working
+                // rather than a crawl that has got stuck, and stopping over it
+                // would be the one outcome doc 15.3 exists to avoid. Cleared
+                // rather than skipped, so the timer starts again from the
+                // first tick after the pressure lifts instead of counting the
+                // hour the crawl spent waiting for the publisher.
+                if report.restrained {
+                    stall = Stall::default();
+                } else if !settings.watch && stall.stuck(waiting, now_ms) {
                     log.line(&format!(
                         "{waiting} urls pending and none leaseable for {}s, stopping",
                         STALL_LIMIT.as_secs()
@@ -1925,6 +1952,98 @@ impl Stall {
                 false
             }
         }
+    }
+}
+
+/// How often doc 15.3's signals are read.
+///
+/// Ten seconds against a hysteresis of ten minutes. Free disk is a `df` and a
+/// process spawn, the unpublished bytes are a query, and neither is a thing to
+/// do several hundred times a second for a ladder that cannot move faster than
+/// once every ten minutes on the way down anyway.
+const SAMPLE_EVERY_MS: u64 = 10_000;
+
+/// Doc 15.3's ladder and the sampling that feeds it.
+struct Pressure {
+    ladder: Backpressure,
+    /// When the signals were last read, or nothing before the first read.
+    sampled_ms: Option<u64>,
+    /// The directory segments land in, which is the filesystem that matters.
+    /// Not the working directory: a crawl writing to a mounted volume fills
+    /// that volume and the one the binary was started from stays empty.
+    dir: PathBuf,
+}
+
+impl Pressure {
+    fn new(layout: &Layout) -> Self {
+        Self {
+            ladder: Backpressure::new(),
+            sampled_ms: None,
+            dir: layout.segments.clone(),
+        }
+    }
+
+    /// Whether it is time to read the signals again.
+    fn due(&self, now_ms: u64) -> bool {
+        self.sampled_ms
+            .is_none_or(|last| now_ms.saturating_sub(last) >= SAMPLE_EVERY_MS)
+    }
+
+    /// Read the signals and move the ladders.
+    async fn observe(
+        &mut self,
+        state: &dyn State,
+        now_ms: u64,
+    ) -> Result<Vec<umi_crawl::Transition>, Error> {
+        self.sampled_ms = Some(now_ms);
+        let signals = self.read(state, now_ms).await?;
+        Ok(self.ladder.observe(&signals, now_ms))
+    }
+
+    async fn read(&self, state: &dyn State, now_ms: u64) -> Result<Signals, Error> {
+        // Unpublished segments, which is where two of doc 15.3's three disk
+        // signals come from. A crawl without `--publish` has none of these
+        // recorded, and that is the right answer rather than a gap: there is
+        // no publisher to be behind, and free space still protects the box.
+        let unpublished = state
+            .segments(SegmentQuery::Unpublished)
+            .await
+            .map_err(|e| Error::State(e.to_string()))?;
+        let unpublished_bytes = unpublished.iter().map(|row| row.bytes).sum();
+        let publish_lag_ms = unpublished
+            .iter()
+            .map(|row| now_ms.saturating_sub(row.sealed_at_ms))
+            .max()
+            .unwrap_or(0);
+        // On a blocking thread, because `df` is a fork and an exec and
+        // benches/tick.rs part 6 measures it at 4 to 5 ms. That is a few
+        // fetches worth of the loop's time, once every ten seconds, and there
+        // is no reason to spend it on the thread doing the fetching.
+        let dir = self.dir.clone();
+        let free = tokio::task::spawn_blocking(move || probe::free_disk_bytes(&dir))
+            .await
+            .unwrap_or(None);
+        Ok(Signals {
+            unpublished_bytes,
+            publish_lag_ms,
+            // A platform with no reading leaves this at what a calm box looks
+            // like. Not at zero: zero free bytes is the top rung, and a
+            // missing reading has to mean nothing is wrong rather than
+            // everything is.
+            free_disk_bytes: free.unwrap_or(u64::MAX),
+            // Doc 15.3's CPU ladder is about the extraction pool, which this
+            // binary extracts inline rather than pooling, so there is no queue
+            // to measure and no saturation to time.
+            extract_queue: 0,
+            extractor_saturated: false,
+            rss_bytes: probe::rss_bytes().unwrap_or(0),
+            // Off. Doc 03.4's 1.5 GB cap is umid's budget and `umi crawl` has
+            // none of its own, and a ladder run against a budget nobody set
+            // would stop a crawl over a number that was guessed. The reading
+            // above is still taken and still logged, so the day umid arrives
+            // with a budget this is one line.
+            rss_budget_bytes: 0,
+        })
     }
 }
 

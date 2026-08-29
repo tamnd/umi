@@ -129,6 +129,14 @@ pub struct Ask {
     pub max_urls: u32,
     /// The most expensive tier this fetcher will run.
     pub max_tier: Tier,
+    /// Doc 09.5's split for this tick, when it is not the configured one.
+    ///
+    /// `None` means the one the frontier was built with, which is the normal
+    /// case. It is here rather than in [`Config`] because doc 15.3's ladder
+    /// moves the discovery share as pressure comes and goes, and a knob that
+    /// changes several times an hour does not belong in the same struct as
+    /// the ones an operator sets once.
+    pub budget: Option<Budget>,
 }
 
 impl Ask {
@@ -140,6 +148,7 @@ impl Ask {
             now_ms,
             max_urls,
             max_tier: Tier::Plain,
+            budget: None,
         }
     }
 }
@@ -509,7 +518,7 @@ impl<S: State> Frontier<S> {
             max_tier: ask.max_tier,
             lease_for: self.config.lease_for,
             plds: &plds,
-            budget: self.config.budget,
+            budget: ask.budget.unwrap_or(self.config.budget),
         };
         self.state.lease(&req).await
     }
