@@ -553,10 +553,9 @@ async fn seeded(hosts: usize) -> Arc<dyn State> {
 /// but is not what either part is measuring: part 1 would count 512 extracts
 /// where 256 pages were crawled, and part 2 would sleep twice per page.
 async fn prime_robots<F: Fetch>(crawler: &Crawler<F, Arc<FixedClock>>, hosts: usize) {
-    let robots = Arc::new(umi_robots::Robots::for_status(
-        200,
-        b"User-agent: *\nAllow: /\n",
-    ));
+    const BODY: &[u8] = b"User-agent: *\nAllow: /\n";
+    let robots = Arc::new(umi_robots::Robots::for_status(200, BODY));
+    let digest = umi_types::Digest::from_bytes(*blake3::hash(BODY).as_bytes());
     for host in 0..hosts {
         let key = RowKey::for_url(&seed_url(host), None).expect("canonicalise");
         crawler
@@ -565,6 +564,7 @@ async fn prime_robots<F: Fetch>(crawler: &Crawler<F, Arc<FixedClock>>, hosts: us
                 key.host,
                 Entry {
                     robots: Arc::clone(&robots),
+                    digest,
                     fetched_ms: T0,
                     expires_ms: T0 + TTL_MS,
                 },

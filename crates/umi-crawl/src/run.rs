@@ -47,7 +47,8 @@ use umi_fetch::Outcome;
 use umi_frontier::{Ask, Config as FrontierConfig, Frontier, Rate};
 use umi_robots::Provenance;
 use umi_state::{
-    Budget, Discovery, FetchOutcome, FetchResult, LeaseId, NackReason, Pace, State, StateError,
+    Budget, Discovery, FetchOutcome, FetchResult, LeaseId, NackReason, Pace, RobotsRef, State,
+    StateError,
 };
 use umi_types::{FetcherId, HostId, Revalidator, Tier, TierSignal, Verification};
 
@@ -753,16 +754,37 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 changed |= host.tier.saw_lie();
             }
 
-            // Doc 07.4's crawl delay, from the one lease a day that fetched
-            // the file. The pacer takes the larger of this and doc 07.6's
-            // adaptive delay, so a site asking for less than we were already
-            // giving it changes nothing and a site asking for more is
-            // honoured.
-            if let Some(facts) = learned.robots
-                && host.crawl_delay_ms != facts.crawl_delay_ms
-            {
-                host.crawl_delay_ms = facts.crawl_delay_ms;
-                changed = true;
+            // Everything robots.txt taught, from the one lease a day that
+            // fetched the file.
+            //
+            // The reference goes down whatever the fetch did, because it is
+            // the record that we asked. Without it a coordinator that restarts
+            // has no idea which hosts it already has a fresh answer for and
+            // refetches robots.txt for every host it touches, which at a few
+            // thousand hosts an hour is a few thousand requests nobody needed,
+            // sent to origins that get nothing out of them.
+            if let Some(facts) = &learned.robots {
+                if host.robots.as_ref() != Some(&facts.reference) {
+                    host.robots = Some(facts.reference);
+                    changed = true;
+                }
+                if let Some(parsed) = &facts.parsed {
+                    // Doc 07.4's crawl delay. The pacer takes the larger of
+                    // this and doc 07.6's adaptive delay, so a site asking for
+                    // less than we were already giving it changes nothing and
+                    // a site asking for more is honoured.
+                    if host.crawl_delay_ms != parsed.crawl_delay_ms {
+                        host.crawl_delay_ms = parsed.crawl_delay_ms;
+                        changed = true;
+                    }
+                    // Doc 13.6's sitemap lines. Read during seeding and then
+                    // dropped, so a later crawl of the same host had no record
+                    // that the site had told us where its sitemap is.
+                    if host.sitemaps != parsed.sitemaps {
+                        host.sitemaps.clone_from(&parsed.sitemaps);
+                        changed = true;
+                    }
+                }
             }
 
             if learned.signal == Some(TierSignal::Blocked) {
@@ -841,11 +863,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         // Only the lease that paid for the fetch writes anything down. Every
         // other lease on this host today read the same entry out of the cache
         // and has nothing to say the host record does not already hold.
-        let robots = if robots_fetched {
-            RobotsFacts::of(&entry)
-        } else {
-            None
-        };
+        let robots = robots_fetched.then(|| RobotsFacts::of(&entry));
         // Doc 07.6, and the reason the sleep above is before the robots check
         // rather than after it: robots.txt is a request to the same host and
         // counts the same way. The state layer spaced this lease out for one
@@ -1267,45 +1285,81 @@ struct Learned {
 /// What one robots.txt fetch said about the host that owns it, beyond the
 /// allow and disallow rules the cache already holds.
 ///
-/// Doc 07.4 puts the crawl delay in the host record rather than in the robots
-/// cache, because doc 07.6's pacer reads the host record and never sees a
-/// parsed file. Until this existed the pacer never saw a site's `Crawl-delay`
-/// at all, so a site asking for one request every ten seconds got one every
-/// second, which is the request the file was written to stop.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Doc 07.4 puts these in the host record rather than in the robots cache,
+/// because doc 07.6's pacer reads the host record and never sees a parsed
+/// file. Until this existed the pacer never saw a site's `Crawl-delay` at all,
+/// so a site asking for one request every ten seconds got one every second,
+/// which is the request the file was written to stop.
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct RobotsFacts {
+    /// Doc 08.3's `RobotsRef`: the digest, the two times and whether the
+    /// origin actually answered.
+    ///
+    /// Written whatever the fetch did, unlike the parsed half below, because
+    /// the fact being recorded is that we asked this host at this time and
+    /// got this answer. That is exactly what a coordinator coming back from a
+    /// restart needs to know, and it is what doc 07.7's rule about a
+    /// `Disallow` that appears later compares against.
+    reference: RobotsRef,
+    /// The things only a real file can say. `None` on the three provenances
+    /// that are not a parse.
+    ///
+    /// A 5xx disallows the host for a day under RFC 9309 2.3.1.4 and carries
+    /// no delay and no sitemaps, and writing its emptiness into the host
+    /// record would throw away numbers the site published, so that the day the
+    /// file came back the site would be crawled at the default pace with no
+    /// idea where its sitemap is.
+    parsed: Option<ParsedFacts>,
+}
+
+/// The half of [`RobotsFacts`] that only a file the origin served can carry.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct ParsedFacts {
     /// The delay the file asked for, already clamped by umi-robots to doc
     /// 07.4's bounds of 100 ms to 300 s. `None` is a file with no
     /// `Crawl-delay` line on it, and it clears a delay the host used to have
     /// rather than leaving the old number in place, because a site that took
     /// the line out asked for exactly that.
     crawl_delay_ms: Option<u32>,
+    /// The `Sitemap` lines, which doc 13.6 reads during seeding and which
+    /// nothing used to keep. An empty list clears the stored one for the same
+    /// reason the delay does.
+    sitemaps: Vec<String>,
 }
 
 impl RobotsFacts {
-    /// What a cache entry teaches, if it is a file the origin actually served.
-    ///
-    /// Nothing is learned from the three provenances that are not a parse. A
-    /// 5xx disallows the host for a day under RFC 9309 2.3.1.4 and carries no
-    /// delay, and writing its empty delay into the host record would throw
-    /// away a number the site published, so that the day the file came back
-    /// the site would be crawled at the default pace instead of its own.
-    fn of(entry: &RobotsEntry) -> Option<Self> {
-        if entry.robots.provenance() != Provenance::Parsed {
-            return None;
+    /// What a cache entry teaches about the host that owns it.
+    fn of(entry: &RobotsEntry) -> Self {
+        let provenance = entry.robots.provenance();
+        Self {
+            reference: RobotsRef {
+                digest: entry.digest,
+                fetched_ms: entry.fetched_ms,
+                expires_ms: entry.expires_ms,
+                // A 404 is authoritative. RFC 9309 2.3.1.3 says a site with no
+                // robots.txt has published no restrictions, and that is an
+                // answer rather than the absence of one. A 5xx and a timeout
+                // are the absence of one: both disallow the host for a day,
+                // and a coordinator that later has to decide whether it knows
+                // this host's rules should be able to tell them apart from a
+                // site that simply does not have a file.
+                authoritative: matches!(provenance, Provenance::Parsed | Provenance::NotFound),
+            },
+            parsed: (provenance == Provenance::Parsed).then(|| ParsedFacts {
+                crawl_delay_ms: entry
+                    .robots
+                    .crawl_delay()
+                    .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+                sitemaps: entry.robots.sitemaps().to_vec(),
+            }),
         }
-        let crawl_delay_ms = entry
-            .robots
-            .crawl_delay()
-            .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
-        Some(Self { crawl_delay_ms })
     }
 }
 
 impl Learned {
     /// One answer that has taught nothing yet, which is where the paths that
     /// learn one thing at a time start.
-    const fn nothing(host: umi_types::HostId, tier: Tier, probe: bool) -> Self {
+    fn nothing(host: umi_types::HostId, tier: Tier, probe: bool) -> Self {
         Self {
             host,
             signal: None,
@@ -1318,7 +1372,7 @@ impl Learned {
     }
 
     /// The tier half of one answer, with nothing learned about revalidation.
-    const fn tiered(host: umi_types::HostId, signal: TierSignal, tier: Tier, probe: bool) -> Self {
+    fn tiered(host: umi_types::HostId, signal: TierSignal, tier: Tier, probe: bool) -> Self {
         Self {
             signal: Some(signal),
             ..Self::nothing(host, tier, probe)
@@ -1343,7 +1397,7 @@ impl Learned {
     /// bottom, because the lease query does not offer a T1 lease for a host
     /// that wants more than T1. There is nothing to learn from it and nothing
     /// to write, so it never becomes a lookup.
-    const fn teaches(&self) -> bool {
+    fn teaches(&self) -> bool {
         if self.weak > 0 || self.lie || self.robots.is_some() {
             return true;
         }
@@ -1376,7 +1430,9 @@ fn learn(signals: &mut Vec<Learned>, learned: Learned) {
     seen.lie |= learned.lie;
     // First one wins, and there is only ever one: the cache fetches a host's
     // robots.txt once and every other lease in the tick reads that entry.
-    seen.robots = seen.robots.or(learned.robots);
+    if seen.robots.is_none() {
+        seen.robots = learned.robots;
+    }
 }
 
 /// Which of doc 05.3's two traps this answer walked into, if either.

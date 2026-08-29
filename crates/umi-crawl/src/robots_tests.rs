@@ -326,10 +326,94 @@ async fn a_crawl_delay_below_the_floor_is_raised_to_it() {
 }
 
 #[tokio::test]
+async fn the_file_a_host_served_is_described_in_its_host_record() {
+    // Doc 08.3 puts a `RobotsRef` on the host record, which is the digest and
+    // the two times rather than the rules, and nothing wrote it. The robots
+    // cache is memory only, so a coordinator that restarted started with
+    // nothing and refetched robots.txt for every host it touched, on hosts
+    // that mostly had not changed their file. Doc 07.4 gives the file a
+    // twenty four hour lifetime precisely so that does not happen, and at a
+    // few thousand hosts an hour it is a few thousand requests nobody needed,
+    // sent to origins that get nothing out of them.
+    //
+    // The digest is the other half. Without it a refetch cannot tell a file
+    // that changed from one that did not, so doc 07.7's rule about a
+    // `Disallow` that appears later has nothing to fire on. It is over the
+    // body rather than over the rules on purpose: two files that parse to the
+    // same rules for our user agent can differ everywhere else.
+    const BODY: &str = "User-agent: *\nAllow: /\nSitemap: https://example.com/s.xml\n";
+    let url = format!("{ORIGIN}/a");
+    let state = seeded(&[&url]).await;
+    let reading = Arc::clone(&state);
+    let fetch = Canned::new()
+        .robots(ORIGIN, BODY)
+        .html(&url, &page("A", &[]));
+    let crawler = crawler(fetch, state);
+
+    crawler.tick(&Collected::default()).await.expect("tick");
+    let host = host_of(&reading, &url).await;
+    let robots = host
+        .robots
+        .expect("the fetch that read the file wrote it down");
+    assert_eq!(
+        robots.digest,
+        umi_types::Digest::from_bytes(*blake3::hash(BODY.as_bytes()).as_bytes())
+    );
+    assert_eq!(robots.fetched_ms, T0);
+    assert_eq!(robots.expires_ms, T0 + crate::robots::TTL_MS);
+    assert!(robots.authoritative, "a 200 is an answer");
+    // Doc 13.6 reads the `Sitemap` lines during seeding and then dropped them,
+    // so a later crawl of the same host had no record that the site had told
+    // us where its sitemap is.
+    assert_eq!(host.sitemaps, vec!["https://example.com/s.xml".to_owned()]);
+}
+
+#[tokio::test]
+async fn a_server_error_is_written_down_as_an_answer_we_did_not_get() {
+    // The flag exists for exactly this. A 5xx and a 404 both leave us with no
+    // rules and they are not the same thing: RFC 9309 2.3.1.3 says a site with
+    // no robots.txt has published no restrictions, which is an answer, and
+    // 2.3.1.4 says a 5xx disallows the host for a day, which is the absence of
+    // one. A coordinator deciding on restart whether it knows this host's
+    // rules has to be able to tell them apart.
+    //
+    // The reference is still written, because the fact being recorded is that
+    // we asked and when. Skipping the write on a failure is how a host whose
+    // robots.txt is down gets asked for it again every time the coordinator
+    // comes back up, which is the origin that can least afford it.
+    let url = format!("{ORIGIN}/a");
+    let state = seeded(&[&url]).await;
+    let reading = Arc::clone(&state);
+    let fetch = Canned::new()
+        .outcome(
+            &format!("{ORIGIN}/robots.txt"),
+            umi_fetch::Outcome::Failed {
+                failure: umi_fetch::Failure::ServerError,
+                status: Some(503),
+                retry_after: None,
+            },
+        )
+        .html(&url, &page("A", &[]));
+    let crawler = crawler(fetch, state);
+
+    crawler.tick(&Collected::default()).await.expect("tick");
+    let host = host_of(&reading, &url).await;
+    let robots = host.robots.expect("we asked, so that is worth recording");
+    assert!(!robots.authoritative, "a 503 is not an answer");
+    assert_eq!(robots.expires_ms, T0 + crate::robots::TTL_MS);
+    // Nothing was parsed, so nothing the site published is overwritten. A 5xx
+    // that cleared a delay the site had asked for would mean the day the file
+    // came back the site got crawled at our pace instead of its own.
+    assert_eq!(host.crawl_delay_ms, None);
+    assert!(host.sitemaps.is_empty());
+}
+
+#[tokio::test]
 async fn a_file_with_no_crawl_delay_leaves_the_host_on_our_own_pace() {
-    // The common case, and the one that has to stay free. Nothing is written,
-    // so a healthy crawl does not read a host record per page in order to
-    // discover that the file said nothing.
+    // The common case, and the one that has to stay cheap. The one lease that
+    // fetched the file writes the host record and no other lease on that host
+    // reads it, so a healthy crawl does not pay a host lookup per page in
+    // order to discover that the file said nothing.
     let url = format!("{ORIGIN}/a");
     let state = seeded(&[&url]).await;
     let reading = Arc::clone(&state);
