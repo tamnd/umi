@@ -13,3 +13,4 @@ state.sqlite*
 # that it should never be one `git add -A` away from being published.
 /umi.toml
 /.umi
+__pycache__/
