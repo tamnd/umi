@@ -13,6 +13,10 @@ authors.workspace = true
 workspace = true
 
 [[bench]]
+name = "ledger"
+harness = false
+
+[[bench]]
 name = "rows"
 harness = false
 
