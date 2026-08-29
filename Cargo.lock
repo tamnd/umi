@@ -3385,6 +3385,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "umi-metrics"
+version = "0.0.1"
+dependencies = [
+ "umi-types",
+]
+
+[[package]]
 name = "umi-nami"
 version = "0.0.1"
 
