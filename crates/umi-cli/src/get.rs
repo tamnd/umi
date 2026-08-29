@@ -100,9 +100,17 @@ pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
 /// the pool never has a second page to hand out and the tabs would cost a few
 /// hundred megabytes to sit idle for the length of one fetch.
 async fn ladder(tier: Option<u8>) -> Result<Ladder, Error> {
-    let config = FetchConfig::default();
     #[cfg(feature = "render")]
     if tier.is_some_and(|byte| byte >= Tier::Rendered.as_u8()) {
+        let mut config = FetchConfig::default();
+        // Doc 05.4's ceiling rather than the 512 KB the one page commands
+        // default to, for this rung only. What T3 returns is the serialised
+        // DOM after the scripts have run, and that is routinely several times
+        // the html the origin sent: vercel.com is 200 KB on the wire and over
+        // half a megabyte rendered. Leaving the small cap here meant `--tier
+        // 3` answered "200, TooLarge" on exactly the client rendered sites it
+        // exists to look at.
+        config.body_cap = 8 << 20;
         // Assigned rather than built with a struct literal because
         // `RenderConfig` is non exhaustive, which is the point: the rest of
         // doc 05.6's numbers are defaults this command does not second guess.
@@ -112,7 +120,7 @@ async fn ladder(tier: Option<u8>) -> Result<Ladder, Error> {
     }
     #[cfg(not(feature = "render"))]
     let _ = tier;
-    Ok(Ladder::with_config(config)?)
+    Ok(Ladder::with_config(FetchConfig::default())?)
 }
 
 /// Print whatever came back, which is the rest of the command.
