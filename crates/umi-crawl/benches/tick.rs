@@ -291,7 +291,76 @@ fn main() {
          parse at all, which is what Scope::filters_links is for, and a focused\n\
          crawl spends around two percent of a core on staying inside its scope."
     );
+
+    // Part 5. Doc 15.3's ladder runs once a tick, and the reason to measure it
+    // is not that it might be slow. It is that a ladder cheap enough to run
+    // every tick can be run every tick, and one that is not has to be run on a
+    // timer, and a timer is another thing to get wrong. The number wanted here
+    // is "free", against a tick that is hundreds of milliseconds long.
+    println!();
+    println!("part 5: doc 15.3's backpressure ladder, once per tick");
+    println!("{:<40}{:>12}{:>14}", "signals", "ns/call", "calls/s");
+
+    for (name, signals) in ladder_signals() {
+        let measured = best_of(5, umi_crawl::Backpressure::new, |mut ladder| {
+            for tick in 0..LADDER_TICKS {
+                std::hint::black_box(ladder.observe(&signals, tick as u64 * 1000));
+                std::hint::black_box(ladder.allowance());
+            }
+            LADDER_TICKS
+        });
+        println!(
+            "{:<40}{:>12.0}{:>14.0}",
+            name,
+            measured.per_item().as_secs_f64() * 1e9,
+            measured.per_second()
+        );
+    }
+
+    println!();
+    println!(
+        "tens of nanoseconds, which is what a handful of integer compares costs.\n\
+         Reading the signals is the part that is not free, and that is a stat\n\
+         call and a directory walk rather than anything in here."
+    );
 }
+
+/// The three cases part 5 measures: nothing wrong, one ladder up, all three.
+///
+/// Three rather than one because the descent path holds a timestamp and the
+/// ascent path does not, and a ladder that was only ever measured while calm
+/// would be measured on the branch that does the least.
+fn ladder_signals() -> Vec<(&'static str, umi_crawl::Signals)> {
+    let calm = umi_crawl::Signals {
+        free_disk_bytes: 500 << 30,
+        ..umi_crawl::Signals::default()
+    };
+    vec![
+        ("nothing wrong", calm),
+        (
+            "disk at rung 1",
+            umi_crawl::Signals {
+                unpublished_bytes: 5 << 30,
+                ..calm
+            },
+        ),
+        (
+            "all three ladders up",
+            umi_crawl::Signals {
+                unpublished_bytes: 9 << 30,
+                extract_queue: 4000,
+                extractor_saturated: true,
+                rss_bytes: 19 << 30,
+                rss_budget_bytes: 20 << 30,
+                ..calm
+            },
+        ),
+    ]
+}
+
+/// Ticks per run for part 5. A tick is hundreds of milliseconds, so this is
+/// more than a day of crawling and it still takes under a millisecond.
+const LADDER_TICKS: usize = 100_000;
 
 /// The scopes part 4 measures, from cheapest to most expensive.
 fn scopes() -> Vec<(&'static str, umi_crawl::Scope)> {

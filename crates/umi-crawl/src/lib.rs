@@ -26,6 +26,7 @@
 //! beat is 250, per core, with everything else in the pipeline still to pay
 //! for.
 
+pub mod backpressure;
 pub mod clock;
 pub mod digest;
 pub mod fetch;
@@ -38,6 +39,8 @@ pub mod scope;
 pub mod sink;
 pub mod sitemap;
 
+#[cfg(test)]
+mod backpressure_tests;
 #[cfg(test)]
 mod render_tests;
 #[cfg(test)]
@@ -53,6 +56,7 @@ mod sitemap_tests;
 #[cfg(test)]
 mod tests;
 
+pub use backpressure::{Allowance, Backpressure, Cause, Ladder, Signals, Transition};
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use digest::extract_digest;
 pub use fetch::Fetch;
