@@ -5,6 +5,7 @@
 //! implementation detail, they are the operational contract that gate 3.6
 //! measures against.
 
+use umi_state::{Budget, RefreshClass};
 use umi_types::Tier;
 
 use super::backpressure::{
@@ -415,4 +416,77 @@ fn a_transition_reads_as_a_sentence() {
         moved[0].to_string(),
         format!("disk backpressure 0 to 1, free disk {}", 30 * GB)
     );
+}
+
+#[test]
+fn a_calm_allowance_leaves_doc_09_5s_split_exactly_alone() {
+    // The identity case, and the one that would go unnoticed if it broke. An
+    // unpressured crawl runs the operator's budget and not an arithmetic
+    // approximation of it, so the shares have to come back byte for byte.
+    let budget = Allowance::default().budget(Budget::DEFAULT);
+    for class in umi_state::CLASSES {
+        assert_eq!(
+            budget.share(class),
+            Budget::DEFAULT.share(class),
+            "{class:?} moved under no pressure"
+        );
+    }
+    assert!((DISCOVERY_NORMAL - 0.35).abs() < f32::EPSILON);
+}
+
+#[test]
+fn pressure_moves_discovery_and_leaves_the_refresh_classes_where_they_were() {
+    // Doc 15.3's rung one: 35 percent to 15. The refresh classes are not
+    // touched, because the rung is about not taking on new work rather than
+    // about refreshing differently, and a crawl that stopped revalidating
+    // under disk pressure would publish a staler corpus for no saving.
+    let under = Allowance {
+        discovery_share: DISCOVERY_UNDER_PRESSURE,
+        ..Allowance::default()
+    };
+    let budget = under.budget(Budget::DEFAULT);
+    for class in umi_state::CLASSES {
+        if class != RefreshClass::Discovery {
+            assert_eq!(budget.share(class), Budget::DEFAULT.share(class));
+        }
+    }
+    // The shares are a ratio, so what is asserted is the fraction of a batch
+    // discovery gets rather than the raw number. Doc 15.3 says 15 percent and
+    // a whole number of shares cannot hit that exactly, so a point either way
+    // is the tolerance.
+    let quota = budget.quota(RefreshClass::Discovery, 1000);
+    assert!(
+        (140..=160).contains(&quota),
+        "{quota} of 1000 is not doc 15.3's 15 percent"
+    );
+}
+
+#[test]
+fn discovery_never_goes_to_zero_however_hard_the_ladder_pushes() {
+    // Zero is a different instruction. It stops the class outright, and doc
+    // 15.3 never asks for that: even rung four is about refusing new bytes
+    // from other people rather than about never discovering a url again.
+    let starved = Allowance {
+        discovery_share: 0.0,
+        ..Allowance::default()
+    };
+    assert!(
+        starved
+            .budget(Budget::DEFAULT)
+            .share(RefreshClass::Discovery)
+            >= 1
+    );
+}
+
+#[test]
+fn a_budget_that_is_all_discovery_is_left_alone() {
+    // Scaling discovery against nothing has no answer, and a caller who wrote
+    // that budget asked for a crawl that does nothing but discover. Changing
+    // it would be inventing refresh classes the operator switched off.
+    let only = Budget::new([0, 0, 0, 0, 0, 100]);
+    let under = Allowance {
+        discovery_share: DISCOVERY_UNDER_PRESSURE,
+        ..Allowance::default()
+    };
+    assert_eq!(under.budget(only).share(RefreshClass::Discovery), 100);
 }

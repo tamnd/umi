@@ -41,7 +41,7 @@ use umi_types::{FetcherId, Revalidator, RowKey, Tier};
 
 mod support;
 
-use support::{MEDIAN_HTML, Run, best_of, html_of};
+use support::{MEDIAN_HTML, Run, best, best_of, html_of};
 
 const T0: u64 = 1_760_000_000_000;
 
@@ -305,7 +305,10 @@ fn main() {
         let measured = best_of(5, umi_crawl::Backpressure::new, |mut ladder| {
             for tick in 0..LADDER_TICKS {
                 std::hint::black_box(ladder.observe(&signals, tick as u64 * 1000));
-                std::hint::black_box(ladder.allowance());
+                let allowance = std::hint::black_box(ladder.allowance());
+                // The whole per tick cost, not just the ladder. `tick` calls
+                // both of these and the budget rewrite is the larger half.
+                std::hint::black_box(allowance.budget(umi_state::Budget::DEFAULT));
             }
             LADDER_TICKS
         });
@@ -320,10 +323,55 @@ fn main() {
     println!();
     println!(
         "tens of nanoseconds, which is what a handful of integer compares costs.\n\
-         Reading the signals is the part that is not free, and that is a stat\n\
-         call and a directory walk rather than anything in here."
+         The ladder runs on every tick because at this price there is no reason\n\
+         to put it on a timer and one more thing to get wrong if we did."
+    );
+
+    // Part 6. Reading the signals is the part that is not free, because two of
+    // the three shell out. The claim in probe.rs's module doc is that a spawn
+    // every ten seconds is a rounding error, and this is the number behind it.
+    println!();
+    println!("part 6: reading doc 15.3's signals, once every ten seconds");
+    println!("{:<40}{:>12}{:>14}", "signal", "us/call", "of a tick");
+
+    let dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let free = best(5, || {
+        for _ in 0..PROBE_CALLS {
+            std::hint::black_box(umi_crawl::probe::free_disk_bytes(&dir));
+        }
+        PROBE_CALLS
+    });
+    probe_line("free disk, through df", free);
+    let rss = best(5, || {
+        for _ in 0..PROBE_CALLS {
+            std::hint::black_box(umi_crawl::probe::rss_bytes());
+        }
+        PROBE_CALLS
+    });
+    probe_line("resident set size", rss);
+
+    println!();
+    println!(
+        "df is milliseconds because it is a fork, an exec and a walk of the\n\
+         mount table, and /proc is microseconds because it is a read. Neither\n\
+         is a per tick cost: once every ten seconds df is under a twentieth\n\
+         of one percent of the box. It is still milliseconds on whichever\n\
+         thread calls it, which is why the crawl runs it on a blocking one\n\
+         rather than parking the loop for the length of a few fetches."
     );
 }
+
+/// Part 6's line: microseconds, and what share of a 400 ms tick that is once
+/// every ten seconds.
+fn probe_line(name: &str, run: Run) {
+    let per = run.per_item().as_secs_f64();
+    let share = per / 10.0 * 100.0;
+    println!("{:<40}{:>12.0}{:>13.5}%", name, per * 1e6, share);
+}
+
+/// Calls per run for part 6. Small, because each one may be a fork and an
+/// exec and a thousand of those is a second of somebody's CI.
+const PROBE_CALLS: usize = 100;
 
 /// The three cases part 5 measures: nothing wrong, one ladder up, all three.
 ///

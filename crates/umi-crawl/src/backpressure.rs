@@ -31,6 +31,7 @@
 
 use std::fmt;
 
+use umi_state::{Budget, CLASSES, RefreshClass};
 use umi_types::Tier;
 
 /// A gigabyte, since every disk threshold in doc 15.3 is written in them.
@@ -226,6 +227,44 @@ pub struct Allowance {
     pub shoal_cap_at_floor: bool,
     /// Whether to evict the least recently used cold state shards.
     pub evict_cold_shards: bool,
+}
+
+impl Allowance {
+    /// Doc 09.5's split with discovery moved to whatever the ladder allows.
+    ///
+    /// The other five classes keep the shares the operator configured, and
+    /// only discovery moves, because doc 15.3's rung is about not taking on
+    /// new work rather than about refreshing differently. Shares are a ratio
+    /// and not a percentage, so the arithmetic is to pick the discovery share
+    /// `d` that makes `d / (rest + d)` come out at the fraction asked for.
+    ///
+    /// A budget whose other five classes are all zero is left alone. Scaling
+    /// discovery against nothing has no answer, and the caller that wrote that
+    /// budget asked for a crawl that does nothing but discover.
+    #[must_use]
+    pub fn budget(&self, configured: Budget) -> Budget {
+        let mut shares = [0u8; 6];
+        let mut rest = 0u32;
+        for class in CLASSES {
+            shares[class.index()] = configured.share(class);
+            if class != RefreshClass::Discovery {
+                rest += u32::from(shares[class.index()]);
+            }
+        }
+        if rest == 0 {
+            return configured;
+        }
+        // In percent, and capped below 100 so the divisor cannot reach zero.
+        // The share is a fraction of the whole batch and the arithmetic below
+        // needs it as a fraction of the rest.
+        let percent = (self.discovery_share.clamp(0.0, 0.95) * 100.0) as u32;
+        // Floored at one, because a discovery share of zero is a different
+        // instruction: it stops the class entirely, and no rung of doc 15.3
+        // asks for that.
+        let discovery = (rest * percent).div_ceil(100 - percent).max(1);
+        shares[RefreshClass::Discovery.index()] = u8::try_from(discovery).unwrap_or(u8::MAX);
+        Budget::new(shares)
+    }
 }
 
 impl Default for Allowance {

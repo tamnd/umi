@@ -32,6 +32,7 @@ pub mod digest;
 pub mod fetch;
 pub mod ledger;
 pub mod page;
+pub mod probe;
 pub mod render;
 pub mod robots;
 pub mod run;

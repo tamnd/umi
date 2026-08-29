@@ -52,6 +52,7 @@ use umi_state::{
 };
 use umi_types::{FetcherId, HostId, Revalidator, Tier, TierSignal, Verification};
 
+use crate::backpressure::Allowance;
 use crate::clock::Clock;
 use crate::fetch::Fetch;
 use crate::page::{Crawled, PageRow};
@@ -314,6 +315,13 @@ pub struct TickReport {
     /// again. They are not failures and no row exists for them, which is why
     /// they are counted apart from everything else.
     pub deferred: usize,
+    /// Whether doc 15.3's ladder is what kept this tick small.
+    ///
+    /// A caller has no other way to tell a tick that leased nothing because
+    /// the frontier was empty from one that leased nothing because the disk
+    /// is full, and the two want opposite responses: the first one means the
+    /// crawl is over and the second one means wait.
+    pub restrained: bool,
 }
 
 impl TickReport {
@@ -325,6 +333,23 @@ impl TickReport {
     }
 }
 
+/// Apply doc 15.3's lease scale to a count.
+///
+/// Zero in gives zero out and so does a scale of zero, and anything in between
+/// gives at least one. The floor is there because the scale is a rate cut and
+/// not a stop: a batch of one under a scale of a hundredth is a crawl that is
+/// still moving, and rounding it to zero would turn every rung into rung three.
+fn scale(count: u32, scale: f32) -> u32 {
+    if count == 0 || scale <= 0.0 {
+        return 0;
+    }
+    if scale >= 1.0 {
+        return count;
+    }
+    let scaled = f64::from(count) * f64::from(scale);
+    (scaled as u32).max(1).min(count)
+}
+
 /// The loop.
 pub struct Crawler<F, C> {
     fetch: F,
@@ -333,6 +358,14 @@ pub struct Crawler<F, C> {
     robots: RobotsCache,
     render: RenderBudget,
     config: CrawlConfig,
+    /// Doc 15.3's answer to the last set of signals.
+    ///
+    /// A lock rather than a field on the config because the config is what the
+    /// operator asked for and this is what the box can afford, and the two
+    /// have to stay apart: pressure comes and goes, and a ladder that edited
+    /// the config would leave the crawl permanently smaller than it was
+    /// started with once the disk emptied again.
+    restraint: Mutex<Allowance>,
 }
 
 impl<F: Fetch, C: Clock> Crawler<F, C> {
@@ -348,7 +381,33 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             robots: RobotsCache::new(),
             render,
             config,
+            restraint: Mutex::new(Allowance::default()),
         }
+    }
+
+    /// Tell the loop what doc 15.3's ladder currently allows.
+    ///
+    /// Takes effect on the next tick and not on the one in flight, which is
+    /// the right granularity: the fetches already on the wire cost bandwidth
+    /// that has been spent and bytes that have to be written somewhere either
+    /// way, and abandoning them would waste both without freeing anything.
+    pub fn restrain(&self, allowance: Allowance) {
+        *self.restraint() = allowance;
+    }
+
+    /// What the ladder allows right now.
+    #[must_use]
+    pub fn allowance(&self) -> Allowance {
+        *self.restraint()
+    }
+
+    fn restraint(&self) -> MutexGuard<'_, Allowance> {
+        // An `Allowance` is nine `Copy` fields and nothing under this lock can
+        // panic, so recovering the guard is recovering from a panic somewhere
+        // else rather than papering over one here.
+        self.restraint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Doc 05.9's render budget, so a caller can report what it is doing.
@@ -489,6 +548,20 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         self.render.observe(self.fetch.render_capacity());
 
         let now_ms = self.clock.now_ms();
+        // Doc 15.3, read once and used for the whole tick, so that a ladder
+        // that moves halfway through does not leave a batch leased under one
+        // set of rules and fetched under another.
+        let allowance = self.allowance();
+        let batch = scale(self.config.batch, allowance.lease_scale);
+        if batch == 0 {
+            // Rung three: lease nothing. Not the same as stopping, and the
+            // caller is told which of the two this is because an idle report
+            // on its own reads as a finished crawl.
+            return Ok(TickReport {
+                restrained: true,
+                ..TickReport::default()
+            });
+        }
         // Through the scheduler and not straight to the store. The store hands
         // out work per host; doc 09.3's cap is per pay level domain, and the
         // two are not the same thing. A site on fifty hosts under one domain is
@@ -500,13 +573,18 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             .tick(&Ask {
                 fetcher: self.config.fetcher,
                 now_ms,
-                max_urls: self.config.batch,
-                max_tier: self.config.max_tier,
+                max_urls: batch,
+                // The lower of the two, always. The config is the most this
+                // process will ever pay for and the allowance is the most it
+                // can afford today, and neither may raise the other.
+                max_tier: self.config.max_tier.min(allowance.max_tier),
+                budget: Some(allowance.budget(self.config.budget)),
             })
             .await?;
 
         let mut report = TickReport {
             leased: leases.len(),
+            restrained: batch < self.config.batch,
             ..TickReport::default()
         };
         if leases.is_empty() {
@@ -535,7 +613,14 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
 
         // Fill the window, then top it up as each one lands, which is what
         // keeps every slot busy rather than waiting on the slowest of a chunk.
-        for _ in 0..self.config.in_flight {
+        // Scaled with the batch, because a window as wide as the unrestrained
+        // one over a batch half the size just means every lease is on the wire
+        // at once, which is the rate the ladder was trying to cut.
+        let window = scale(
+            u32::try_from(self.config.in_flight).unwrap_or(u32::MAX),
+            allowance.lease_scale,
+        ) as usize;
+        for _ in 0..window {
             let Some((lease, at)) = self.gate(&mut queue, &mut deferred, &mut report) else {
                 break;
             };
