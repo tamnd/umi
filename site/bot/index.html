@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>umi crawler</title>
+<meta name="description" content="What the umi crawler is, how to verify it, how to slow it down, and how to make it stop.">
+<link rel="canonical" href="https://umi.dev/bot">
+<style>
+:root {
+  color-scheme: light dark;
+  --fg: #16181d;
+  --bg: #ffffff;
+  --dim: #5b6270;
+  --rule: #dfe2e8;
+  --code: #f4f5f7;
+  --link: #0b57d0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e7e9ee;
+    --bg: #14161a;
+    --dim: #9aa2b1;
+    --rule: #2b2f37;
+    --code: #1d2027;
+    --link: #7fb0ff;
+  }
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0 auto;
+  padding: 2.5rem 1.25rem 5rem;
+  max-width: 46rem;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+h1 { font-size: 1.9rem; margin: 0 0 .25rem; letter-spacing: -0.01em; }
+h2 { font-size: 1.25rem; margin: 2.75rem 0 .5rem; letter-spacing: -0.01em; }
+h3 { font-size: 1rem; margin: 1.5rem 0 .35rem; }
+p, ul, ol { margin: .75rem 0; }
+li { margin: .3rem 0; }
+a { color: var(--link); }
+code, pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace; font-size: .9em; }
+code { background: var(--code); padding: .1em .35em; border-radius: 3px; }
+pre { background: var(--code); padding: .85rem 1rem; border-radius: 6px; overflow-x: auto; }
+pre code { background: none; padding: 0; }
+.lede { color: var(--dim); margin-top: 0; }
+.stop { border: 2px solid var(--link); border-radius: 8px; padding: 1rem 1.25rem; margin: 1.75rem 0; }
+.stop h2 { margin-top: 0; }
+table { border-collapse: collapse; width: 100%; margin: .75rem 0; }
+th, td { text-align: left; padding: .4rem .6rem .4rem 0; border-bottom: 1px solid var(--rule); vertical-align: top; }
+th { font-weight: 600; }
+footer { margin-top: 3.5rem; padding-top: 1rem; border-top: 1px solid var(--rule); color: var(--dim); font-size: .9rem; }
+.updated { color: var(--dim); font-size: .9rem; }
+</style>
+</head>
+<body>
+
+<h1>umi crawler</h1>
+<p class="lede">If you found this page in your server logs, this is the page that answers it.</p>
+
+<p>umi is a web crawler that builds a public, openly licensed index of the web. Everything it collects is published as open data under <a href="https://huggingface.co/open-index">open-index</a> on Hugging Face. The code is at <a href="https://github.com/tamnd/umi">github.com/tamnd/umi</a> and it is run by Tam Nguyen.</p>
+
+<p>Requests come from one user agent, on every request, at every tier:</p>
+
+<pre><code>umi/1.0 (+https://umi.dev/bot)</code></pre>
+
+<div class="stop">
+<h2>Make it stop</h2>
+
+<p>The robots token is <code>umi</code>. Nothing else. Not <code>umibot</code>, not <code>umi/1.0</code>, not a prefix of the user agent string. Put this in your <code>robots.txt</code> and umi stops within 24 hours, which is how long a cached <code>robots.txt</code> lives:</p>
+
+<pre><code>User-agent: umi
+Disallow: /</code></pre>
+
+<p>If you already block <code>User-agent: *</code>, you already block umi. There is no flag anywhere in umi that ignores robots.txt, and there never will be.</p>
+
+<p>To stop it now, or to stop it across the whole fleet including machines other people run, email <a href="mailto:tamnd87@gmail.com">tamnd87@gmail.com</a> with the domain. You get an answer from a person within one business day and the block is applied within one hour of a valid request. Send the domain and, if you have them, a few log lines so the request can be matched against what actually happened.</p>
+
+<p>A block is permanent, it is on the record, and it also removes what has already been collected from the next revision of the published corpus. The list of blocked domains is published in <a href="https://huggingface.co/datasets/open-index/umi-meta">open-index/umi-meta</a>, so anyone using an older snapshot can honour it too.</p>
+</div>
+
+<h2>Is it really umi</h2>
+
+<p>Anybody can put a string in a user agent header, so there are three ways to check, in order of how easy they are to run.</p>
+
+<h3>1. Reverse DNS, forward confirmed</h3>
+
+<p>This is the same check that verifies Googlebot and Bingbot, and your tooling probably already does it. Take the address from your log, look up its PTR record, and check the name ends in <code>umi.dev</code>. Then resolve that name and check it comes back to the address you started with. Both halves have to pass. The first half alone proves nothing, because a PTR record is set by whoever owns the address.</p>
+
+<pre><code>$ dig +short -x 62.171.131.190
+fetch-3.umi.dev.
+$ dig +short fetch-3.umi.dev
+62.171.131.190</code></pre>
+
+<h3>2. The published address list</h3>
+
+<p>Every address umi crawls from is published at <a href="/bot/umi.json">umi.dev/bot/umi.json</a>. It is the same shape as Google's <code>googlebot.json</code>, field for field, so a reader that already eats that file reads this one unchanged. The one extra field is <code>name</code>, which carries the reverse DNS name for the range, and a reader that does not expect it ignores it.</p>
+
+<table>
+<tr><th>Address</th><th>Reverse DNS name</th></tr>
+<tr><td><code>194.233.70.53</code></td><td><code>fetch-1.umi.dev</code></td></tr>
+<tr><td><code>185.209.229.109</code></td><td><code>fetch-2.umi.dev</code></td></tr>
+<tr><td><code>2a02:c207:2311:2167::1</code></td><td><code>fetch-2.umi.dev</code></td></tr>
+<tr><td><code>62.171.131.190</code></td><td><code>fetch-3.umi.dev</code></td></tr>
+<tr><td><code>2a02:c207:2339:1933::1</code></td><td><code>fetch-3.umi.dev</code></td></tr>
+</table>
+
+<p>Traffic from anywhere else claiming to be umi is not umi. When an address changes, the list gains the new one before any crawling moves to it, and the old one stays on the list for a full crawl cycle after the move, so a log line from yesterday still checks out. An address that is retired for cause comes off immediately and this page says when and why.</p>
+
+<h3>3. Web Bot Auth signatures</h3>
+
+<p>Requests from machines that umi operates are signed under RFC 9421 HTTP Message Signatures, following the Web Bot Auth protocol draft. The signature covers <code>@authority</code>, <code>@method</code>, <code>@path</code> and the <code>Signature-Agent</code> header, and it is good for sixty seconds. The public keys are Ed25519 and are published as a JSON Web Key Set at <code>https://umi.dev/.well-known/http-message-signatures-directory</code>. Keys rotate quarterly with an overlap window, and a rotated key keeps its entry and gains an expiry rather than being deleted, so a request signed last year can still be checked this year.</p>
+
+<p>Signing is built and the directory goes live with the first coordinator operated crawl outside our own domains. Until it does, the two checks above are the ones to use. Rotations are announced here.</p>
+
+<p>Machines run by volunteers sign with their own keys and point <code>Signature-Agent</code> at a separate directory of active fetcher keys, so you can tell a machine we run from a machine somebody else runs, and rate limit them differently if you want to.</p>
+
+<h2>Slowing it down without blocking</h2>
+
+<p>umi backs off on its own. A slow response, a 429, a 503 or a connection error all widen the gap between requests for that host, and the gap only narrows again after sustained fast responses. Nothing goes below a 200 ms gap for any host, and no host ever sees more than 5 requests per second from the entire fleet.</p>
+
+<ul>
+<li><code>Crawl-delay</code> in <code>robots.txt</code> is honoured, clamped to between 0.1 and 300 seconds. It is not part of RFC 9309, but it is widely deployed and umi obeys it.</li>
+<li><code>Retry-After</code> is honoured exactly, in both the seconds form and the HTTP date form, up to 24 hours.</li>
+<li>A 429 or a 503 multiplies the current gap by four, immediately.</li>
+<li>Everything under one registrable domain shares a cap of 20 requests per second, so a site with thousands of subdomains does not get thousands of times the traffic.</li>
+</ul>
+
+<p>If a path is expensive to serve and the rest of the site is fine, a <code>Disallow</code> on that path is the precise tool and umi will keep the rest.</p>
+
+<h2>What umi collects</h2>
+
+<p>Only what is needed to build an index of what a page says.</p>
+
+<ul>
+<li>The URL, the final URL after redirects, and the status code.</li>
+<li>The main content of the page, converted to markdown, with navigation, boilerplate and scripts removed.</li>
+<li>Outbound links and their anchor text.</li>
+<li>Title, description, headings and the usual social metadata.</li>
+<li>Response headers that matter for caching and content type, such as <code>ETag</code>, <code>Last-Modified</code>, <code>Content-Type</code> and <code>Content-Language</code>.</li>
+<li>Timing, size, which tier fetched it, and digests of the content.</li>
+</ul>
+
+<p>It does not store <code>Set-Cookie</code>, <code>Authorization</code>, <code>Proxy-Authorization</code> or <code>WWW-Authenticate</code>. There is no flag, allowlist entry or operator setting that changes that. It does not collect <code>mailto:</code> addresses from pages, deliberately, because harvesting email addresses at web scale creates an obligation this project does not want.</p>
+
+<p>umi fetches nothing behind a login, solves no CAPTCHAs, bypasses no challenge, and uses no residential proxies and no proxy rotation. It crawls from the addresses listed above and nowhere else. Pages that require an account are pages umi does not have.</p>
+
+<h2>What umi publishes</h2>
+
+<p>Everything, openly. Crawled pages are converted to Parquet and uploaded to public datasets under <a href="https://huggingface.co/open-index">open-index</a> on Hugging Face, usually within ten minutes of being fetched, after which the local copy is deleted. The local disk is a cache and nothing else. Manifests are hash chained and signed so a stranger can verify that a published corpus is the one that was produced.</p>
+
+<p>Each published row carries the crawl purpose and the fetch tier that produced it, so a consumer can filter on either.</p>
+
+<h2>Purpose</h2>
+
+<p>umi has one purpose and declares it: <strong>building a public, openly licensed web index</strong>.</p>
+
+<ul>
+<li>It does not train models on the corpus.</li>
+<li>It does not browse on a user's behalf as an agent.</li>
+<li>It does not resell access to anything it collects.</li>
+</ul>
+
+<p>The honest part that most crawler pages leave out: the corpus is open, so other people can and will train on it, and that is outside our control. Saying otherwise would be the dishonest version. If you do not want your site in an open dataset that anyone can download, the block above is the answer and it is meant to be used.</p>
+
+<p>If umi ever gains a second purpose it gets a second user agent, a second key and a second robots token, because a purpose declaration is only worth anything if it is granular enough to act on.</p>
+
+<p>The same declaration in machine readable form is at <a href="/bot/purpose.json">umi.dev/bot/purpose.json</a>.</p>
+
+<h2>Contact</h2>
+
+<p>Email <a href="mailto:tamnd87@gmail.com">tamnd87@gmail.com</a>. A person reads it. Response within one business day, blocks applied within one hour of a valid request.</p>
+
+<p>If umi fetched a path you have under <code>Disallow</code>, that is a bug and it gets treated as a security-class report. Send the URL, the timestamp and the user agent string you saw, either by email or at <a href="https://github.com/tamnd/umi/issues">github.com/tamnd/umi/issues</a>.</p>
+
+<footer>
+<p>umi is free software under the Apache 2.0 licence. The whole design, including everything on this page and the reasoning behind it, is written down in <a href="https://github.com/tamnd/umi/tree/main/docs/spec">the specification</a>. Politeness and identity are <a href="https://github.com/tamnd/umi/blob/main/docs/spec/07-politeness-and-identity.md">document 07</a>.</p>
+<p class="updated">Last updated 29 August 2026.</p>
+</footer>
+
+</body>
+</html>
