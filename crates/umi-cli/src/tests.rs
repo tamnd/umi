@@ -436,7 +436,8 @@ fn cat_projects_a_list_column_out_of_a_parquet_file() {
     let from_parquet = capture(|sink| cat_to(&parquet, Some(3), Some(&["url", "tier_path"]), sink));
     assert_eq!(from_umi, from_parquet);
 
-    let row: serde_json::Value = serde_json::from_str(from_parquet.lines().next().unwrap()).unwrap();
+    let row: serde_json::Value =
+        serde_json::from_str(from_parquet.lines().next().unwrap()).unwrap();
     assert_eq!(row.as_object().unwrap().len(), 2);
     assert!(row.get("tier_path").unwrap().is_array(), "{row}");
 }
