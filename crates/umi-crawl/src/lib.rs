@@ -40,6 +40,8 @@ pub mod sitemap;
 #[cfg(test)]
 mod render_tests;
 #[cfg(test)]
+mod robots_tests;
+#[cfg(test)]
 mod run_tests;
 #[cfg(test)]
 mod scope_tests;
