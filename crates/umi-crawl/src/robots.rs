@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, OnceCell};
 use umi_robots::{Decision, Provenance, Robots};
-use umi_types::{HostId, Tier};
+use umi_types::{Digest, HostId, Tier};
 
 use crate::fetch::Fetch;
 
@@ -41,6 +41,14 @@ pub const TTL_MS: u64 = 24 * 60 * 60 * 1000;
 pub struct Entry {
     /// The rules.
     pub robots: Arc<Robots>,
+    /// blake3 of the body the rules were parsed from, and of the empty string
+    /// when the fetch produced no body at all.
+    ///
+    /// Kept because the rules cannot be compared. Two robots.txt files that
+    /// parse to the same rules for our user agent can differ everywhere else,
+    /// and doc 07.7's rule about a `Disallow` that appears later needs to know
+    /// that the file changed rather than that our slice of it did.
+    pub digest: Digest,
     /// When it was fetched.
     pub fetched_ms: u64,
     /// When it stops counting.
@@ -149,9 +157,10 @@ impl RobotsCache {
         let entry = cell
             .get_or_init(|| async {
                 fetched = true;
-                let robots = fetch_robots(fetch, origin, tier).await;
+                let (robots, digest) = fetch_robots(fetch, origin, tier).await;
                 Entry {
                     robots: Arc::new(robots),
+                    digest,
                     fetched_ms: now_ms,
                     expires_ms: now_ms + TTL_MS,
                 }
@@ -194,9 +203,15 @@ impl RobotsCache {
 /// round trip a robots.txt costs because of it. RFC 9309 2.3.1.2 asks for at
 /// least five hops followed "even across authorities", and the rules that come
 /// back apply to the origin we started from.
-async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) -> Robots {
+async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) -> (Robots, Digest) {
     let mut url = format!("{origin}/robots.txt");
     let mut hops = 0u32;
+    // The empty digest until a body arrives, which is what every path that
+    // never sees one keeps. A 5xx and a timeout are different answers about a
+    // host and neither of them is a file, so neither has bytes to hash, and
+    // giving them the same digest is honest rather than lossy: what tells the
+    // two apart on the way back out is the authoritative flag.
+    let mut digest = digest_of(b"");
     loop {
         // Never conditional. A stale robots.txt that a 304 confirmed is still
         // a file we are about to re-read from a cache we already dropped, so
@@ -205,8 +220,11 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
         // The rungs it took are not this function's business. A robots.txt
         // that came back over plain HTTP because the browser would not hand
         // back a `text/plain` body is still this origin's robots.txt.
-        return match fetch.fetch(&url, None, tier).await.map(|s| s.outcome) {
-            Ok(umi_fetch::Outcome::Ok(page)) => Robots::for_status(page.status, page.body.as_ref()),
+        let robots = match fetch.fetch(&url, None, tier).await.map(|s| s.outcome) {
+            Ok(umi_fetch::Outcome::Ok(page)) => {
+                digest = digest_of(page.body.as_ref());
+                Robots::for_status(page.status, page.body.as_ref())
+            }
             Ok(umi_fetch::Outcome::RedirectedOffDomain {
                 redirects, target, ..
             }) => {
@@ -216,7 +234,7 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
                 hops += u32::try_from(redirects.len()).unwrap_or(u32::MAX);
                 hops += 1;
                 if hops > umi_robots::MAX_REDIRECTS {
-                    return Robots::disallow_all(Provenance::Unreachable);
+                    return (Robots::disallow_all(Provenance::Unreachable), digest);
                 }
                 url = target;
                 continue;
@@ -245,5 +263,11 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
             // job is to say no.
             Ok(_) | Err(_) => Robots::disallow_all(Provenance::Unreachable),
         };
+        return (robots, digest);
     }
+}
+
+/// blake3 of a robots.txt body.
+fn digest_of(body: &[u8]) -> Digest {
+    Digest::from_bytes(*blake3::hash(body).as_bytes())
 }
