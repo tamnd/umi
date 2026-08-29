@@ -289,6 +289,11 @@ jobs:
             fi
           done
           exit $missing
+      # The gate scripts run unattended for days at a time on a server
+      # nobody is watching, and a name that is only reached on the error
+      # path will not be found by anything else here.
+      - name: The scripts parse
+        run: python3 -m py_compile scripts/*.py
 
   # The bot page states the robots token, the addresses and the user agent
   # string, and every one of those is also a constant in the code. A page
