@@ -36,7 +36,8 @@
 //! wants them in a `.umi` file. Splitting it that way also keeps this file
 //! free of any I/O that is not a fetch.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -48,7 +49,7 @@ use umi_robots::Provenance;
 use umi_state::{
     Budget, Discovery, FetchOutcome, FetchResult, LeaseId, NackReason, Pace, State, StateError,
 };
-use umi_types::{FetcherId, Revalidator, Tier, TierSignal, Verification};
+use umi_types::{FetcherId, HostId, Revalidator, Tier, TierSignal, Verification};
 
 use crate::clock::Clock;
 use crate::fetch::Fetch;
@@ -64,6 +65,47 @@ use crate::scope::{LinkPolicy, Scope};
 /// vendor changed a default rule, rather than a small crawl visiting a couple
 /// of sites that have always wanted T2.
 const ALERT_FLOOR: usize = 100;
+
+/// The earliest a host may be asked again, for the leases a tick is still
+/// holding.
+///
+/// Doc 07.6's delay is applied when a batch is leased, so a batch of one
+/// host's urls comes out of the store already spaced. That is the right place
+/// for a rate, which is a running estimate and belongs to the next decision.
+/// It is the wrong place for one thing: `Retry-After` is not an estimate, it
+/// is an origin naming a time, and a batch that was spaced a second apart
+/// before the origin said "six seconds" has six requests already scheduled
+/// inside the window it just asked us to leave empty. Measured from the
+/// outside on gate 2.3's origin: a 429 asking for six seconds was followed by
+/// another request 960 ms later, from the same batch.
+///
+/// So the ask is written here as well, and every lease in flight checks it
+/// before it goes out. It lives for one tick because the next tick leases
+/// against a host record the state layer has already moved.
+#[derive(Debug, Default)]
+struct HostFloors(Mutex<HashMap<HostId, u64>>);
+
+impl HostFloors {
+    /// The floor for one host, or zero for a host nobody has asked us to wait
+    /// for, which is almost all of them.
+    fn get(&self, host: HostId) -> u64 {
+        self.lock().get(&host).copied().unwrap_or(0)
+    }
+
+    /// Move a host's floor out, never in. Two origins behind one host name
+    /// disagreeing about the wait is not a thing to average.
+    fn push(&self, host: HostId, at_ms: u64) {
+        let mut floors = self.lock();
+        let slot = floors.entry(host).or_default();
+        *slot = (*slot).max(at_ms);
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<HostId, u64>> {
+        // Nothing under this lock can panic, and recovering the guard keeps a
+        // poisoned map from taking the rest of the tick down.
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 /// Where finished rows go.
 ///
@@ -256,13 +298,20 @@ pub struct TickReport {
     /// Leases fetched at T2, for doc 05.9's 15 percent alert.
     pub emulated: usize,
     /// Leases fetched at T3 or above.
-    pub rendered: usize,
-    /// Leases the render budget had no room for, per doc 05.9.
     ///
-    /// These were given back to the frontier without an answer, so they keep
-    /// their due time and their priority and the next tick offers the most
-    /// important of them again. They are not failures and no row exists for
-    /// them, which is why they are counted apart from everything else.
+    /// Counted where doc 05.9's budget grants the slot, which is before the
+    /// lease finds out whether it has to spend itself on the host's
+    /// robots.txt. One that does gives the slot back and this number is a
+    /// render high for that tick, once per host per day.
+    pub rendered: usize,
+    /// Leases given back to the frontier without an answer.
+    ///
+    /// Two things end up here. Doc 05.9's render budget turns some T3 leases
+    /// away, and the lease that has to fetch a host's robots.txt spends its
+    /// slot on that file instead of on its page. Both keep their due time and
+    /// their priority and the next tick offers the most important of them
+    /// again. They are not failures and no row exists for them, which is why
+    /// they are counted apart from everything else.
     pub deferred: usize,
 }
 
@@ -472,6 +521,9 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         let mut leases = leases;
         leases.sort_by_key(|lease| lease.not_before_ms);
 
+        // Before `pending`, because the futures in it borrow this and the
+        // borrow has to outlive them.
+        let floors = HostFloors::default();
         let mut pending = FuturesUnordered::new();
         let mut queue = leases.into_iter();
         let mut rows = Vec::with_capacity(report.leased);
@@ -486,11 +538,20 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             let Some((lease, at)) = self.gate(&mut queue, &mut deferred, &mut report) else {
                 break;
             };
-            pending.push(self.one(lease, at));
+            pending.push(self.one(lease, at, &floors));
         }
         while let Some(done) = pending.next().await {
+            // Before the lease that replaces it, and before anything else this
+            // loop does, so that a `Retry-After` on this answer reaches the
+            // rest of the batch rather than the request after next.
+            if let Some(after) = done.outcome.pace.retry_after_ms {
+                floors.push(
+                    done.outcome.key.host,
+                    done.outcome.finished_ms.saturating_add(u64::from(after)),
+                );
+            }
             if let Some((lease, at)) = self.gate(&mut queue, &mut deferred, &mut report) {
-                pending.push(self.one(lease, at));
+                pending.push(self.one(lease, at, &floors));
             }
             let Fetched {
                 row,
@@ -498,6 +559,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 links,
                 links_seen,
                 disallowed,
+                give_back,
                 signal,
             } = done;
 
@@ -521,6 +583,15 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 if learned.teaches() {
                     learn(&mut signals, learned);
                 }
+            }
+            // After the signal, because a lease that spent its slot on
+            // robots.txt still learned what the file said and that is the one
+            // lease a day that knows it. Before everything else, because there
+            // is no answer here to record: the url keeps its due time and the
+            // next tick offers it again.
+            if give_back {
+                deferred.push(outcome.lease);
+                continue;
             }
             // Counted off the completion rather than off the row, because a
             // 304 has no row. Everything else does.
@@ -725,7 +796,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     ///
     /// `start_ms` is when it may go out, which is its politeness time and, for
     /// a rendered page, the render slot doc 05.9's budget gave it.
-    async fn one(&self, lease: umi_state::Lease, start_ms: u64) -> Fetched {
+    async fn one(&self, lease: umi_state::Lease, start_ms: u64, floors: &HostFloors) -> Fetched {
         // Doc 07.6, and the whole reason `not_before_ms` exists. The state
         // layer already spaced the leases of a batch by each host's politeness
         // delay, and until this line the loop threw that away and sent the
@@ -735,7 +806,21 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         //
         // Before the robots check rather than after, since robots.txt is a
         // request to the same host and counts the same way.
-        self.clock.sleep_until_ms(start_ms).await;
+        //
+        // A loop and not one sleep, because the wait can grow while it is
+        // being served. This batch was spaced at lease time and an origin that
+        // answers one of it with `Retry-After` is asking for the rest to move,
+        // which is what [`HostFloors`] carries. Waking up to find the wait
+        // longer than it was is the ordinary case for that, not an error.
+        let mut until = start_ms;
+        loop {
+            self.clock.sleep_until_ms(until).await;
+            let floor = floors.get(lease.key.host);
+            if floor <= self.clock.now_ms() {
+                break;
+            }
+            until = floor;
+        }
 
         let now = || self.clock.now_ms();
         let Some(origin) = origin_of(&lease.url) else {
@@ -761,6 +846,28 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         } else {
             None
         };
+        // Doc 07.6, and the reason the sleep above is before the robots check
+        // rather than after it: robots.txt is a request to the same host and
+        // counts the same way. The state layer spaced this lease out for one
+        // request, so the lease that fetched the file has spent its slot and
+        // the page waits for the next one. The url keeps its due time and the
+        // next tick offers it again, so this costs a tick per host per day and
+        // no extra request at all.
+        //
+        // Measured from the outside before it was written: gate 2.3's origin
+        // logged robots.txt and the front page six milliseconds apart.
+        if robots_fetched {
+            // A T3 lease was holding one of doc 05.9's render slots, taken
+            // before anything here knew there was a robots.txt to fetch. No
+            // browser ran, so the slot goes back. The guard is the tier and
+            // not whether a slot was granted, because the one case that
+            // reaches here without a grant is a process with no browser at
+            // all, and `refund` on that process does nothing.
+            if lease.tier >= Tier::Rendered {
+                self.render.refund();
+            }
+            return Fetched::robots_cost(&lease, now()).taught(&lease, robots);
+        }
         if !decision.is_allowed() {
             let mut out = Fetched::excluded(&lease, now(), umi_state::ExcludeReason::Robots);
             out.disallowed = true;
@@ -988,6 +1095,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             links,
             links_seen,
             disallowed: false,
+            give_back: false,
             signal: learned,
         }
         .taught(&lease, robots)
@@ -1111,6 +1219,15 @@ struct Fetched {
     links: Vec<(String, u8)>,
     links_seen: usize,
     disallowed: bool,
+    /// Whether this lease is going back on the queue with no answer.
+    ///
+    /// One case, and it is doc 07.6's rate rather than doc 05.9's budget: this
+    /// is the lease that found the host's robots.txt missing and fetched it.
+    /// That file is a request to the same origin as the page, and the state
+    /// layer spaced this lease out for one request, so sending the page as
+    /// well would put two on the origin at once. Giving the lease back costs a
+    /// tick and costs the origin nothing.
+    give_back: bool,
     /// What the answer said about the tier it came back on, when it said
     /// anything. A robots exclusion and a malformed URL say nothing, because
     /// no request was sent.
@@ -1301,6 +1418,23 @@ impl Fetched {
         Self::answered(lease, now_ms, FetchResult::Excluded { reason })
     }
 
+    /// A lease that spent its slot on robots.txt.
+    ///
+    /// The url is untouched and comes straight back, at the due time it
+    /// already had, which the state layer has already moved past this
+    /// request. Doc 08.3's `Refused` is what the release says, because that is
+    /// what happened: the loop declined this work now and the page has not
+    /// failed at anything.
+    fn robots_cost(lease: &umi_state::Lease, now_ms: u64) -> Self {
+        // The outcome is built and thrown away. `give_back` sends the lease
+        // down the release path instead, and building one anyway keeps this
+        // constructor the same shape as the others rather than making
+        // `outcome` an `Option` that only one caller ever leaves empty.
+        let mut out = Self::excluded(lease, now_ms, umi_state::ExcludeReason::Robots);
+        out.give_back = true;
+        out
+    }
+
     /// A lease whose URL this fetcher could not send at all.
     ///
     /// `Malformed` rather than `Excluded`, because exclusion is a decision
@@ -1336,6 +1470,7 @@ impl Fetched {
             links: Vec::new(),
             links_seen: 0,
             disallowed: false,
+            give_back: false,
             signal: None,
         }
     }

@@ -15,7 +15,7 @@ use std::time::Duration;
 use umi_state::{HostRow, State};
 use umi_types::RowKey;
 
-use crate::run_tests::{Canned, Collected, T0, crawler, page, seeded};
+use crate::run_tests::{Canned, Collected, T0, crawler, page, robots_tick, seeded};
 
 const ORIGIN: &str = "https://example.com";
 
@@ -69,6 +69,7 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let crawler = crawler(fetch, state);
 
+    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
@@ -147,6 +148,7 @@ async fn a_robots_file_the_fetcher_would_not_finish_disallows_the_host() {
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let crawler = crawler(fetch, state);
 
+    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
@@ -181,6 +183,7 @@ async fn a_robots_redirect_off_the_domain_is_followed() {
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let crawler = crawler(fetch, state);
 
+    robots_tick(&crawler, &Collected::default()).await;
     for _ in 0..2 {
         crawler.tick(&Collected::default()).await.expect("tick");
     }
@@ -236,6 +239,7 @@ async fn a_robots_redirect_that_never_lands_disallows_the_host() {
     let state = seeded(&[&format!("{ORIGIN}/a")]).await;
     let crawler = crawler(fetch, state);
 
+    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
