@@ -45,6 +45,10 @@ TOTAL="${TOTAL:-100000}"
 PER_STRATUM_DOMAINS="${PER_STRATUM_DOMAINS:-1200}"
 # The cap that stops one site filling a stratum on its own.
 PER_DOMAIN_URLS="${PER_DOMAIN_URLS:-30}"
+# Well under what the box has, because the out of memory killer does not care
+# that this is a measurement and a run that dies at minute fifty has to start
+# again from the top.
+MEMORY="${MEMORY:-8GB}"
 
 DOMAINS="${DOMAINS:-hf://datasets/open-index/ccrawl-domains/data/cc-main-2026-apr-may-jun/*.parquet}"
 URLS="${URLS:-hf://datasets/open-index/ccrawl-urls/data/CC-MAIN-2026-25/*.parquet}"
@@ -56,7 +60,7 @@ echo "sampling into $db"
 echo "this reads both datasets off hugging face and takes about an hour"
 
 duckdb "$db" <<SQL
-SET memory_limit = '16GB';
+SET memory_limit = '$MEMORY';
 SET temp_directory = '$OUT/duckdb-tmp';
 SET preserve_insertion_order = false;
 
@@ -117,15 +121,29 @@ FROM sampled_domains GROUP BY stratum ORDER BY stratum;
 -- only url population large enough to stratify by rank in the first place, and
 -- the count of sampled domains that returned nothing is reported next to the
 -- result as the size of the hole.
-CREATE OR REPLACE TABLE candidates AS
-  SELECT u.url, u.url_host_registered_domain AS domain, d.rank, d.stratum,
-         row_number() OVER (PARTITION BY u.url_host_registered_domain
-                            ORDER BY hash(u.url)) AS pick
+--
+-- min_by and not a window function. The obvious way to write this is
+-- row_number over a partition by domain with a qualify on the end, and it gets
+-- killed by the out of memory killer, because a window has to hold every row of
+-- every partition before it can number them and some of these domains have
+-- millions of urls in the index. min_by keeps a heap of thirty per group and
+-- nothing else, so the memory is eight thousand groups wide regardless of how
+-- big the biggest site is. The urls it keeps are the ones with the smallest
+-- hash, which is a deterministic draw rather than an arbitrary one.
+CREATE OR REPLACE TABLE picks AS
+  SELECT u.url_host_registered_domain AS domain, d.rank, d.stratum,
+         min_by(u.url, hash(u.url), $PER_DOMAIN_URLS) AS urls
   FROM '$URLS' u
   JOIN sampled_domains d ON u.url_host_registered_domain = d.domain
   WHERE u.fetch_status = 200
     AND u.content_mime_detected = 'text/html'
-  QUALIFY pick <= $PER_DOMAIN_URLS;
+  GROUP BY 1, 2, 3;
+
+-- At most thirty urls a domain from here on, so the window below is cheap.
+CREATE OR REPLACE TABLE candidates AS
+  SELECT url, domain, rank, stratum,
+         row_number() OVER (PARTITION BY domain ORDER BY hash(url)) AS pick
+  FROM (SELECT domain, rank, stratum, unnest(urls) AS url FROM picks);
 
 -- Round robin rather than a straight cut. Taking the first url from every
 -- domain, then the second from every domain, and stopping when the stratum is
