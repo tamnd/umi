@@ -420,6 +420,29 @@ fn cat_projects_the_columns_it_was_given() {
 }
 
 #[test]
+fn cat_projects_a_list_column_out_of_a_parquet_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = segment(dir.path(), 8);
+    let parquet = dir.path().join("pages.parquet");
+    let segment = umi_file::Segment::open(&path).unwrap();
+    umi_publish::convert(&segment, &parquet).unwrap();
+
+    // `tier_path` is a list, so parquet stores it as a leaf three levels down
+    // called `tier_path.list.element`. Matching on the last part of that path
+    // finds nothing, and the projection used to report that the column was not
+    // in the file. It is in the file, and the analysis that reads a tier share
+    // out of a published corpus wants this column and no other.
+    let from_umi = capture(|sink| cat_to(&path, Some(3), Some(&["url", "tier_path"]), sink));
+    let from_parquet = capture(|sink| cat_to(&parquet, Some(3), Some(&["url", "tier_path"]), sink));
+    assert_eq!(from_umi, from_parquet);
+
+    let row: serde_json::Value =
+        serde_json::from_str(from_parquet.lines().next().unwrap()).unwrap();
+    assert_eq!(row.as_object().unwrap().len(), 2);
+    assert!(row.get("tier_path").unwrap().is_array(), "{row}");
+}
+
+#[test]
 fn cat_on_a_column_that_is_not_there_is_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();
     let path = segment(dir.path(), 4);

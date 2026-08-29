@@ -44,11 +44,16 @@ pub struct Show {
 pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
     let parsed = Url::parse(url).map_err(|_| Error::BadUrl(url.to_owned()))?;
 
-    // Honest rather than silently doing something else. T2 is behind a cargo
-    // feature, T3 needs a browser this command does not start and T4 is not
-    // written, so pretending a `--tier 3` request was served would make this
-    // command useless for the exact question it exists to answer.
-    let fetcher = Ladder::with_config(FetchConfig::default())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(Error::Io)?;
+
+    // Honest rather than silently doing something else. T2 and T3 are behind
+    // cargo features and T4 is not written, so pretending a `--tier 4` request
+    // was served would make this command useless for the exact question it
+    // exists to answer.
+    let fetcher = runtime.block_on(ladder(tier))?;
     let highest = fetcher.highest();
     if let Some(byte) = tier
         && byte > highest.as_u8()
@@ -63,19 +68,66 @@ pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
         .unwrap_or(Tier::Plain)
         .min(highest);
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(Error::Io)?;
-    let served = runtime.block_on(fetcher.fetch(parsed.as_str(), None, asked))?;
-    // The rung that answered rather than the rung that was asked for. They
-    // are the same here, since `asked` is already clamped to what this build
-    // has, but reading it off the answer is how it stays that way.
-    let used = served.path.used();
+    let served = runtime.block_on(fetcher.fetch(parsed.as_str(), None, asked));
+    // Close the browser before returning, whichever way this went. Dropping
+    // the ladder kills Chromium anyway, but it leaves the profile directory
+    // behind, and a debugging command that leaves a few hundred megabytes in
+    // the temp directory every time somebody runs it is a command people stop
+    // running.
+    let result = served.map_err(Error::from).and_then(|served| {
+        // The rung that answered rather than the rung that was asked for. They
+        // are the same here, since `asked` is already clamped to what this
+        // build has, but reading it off the answer is how it stays that way.
+        let used = served.path.used();
+        present(served.outcome, &parsed, used, show)
+    });
+    runtime.block_on(fetcher.shutdown());
+    result
+}
 
-    match served.outcome {
+/// The ladder this command runs the page through.
+///
+/// T3 starts a browser and no other rung does, so it is built only when the
+/// caller asked for T3 or higher by name. Doc 14.6 says this command is the
+/// one you reach for when a page extracted badly, and a page that extracted
+/// badly because it is a client rendered shell is exactly the case where the
+/// answer is invisible without a browser. Refusing to start one here would
+/// leave the only rung that can explain that page unreachable from the command
+/// line, which is how `umi get --tier 3` came to report tier 2 on every client
+/// rendered site somebody pointed it at.
+///
+/// One tab and not doc 05.6's eight. This fetches one url and then exits, so
+/// the pool never has a second page to hand out and the tabs would cost a few
+/// hundred megabytes to sit idle for the length of one fetch.
+async fn ladder(tier: Option<u8>) -> Result<Ladder, Error> {
+    #[cfg(feature = "render")]
+    if tier.is_some_and(|byte| byte >= Tier::Rendered.as_u8()) {
+        let mut config = FetchConfig::default();
+        // Doc 05.4's ceiling rather than the 512 KB the one page commands
+        // default to, for this rung only. What T3 returns is the serialised
+        // DOM after the scripts have run, and that is routinely several times
+        // the html the origin sent: vercel.com is 200 KB on the wire and over
+        // half a megabyte rendered. Leaving the small cap here meant `--tier
+        // 3` answered "200, TooLarge" on exactly the client rendered sites it
+        // exists to look at.
+        config.body_cap = 8 << 20;
+        // Assigned rather than built with a struct literal because
+        // `RenderConfig` is non exhaustive, which is the point: the rest of
+        // doc 05.6's numbers are defaults this command does not second guess.
+        let mut render = umi_fetch::RenderConfig::default();
+        render.tabs = 1;
+        return Ok(Ladder::with_rendered(config, None, render).await?);
+    }
+    #[cfg(not(feature = "render"))]
+    let _ = tier;
+    Ok(Ladder::with_config(FetchConfig::default())?)
+}
+
+/// Print whatever came back, which is the rest of the command.
+fn present(outcome: Outcome, parsed: &Url, used: Tier, show: &Show) -> Result<(), Error> {
+    match outcome {
         Outcome::Ok(page) => {
-            report(&page, &parsed, used);
+            report(&page, parsed, used);
             if show.headers {
                 section("headers");
                 for (name, value) in &page.headers_kept {
@@ -92,7 +144,7 @@ pub fn get(url: &str, tier: Option<u8>, show: &Show) -> Result<(), Error> {
             }
             let extracted = umi_extract::extract_with_headers(
                 &page.body,
-                &parsed,
+                parsed,
                 umi_extract::Headers {
                     x_robots_tag: header(&page, "x-robots-tag"),
                     link: header(&page, "link"),
