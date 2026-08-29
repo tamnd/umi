@@ -11,7 +11,7 @@
 //! flaky and would test hyper rather than umi, so the tests here implement this
 //! trait over a map of canned responses instead.
 
-use umi_fetch::{FetchError, Fetcher, Ladder, Outcome, Revalidator, Tier};
+use umi_fetch::{FetchError, Fetcher, Ladder, Revalidator, Served, Tier};
 
 /// Somewhere bytes come from.
 ///
@@ -34,23 +34,26 @@ pub trait Fetch: Send + Sync {
     /// `tier` is what doc 05.8 learned about this host, off the lease. It is a
     /// request and not an instruction: a fetcher that does not have the rung
     /// serves the highest one it does have, which for a build without the
-    /// `emulation` feature means a lease at T2 comes back over plain HTTP. The
-    /// loop cannot tell, and does not need to. It reports the block either way
-    /// and doc 05.8 backs the host off on its own.
+    /// `emulation` feature means a lease at T2 comes back over plain HTTP.
+    /// [`Served::path`] is where the fetcher says which rungs it really used,
+    /// and the loop stores that rather than what it asked for, because doc
+    /// 05.5 publishes the column and a column that reported the request would
+    /// say a browser rendered pages no browser ever saw.
     ///
     /// # Errors
     ///
     /// Only for things that are wrong with the request rather than with the
     /// world. A connection refused, a timeout and a 503 are all
-    /// [`Outcome`]s, because the loop has to record them against the URL and
-    /// back the host off, and an error type that mixed those with "this string
-    /// is not a URL" would make the loop match on both.
+    /// [`Outcome`](umi_fetch::Outcome)s, because the loop has to record them
+    /// against the URL and back the host off, and an error type that mixed
+    /// those with "this string is not a URL" would make the loop match on
+    /// both.
     async fn fetch(
         &self,
         url: &str,
         revalidate: Option<&Revalidator>,
         tier: Tier,
-    ) -> Result<Outcome, FetchError>;
+    ) -> Result<Served, FetchError>;
 
     /// How many pages a second this fetcher can render, doc 05.9.
     ///
@@ -70,7 +73,7 @@ impl Fetch for Ladder {
         url: &str,
         revalidate: Option<&Revalidator>,
         tier: Tier,
-    ) -> Result<Outcome, FetchError> {
+    ) -> Result<Served, FetchError> {
         Self::fetch(self, url, revalidate, tier).await
     }
 
@@ -91,9 +94,16 @@ impl Fetch for Fetcher {
         &self,
         url: &str,
         revalidate: Option<&Revalidator>,
-        _tier: Tier,
-    ) -> Result<Outcome, FetchError> {
-        Self::fetch(self, url, revalidate).await
+        tier: Tier,
+    ) -> Result<Served, FetchError> {
+        // No ladder, so the rung asked for is the rung that answered, except
+        // that T0 and T1 are the same client here as everywhere else.
+        let served = match tier {
+            Tier::Revalidate => tier,
+            _ => Tier::Plain,
+        };
+        let outcome = Self::fetch(self, url, revalidate).await?;
+        Ok(Served::descended(tier, served, outcome))
     }
 }
 
@@ -104,7 +114,7 @@ impl<T: Fetch + ?Sized> Fetch for std::sync::Arc<T> {
         url: &str,
         revalidate: Option<&Revalidator>,
         tier: Tier,
-    ) -> Result<Outcome, FetchError> {
+    ) -> Result<Served, FetchError> {
         (**self).fetch(url, revalidate, tier).await
     }
 

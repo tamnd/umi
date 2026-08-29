@@ -93,7 +93,7 @@ use engine::Engine;
 
 pub use outcome::{Failure, Hop, Outcome, OutcomeCode, Page, RetryAfter, Stage, Version};
 pub use sniff::Media;
-pub use umi_types::{Revalidator, Tier};
+pub use umi_types::{Revalidator, Tier, TierPath};
 pub use webbotauth::{Directory, Jwk, SignatureError, Signer};
 
 #[cfg(feature = "emulation")]
@@ -519,6 +519,10 @@ impl Ladder {
     /// `Tier::Revalidate` and `Tier::Plain` are the same client and differ
     /// only in whether `revalidate` is set, which is the caller's decision.
     ///
+    /// The answer carries the rungs it took to get it, because the tier a
+    /// lease asks for and the tier that answers are not always the same one
+    /// and doc 05.5 publishes the second of those.
+    ///
     /// # Errors
     ///
     /// [`FetchError::Url`] when the URL does not parse or is not http(s).
@@ -528,7 +532,7 @@ impl Ladder {
         url: &str,
         revalidate: Option<&Revalidator>,
         tier: Tier,
-    ) -> Result<Outcome> {
+    ) -> Result<Served> {
         // T3 first, so that a lease for it gets a browser when there is one and
         // falls through to T2 and then T1 when there is not. Doc 05.4's rule
         // about a missing rung is the same at every height: serve the page from
@@ -554,17 +558,66 @@ impl Ladder {
                     ..
                 }
             ) {
-                return Ok(outcome);
+                return Ok(Served::at(tier, outcome));
             }
-            return self.plain.fetch(url, revalidate).await;
+            let outcome = self.plain.fetch(url, revalidate).await?;
+            return Ok(Served {
+                path: TierPath::new(tier).then(Tier::Plain),
+                outcome,
+            });
         }
-        match tier {
-            #[cfg(feature = "emulation")]
-            Tier::Emulated | Tier::Rendered | Tier::Supervised => {
-                self.emulated.fetch(url, revalidate).await
-            }
-            _ => self.plain.fetch(url, revalidate).await,
+        #[cfg(feature = "emulation")]
+        if matches!(tier, Tier::Emulated | Tier::Rendered | Tier::Supervised) {
+            let outcome = self.emulated.fetch(url, revalidate).await?;
+            return Ok(Served::descended(tier, Tier::Emulated, outcome));
         }
+        // T0 and T1 are the same client, so a lease for either of them lands
+        // on the rung it asked for and has not descended. Anything higher that
+        // reaches here is a rung this build does not have, and doc 05.4 says
+        // serve it from the highest rung that exists rather than error.
+        let served = match tier {
+            Tier::Revalidate | Tier::Plain => tier,
+            _ => Tier::Plain,
+        };
+        let outcome = self.plain.fetch(url, revalidate).await?;
+        Ok(Served::descended(tier, served, outcome))
+    }
+}
+
+/// One answer, and the rungs it took to get it.
+#[derive(Debug)]
+pub struct Served {
+    /// What came back.
+    pub outcome: Outcome,
+    /// Doc 04.5's `tier_path`, which starts at the tier the lease asked for
+    /// and ends at the tier that answered.
+    pub path: TierPath,
+}
+
+impl Served {
+    /// An answer from the rung that was asked for, which is nearly all of
+    /// them.
+    #[must_use]
+    pub const fn at(tier: Tier, outcome: Outcome) -> Self {
+        Self {
+            outcome,
+            path: TierPath::new(tier),
+        }
+    }
+
+    /// An answer from `served` when `asked` was requested, which is one rung
+    /// when they are the same and two when the build does not have the rung
+    /// the lease wanted.
+    #[must_use]
+    pub const fn descended(asked: Tier, served: Tier, outcome: Outcome) -> Self {
+        // By byte rather than by `==`, which is not something a const fn can
+        // call on 1.98.
+        let path = if asked.as_u8() == served.as_u8() {
+            TierPath::new(served)
+        } else {
+            TierPath::new(asked).then(served)
+        };
+        Self { outcome, path }
     }
 }
 

@@ -187,12 +187,32 @@ async fn a_lease_above_the_top_of_the_ladder_is_served_by_the_top_of_the_ladder(
         Origin::start(|_| Reply::response(200, &[("content-type", "text/html")], b"ok")).await;
     let ladder = Ladder::with_config(FetchConfig::default()).expect("the ladder builds");
 
+    let highest = ladder.highest();
     for tier in Tier::ALL {
-        let outcome = ladder
+        let served = ladder
             .fetch(&origin.url("/"), None, tier)
             .await
             .expect("a url we can crawl");
-        assert!(matches!(outcome, Outcome::Ok(_)), "{tier:?}: {outcome:?}");
+        assert!(
+            matches!(served.outcome, Outcome::Ok(_)),
+            "{tier:?}: {:?}",
+            served.outcome
+        );
+
+        // Doc 04.5's path, and the reason it is on the answer. A lease for a
+        // rung this build does not have is served from the highest one it does,
+        // and the row has to say so rather than repeating the request back.
+        // T0 is the exception: it is the plain client with conditional headers
+        // on, so a T0 lease has not descended anywhere.
+        let landed = if tier == Tier::Revalidate {
+            Tier::Revalidate
+        } else {
+            tier.min(highest)
+        };
+        assert_eq!(served.path.used(), landed, "{tier:?}");
+        assert_eq!(served.path.asked(), tier, "{tier:?}");
+        let rungs = if landed == tier { 1 } else { 2 };
+        assert_eq!(served.path.len(), rungs, "{tier:?}");
     }
     assert_eq!(origin.requests().len(), Tier::ALL.len());
 }

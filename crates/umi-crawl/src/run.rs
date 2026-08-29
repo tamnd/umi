@@ -748,14 +748,22 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
 
         let robots_checked_ms = entry.fetched_ms;
         let started_ms = now();
-        let outcome = match self
+        let served = match self
             .fetch
             .fetch(&lease.url, lease.revalidate.as_ref(), lease.tier)
             .await
         {
-            Ok(outcome) => outcome,
+            Ok(served) => served,
             Err(_) => return Fetched::malformed(&lease, now()),
         };
+        // Doc 04.5's path, off the fetcher rather than off the lease. The two
+        // differ whenever the ladder moved: a build with no browser serving a
+        // T3 lease at T1, or a browser handing back something that is not a
+        // document and the plain client finishing the job. Doc 05.5 publishes
+        // this column as the record of what the web needs, so it has to be the
+        // rungs that ran.
+        let tier_path = served.path;
+        let outcome = served.outcome;
 
         let (outcome, audited) = self.audit(&lease, outcome).await;
         let fetched_at_ms = now();
@@ -875,8 +883,8 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             fetched_at_ms,
             outcome: &outcome,
             extracted: extracted.as_ref(),
-            tier_used: lease.tier,
-            tier_path: std::slice::from_ref(&lease.tier),
+            tier_used: tier_path.used(),
+            tier_path: tier_path.as_slice(),
             robots_checked_ms,
             content_usage: content_usage.as_deref(),
             fetcher_id: self.config.fetcher,
@@ -945,7 +953,13 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             lease: lease.id,
             key: lease.key,
             finished_ms: fetched_at_ms,
-            tier_used: lease.tier,
+            // Also the rung that answered, which is what the field is
+            // documented to hold. Not the same thing as `Learned::tier` a few
+            // lines up: that one feeds doc 05.8's host ladder and has to stay
+            // the tier the lease was for, because a favicon that T1 finished
+            // after a browser refused it says nothing about whether this
+            // host's pages still need a browser.
+            tier_used: tier_path.used(),
             result: result_of(&row, &outcome),
             pace,
         };
@@ -983,7 +997,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             .sleep_until_ms(self.clock.now_ms().saturating_add(delay))
             .await;
         match self.fetch.fetch(&lease.url, None, lease.tier).await {
-            Ok(fresh @ Outcome::Ok(_)) => (fresh, true),
+            Ok(fresh) if matches!(fresh.outcome, Outcome::Ok(_)) => (fresh.outcome, true),
             _ => (outcome, false),
         }
     }
