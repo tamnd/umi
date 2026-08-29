@@ -80,9 +80,17 @@ On detection, the honest position is that T3 is not stealthy and pretending othe
 
 A real browser with a real profile, driven by or with a human, on an explicit per domain allowlist.
 
-The allowlist entry records the domain, the operator who added it, an ISO timestamp, and a free text reason. It is stored in state, it is included in the published `hosts` table as a boolean plus the reason, and it appears in the operations dashboard. Anyone reading the corpus can see which domains were crawled this way and why.
+The allowlist entry records the domain, the operator who added it, an ISO timestamp, and a free text reason. It is stored in state, it is published one file per domain in `open-index/umi-meta` under `supervised/`, and it is linked from the bot page at `umi.dev/bot`. Anyone can see which domains are crawled this way and why, without having to ask us.
 
-T4 only ever runs on a fetcher whose operator has opted in with `umi fetch --allow-supervised`. It is never dispatched to a fetcher that has not, and the default is off. Community fetchers are never given T4 work unless attested, opted in, and explicitly enabled by a coordinator operator.
+The only way onto the list is `umi supervise <domain> --operator <who> --reason <text>`, from doc 14.5. Nothing escalates to T4. There is no signal that gets a host there after enough failures, no counter that reaches it, and no configuration key that lowers the bar. `TierPolicy::CEILING` is T2 and the highest rung anything climbs to on its own is T3, on a shell page.
+
+T4 only ever runs on a fetcher whose operator has opted in with `--allow-supervised`. It is never dispatched to a fetcher that has not, and the default is off. Community fetchers are never given T4 work unless attested, opted in, and explicitly enabled by a coordinator operator. The two switches are separate on purpose: the list says which domains may be crawled this way and the flag says which machines are willing to do it, and neither is any use without the other.
+
+Every fetch that a T4 lease produced is appended to `supervised.jsonl` in the crawl directory, with the URL, the time, the status, the size and the rung that answered. Its own file rather than a query over the crawled rows, because doc 12 deletes the local copy of a segment once it is published, so the rows that would answer "what did you fetch from my site with a browser" are exactly the rows that go away. `umi supervise <domain> --show` prints it, and that is what an operator gets sent when they ask.
+
+The line is written for the tier the lease asked for and not the tier that answered, and it carries both. A build with no supervised engine would otherwise keep an empty record while happily leasing at T4, which is the shape of disclosure that looks clean because it is not writing anything down.
+
+The supervised browser itself is not built. What exists is the allowlist, the opt in, the publishing, the disclosure on the bot page and the per fetch record. A fetch requested at T4 today descends to T3 and says so in `tier_path`, because a row claiming T4 while a headless browser with a temporary profile did the work would be a false entry in the one column this entire tier exists to keep true. Section 5.6's engine is one incognito context per domain on a throwaway profile, which is the opposite of what the first sentence of this section describes.
 
 This tier will get very little use and that is correct.
 

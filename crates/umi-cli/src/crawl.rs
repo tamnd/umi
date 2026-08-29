@@ -75,7 +75,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use umi_crawl::{
-    Clock, CrawlConfig, Crawler, Scope, SegmentInfo, SegmentSink, SystemClock, TickReport,
+    Clock, CrawlConfig, Crawler, Recorded, Scope, SegmentInfo, SegmentSink, SupervisedLedger,
+    SystemClock, TickReport,
 };
 use umi_fetch::webbotauth::Signer;
 use umi_fetch::{FetchConfig, Ladder};
@@ -181,6 +182,12 @@ pub struct Options {
     pub concurrency: u16,
     /// Highest tier allowed.
     pub tier_max: u8,
+    /// Doc 05.7's opt in. Off by default and the only thing that lets a lease
+    /// come back at T4, and then only for a domain somebody put on the
+    /// supervised list with `umi supervise`. Two separate switches on purpose:
+    /// one says which domains may be crawled that way and the other says this
+    /// machine is willing to do it, and neither is any use without the other.
+    pub allow_supervised: bool,
     /// Doc 05.6's tab cap. Zero means this machine does not render, which is
     /// the default and is also what a build without the `render` feature can
     /// do regardless of what is configured.
@@ -782,7 +789,7 @@ fn settings(options: &Options) -> Result<Settings, Error> {
         config: CrawlConfig {
             fetcher: FetcherId::LOCAL,
             in_flight: usize::from(options.concurrency.max(1)),
-            max_tier: tier(options.tier_max),
+            max_tier: tier(options.tier_max, options.allow_supervised),
             ..CrawlConfig::default()
         },
         watch: options.watch,
@@ -808,13 +815,22 @@ fn delay_ms(rps: f32) -> u32 {
     ms
 }
 
-fn tier(max: u8) -> Tier {
+fn tier(max: u8, allow_supervised: bool) -> Tier {
+    // Doc 05.7's opt in, and it is the only thing in the workspace that
+    // produces `Tier::Supervised` from operator input. It raises the ceiling
+    // and nothing more: the lease still comes back at T3 unless the domain is
+    // on the supervised list, which is the state layer's decision and not this
+    // one. An explicit `--tier` below 3 still wins, because somebody who capped
+    // the ladder meant it and a flag about one rung should not undo a cap about
+    // all of them.
+    if allow_supervised && max >= 3 {
+        return Tier::Supervised;
+    }
     match max {
         0 => Tier::Revalidate,
         1 => Tier::Plain,
         2 => Tier::Emulated,
-        3 => Tier::Rendered,
-        // Doc 05.6 says tier 4 is allowlisted and opted into, never reached by
+        // Doc 05.7 says T4 is allowlisted and opted into, never reached by
         // typing a bigger number, so `--tier 9` means the highest tier a crawl
         // can ask for on its own rather than the highest one that exists.
         _ => Tier::Rendered,
@@ -1021,6 +1037,11 @@ fn run(
     )
     .map_err(Error::Io)?;
 
+    // Doc 05.7's record. It writes nothing until something is leased at T4, so
+    // a crawl that never opts in leaves no file behind, and it wraps the
+    // segment sink rather than replacing it because the same rows go to both.
+    let ledger = SupervisedLedger::in_dir(&layout.dir);
+
     let crawler = Crawler::new(
         fetcher,
         Arc::clone(&state),
@@ -1137,7 +1158,7 @@ fn run(
         let mut interrupt = interrupt();
         loop {
             let report = crawler
-                .tick(&sink)
+                .tick(&Recorded::new(&ledger, &sink))
                 .await
                 .map_err(|e| Error::Crawl(e.to_string()))?;
             add(&mut summary, &report);
@@ -1967,6 +1988,7 @@ impl Default for Options {
             rps: 1.0,
             concurrency: 4,
             tier_max: 3,
+            allow_supervised: false,
             tabs: 0,
             seed: None,
             seeder: Vec::new(),

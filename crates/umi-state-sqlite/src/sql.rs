@@ -510,6 +510,21 @@ pub const SELECT_BLOCKS: &str = "
 SELECT pld, domain, reason, blocked_ms, lifted_ms, lifted_reason
   FROM blocks";
 
+/// Write an allowlist entry whole, doc 05.7's T4 list.
+///
+/// `INSERT OR REPLACE` for the same reason [`PUT_BLOCK`] is one: taking a
+/// domain off the list is the same row with two more columns filled in, and
+/// the caller has just built the whole thing.
+pub const PUT_SUPERVISION: &str = "
+INSERT OR REPLACE INTO supervision (
+    pld, domain, operator, reason, added_ms, removed_ms, removed_reason
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)";
+
+/// The whole allowlist, removed entries included, in key order.
+pub const SELECT_SUPERVISION: &str = "
+SELECT pld, domain, operator, reason, added_ms, removed_ms, removed_reason
+  FROM supervision";
+
 /// Take a blocked domain's urls out of the frontier.
 ///
 /// The `WHERE` is the scheduler's own state test, so a gone row stays gone and

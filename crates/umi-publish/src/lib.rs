@@ -61,6 +61,7 @@ pub mod keys;
 pub mod manifest;
 pub mod pipeline;
 pub mod repo;
+pub mod supervised;
 pub mod verify;
 
 #[cfg(test)]
@@ -76,6 +77,7 @@ pub use keys::{Role, SigningKey, VerifyingKey};
 pub use manifest::{FileEntry, Manifest, Verification};
 pub use pipeline::{PublishConfig, Published, Publisher, stream_kind, stream_of};
 pub use repo::{Corpus, Family, Location, locate};
+pub use supervised::{SupervisedEntry, publish_supervised, published_supervised};
 pub use verify::{Report, verify};
 
 /// What can go wrong publishing.
@@ -175,3 +177,29 @@ pub enum Error {
 
 /// The result type this crate returns.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The path in `umi-meta` for a per domain file under `dir`.
+///
+/// Both of the lists we publish about domains, the blocks in [`blocklist`] and
+/// the supervised entries in [`supervised`], are one small file per registrable
+/// domain. This is the check that keeps the domain from naming something other
+/// than a file in that directory. Domains reach it having already been widened
+/// to a registrable domain, so anything with a slash, an empty label or a
+/// leading dot did not come from there and is not going into a repository path
+/// on trust.
+fn domain_path(dir: &str, domain: &str) -> Result<String> {
+    let usable = !domain.is_empty()
+        && domain.len() <= 253
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..");
+    if !usable {
+        return Err(Error::Manifest(
+            "a list entry names a domain that cannot be one",
+        ));
+    }
+    Ok(format!("{dir}/{domain}.json"))
+}

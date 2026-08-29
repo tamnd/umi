@@ -128,14 +128,34 @@ fn the_rate_is_clamped_to_doc_13_3s_ceiling() {
 
 #[test]
 fn tier_numbers_map_onto_the_ladder_and_stop_at_the_top_of_it() {
-    assert_eq!(tier(1), umi_types::Tier::Plain);
-    assert_eq!(tier(2), umi_types::Tier::Emulated);
-    assert_eq!(tier(3), umi_types::Tier::Rendered);
+    assert_eq!(tier(1, false), umi_types::Tier::Plain);
+    assert_eq!(tier(2, false), umi_types::Tier::Emulated);
+    assert_eq!(tier(3, false), umi_types::Tier::Rendered);
     assert_eq!(
-        tier(9),
+        tier(9, false),
         umi_types::Tier::Rendered,
         "tier 4 is opt in and allowlisted, never reached by typing a number"
     );
+}
+
+#[test]
+fn tier_four_needs_the_opt_in_and_a_cap_below_it_still_wins() {
+    assert_eq!(
+        tier(3, true),
+        umi_types::Tier::Supervised,
+        "--allow-supervised did not raise the ceiling"
+    );
+    assert_eq!(
+        tier(9, true),
+        umi_types::Tier::Supervised,
+        "the opt in stops mattering above the top of the ladder"
+    );
+    assert_eq!(
+        tier(2, true),
+        umi_types::Tier::Emulated,
+        "an explicit cap below T3 was overruled by a flag about one rung"
+    );
+    assert_eq!(tier(1, true), umi_types::Tier::Plain);
 }
 
 fn with_budget(pages: Option<u64>, seconds: Option<u64>) -> Settings {

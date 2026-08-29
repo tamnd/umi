@@ -72,8 +72,8 @@ use umi_state::{
     AdmitReport, BlockReport, BlockRow, CLASSES, Candidate, Checkpoint, DAILY_UNDER_MS, Discovery,
     EvictReport, FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow, Lease, LeaseId, LeaseRequest,
     LedgerRow, NackReason, Priority, REALTIME_UNDER_MS, RefreshClass, Result, Revalidator,
-    SegmentQuery, SegmentRow, State, StateError, StateStats, TierPolicy, UrlState, WEEKLY_UNDER_MS,
-    next_due_dated, retry_after_ms,
+    SegmentQuery, SegmentRow, State, StateError, StateStats, SupervisionRow, TierPolicy, UrlState,
+    WEEKLY_UNDER_MS, next_due_dated, retry_after_ms,
 };
 use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
 
@@ -198,6 +198,10 @@ struct Inner {
     /// operator sets when somebody asks us to stop. Merging them would let the
     /// tier logic clear a block.
     blocked_plds: HashSet<PldId>,
+    /// Doc 05.7's T4 allowlist, the enforced half. Read at open and kept in
+    /// step by `supervise`, because the lease path cannot afford a query per
+    /// url any more than the block check can.
+    supervised_plds: HashSet<PldId>,
     next_lease: u64,
     checkpoint_seq: u64,
 }
@@ -259,6 +263,7 @@ impl SqliteState {
 
         let blocked = load_blocked(&conn)?;
         let blocked_plds = load_blocked_plds(&conn)?;
+        let supervised_plds = load_supervised_plds(&conn)?;
         let next_lease = meta_u64(&conn, "next_lease")?.unwrap_or(0);
         let checkpoint_seq = meta_u64(&conn, "checkpoint_seq")?.unwrap_or(0);
 
@@ -267,6 +272,7 @@ impl SqliteState {
                 conn,
                 blocked,
                 blocked_plds,
+                supervised_plds,
                 next_lease,
                 checkpoint_seq,
             }),
@@ -453,6 +459,22 @@ fn load_blocked_plds(conn: &Connection) -> Result<HashSet<PldId>> {
     Ok(plds)
 }
 
+/// The domains doc 05.7 allows T4 on, read once at open.
+///
+/// Removed entries are left out for the same reason lifted blocks are: this
+/// set is the enforcement and the table is the record.
+fn load_supervised_plds(conn: &Connection) -> Result<HashSet<PldId>> {
+    let mut stmt = conn
+        .prepare("SELECT pld FROM supervision WHERE removed_ms IS NULL")
+        .state()?;
+    let plds = stmt
+        .query_map([], |r| row::pld(r, "pld"))
+        .state()?
+        .collect::<rusqlite::Result<HashSet<_>>>()
+        .state()?;
+    Ok(plds)
+}
+
 fn meta_u64(conn: &Connection, key: &str) -> Result<Option<u64>> {
     let value: Option<String> = conn
         .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -528,6 +550,7 @@ fn pull(
     want: usize,
     req: &LeaseRequest<'_>,
     blocked_plds: &HashSet<PldId>,
+    supervised_plds: &HashSet<PldId>,
     picks: &mut Picks,
 ) -> Result<()> {
     let mut taken = 0usize;
@@ -587,7 +610,16 @@ fn pull(
             last_mod_ms: row::from_ms(r.get("last_mod_ms").state()?),
             delay_ms: adaptive.max(crawl.unwrap_or(0)).max(0) as u64,
             next_allowed_ms: row::from_ms(r.get("next_allowed_ms").state()?),
-            tier: policy.start_at(req.max_tier, req.now_ms),
+            // Doc 05.7's allowlist is the only thing in the system that
+            // produces a T4 lease, and it is checked here rather than when the
+            // entry is written so that a url which arrived afterwards sees it
+            // too. A fetcher that has not opted in never gets one, because
+            // `max_tier` is what it said it would run.
+            tier: if req.max_tier >= Tier::Supervised && supervised_plds.contains(&key.pld) {
+                Tier::Supervised
+            } else {
+                policy.start_at(req.max_tier, req.now_ms)
+            },
             probe: policy.probing(req.now_ms),
             content_hash: row::bytes(r, "content_hash").state()?,
             conditional: policy.conditional(),
@@ -765,7 +797,14 @@ impl State for SqliteState {
                 for (rows, class) in cursors.iter_mut().zip(CLASSES) {
                     let room = max_urls - picks.rows.len();
                     let want = (req.budget.quota(class, req.max_urls) as usize).min(room);
-                    pull(rows, want, req, &inner.blocked_plds, &mut picks)?;
+                    pull(
+                        rows,
+                        want,
+                        req,
+                        &inner.blocked_plds,
+                        &inner.supervised_plds,
+                        &mut picks,
+                    )?;
                 }
 
                 // A share is a floor and not a cap. Whatever the classes did
@@ -778,7 +817,14 @@ impl State for SqliteState {
                     if want == 0 {
                         break;
                     }
-                    pull(rows, want, req, &inner.blocked_plds, &mut picks)?;
+                    pull(
+                        rows,
+                        want,
+                        req,
+                        &inner.blocked_plds,
+                        &inner.supervised_plds,
+                        &mut picks,
+                    )?;
                 }
             }
 
@@ -1327,6 +1373,66 @@ impl State for SqliteState {
             let mut stmt = guard.conn.prepare_cached(sql::SELECT_BLOCKS).state()?;
             let rows = stmt
                 .query_map([], row::block)
+                .state()?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .state()?;
+            Ok(rows)
+        })
+    }
+
+    async fn supervise(&self, rows: &[SupervisionRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        blocking(|| {
+            let mut guard = self.lock();
+            let Inner {
+                conn,
+                supervised_plds,
+                ..
+            } = &mut *guard;
+            // Durable, and the trait says why: the published list is what
+            // makes this tier disclosed rather than secret, and an entry a
+            // crash can undo is one the published list could disagree with.
+            set_sync(conn, Sync::Durable)?;
+            let tx = conn.transaction().state()?;
+            {
+                let mut put = tx.prepare_cached(sql::PUT_SUPERVISION).state()?;
+                for row in rows {
+                    put.execute(params![
+                        &row.pld.as_bytes()[..],
+                        row.domain.as_str(),
+                        row.operator.as_str(),
+                        row.reason.as_str(),
+                        row::to_ms(row.added_ms),
+                        row.removed_ms.map(row::to_ms),
+                        row.removed_reason.as_str(),
+                    ])
+                    .state()?;
+                }
+            }
+            tx.commit().state()?;
+
+            // After the commit, so a batch that failed leaves the set agreeing
+            // with the file rather than with what the caller wanted.
+            for row in rows {
+                if row.in_force() {
+                    supervised_plds.insert(row.pld);
+                } else {
+                    supervised_plds.remove(&row.pld);
+                }
+            }
+            Ok(rows.len())
+        })
+    }
+
+    async fn supervision(&self) -> Result<Vec<SupervisionRow>> {
+        blocking(|| {
+            let guard = self.lock();
+            let mut stmt = guard.conn.prepare_cached(sql::SELECT_SUPERVISION).state()?;
+            let rows = stmt
+                .query_map([], row::supervision)
                 .state()?
                 .collect::<rusqlite::Result<Vec<_>>>()
                 .state()?;

@@ -790,6 +790,79 @@ pub struct BlockReport {
     pub restored: u64,
 }
 
+/// One domain somebody has deliberately put on doc 05.7's T4 allowlist.
+///
+/// T4 is the only rung nothing reaches by learning. Every other tier is
+/// escalated into by a host that refused the rung below, and doc 05.8 caps
+/// that at T3, so the only way a fetch runs supervised is an entry here that
+/// a person wrote with their name on it.
+///
+/// The row carries who added it and why for the same reason the block list
+/// does: it is published, and doc 05.7 says anyone reading the corpus can see
+/// which domains were crawled this way and why. An allowlist that exists but
+/// is not disclosed makes doc 07's whole claim false, which is that a site
+/// operator can find out exactly how we treat their site.
+///
+/// Removal is recorded rather than deleted, again like a block, because the
+/// interesting question a year later is not what the list says now but what it
+/// said when a given page was fetched.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SupervisionRow {
+    /// The domain, as the key a lease is matched on.
+    pub pld: PldId,
+    /// The same domain as text, for the published list.
+    pub domain: String,
+    /// Who added it. A person, named, because a tier this expensive should
+    /// have somebody's name against it.
+    pub operator: String,
+    /// Why, in words a stranger reads later.
+    pub reason: String,
+    /// When it was added.
+    pub added_ms: u64,
+    /// When it came off the list, or `None` while it is in force.
+    pub removed_ms: Option<u64>,
+    /// Why it came off, empty while it is in force.
+    pub removed_reason: String,
+}
+
+impl SupervisionRow {
+    /// An allowlist entry for whatever registrable domain `domain` falls
+    /// under.
+    ///
+    /// Widened the same way a block is, and for the same reason. Supervising
+    /// one host of a site and not the rest would mean a published list that
+    /// does not describe what actually happened.
+    #[must_use]
+    pub fn new(domain: &str, operator: &str, reason: &str, added_ms: u64) -> Self {
+        let pld = pay_level_domain(domain);
+        Self {
+            pld: PldId::derive(pld.as_bytes()),
+            domain: pld.to_owned(),
+            operator: operator.to_owned(),
+            reason: reason.to_owned(),
+            added_ms,
+            removed_ms: None,
+            removed_reason: String::new(),
+        }
+    }
+
+    /// Whether this entry still lets anything run at T4.
+    #[must_use]
+    pub const fn in_force(&self) -> bool {
+        self.removed_ms.is_none()
+    }
+
+    /// The same entry, taken off the list, keeping the original dates.
+    #[must_use]
+    pub fn remove(&self, reason: &str, removed_ms: u64) -> Self {
+        Self {
+            removed_ms: Some(removed_ms),
+            removed_reason: reason.to_owned(),
+            ..self.clone()
+        }
+    }
+}
+
 /// Where a host's robots.txt lives and how long we may believe it.
 ///
 /// A digest rather than the parsed rules, because parsed rules belong to

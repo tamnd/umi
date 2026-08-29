@@ -13,7 +13,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use umi_cli::{Error, block, config, crawl, doctor, get, inspect, verify};
+use umi_cli::{Error, block, config, crawl, doctor, get, inspect, supervise, verify};
 use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
 
@@ -177,6 +177,29 @@ enum Command {
         #[arg(long, default_value = ".")]
         dir: String,
     },
+    /// Put a domain on doc 05.7's supervised allowlist, or take it off.
+    Supervise {
+        /// The domain. Left out, the command prints the list.
+        domain: Option<String>,
+        /// Why, which is published alongside the entry.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Who is adding it. A person, because doc 05.7 wants somebody who can
+        /// be asked about it later.
+        #[arg(long)]
+        operator: Option<String>,
+        /// Take the domain off the list, with the reason as the note. The entry
+        /// stays in the list either way.
+        #[arg(long)]
+        remove: bool,
+        /// Print every tier 4 fetch from this domain instead of changing
+        /// anything. This is what an operator gets sent when they ask.
+        #[arg(long)]
+        show: bool,
+        /// The crawl directory to apply it to.
+        #[arg(long, default_value = ".")]
+        dir: String,
+    },
     /// Evaluate a scope profile against a list of URLs.
     Scope {
         /// One of: check.
@@ -239,6 +262,10 @@ struct CrawlArgs {
     /// Never open a browser. Equivalent to `--tier 2`.
     #[arg(long)]
     no_render: bool,
+    /// Doc 05.7's opt in to tier 4. Off by default. It still only reaches the
+    /// domains on the supervised list, which `umi supervise` writes.
+    #[arg(long)]
+    allow_supervised: bool,
     /// Browser tabs for tier 3, doc 05.6. Zero, the default, is a machine
     /// that does not render.
     #[arg(long)]
@@ -290,6 +317,7 @@ impl CrawlArgs {
             rps: config.rps.value,
             concurrency: config.concurrency.value,
             tier_max: config.tier_max.value,
+            allow_supervised: self.allow_supervised,
             tabs: config.tabs.value,
             seed: self.seed.clone(),
             seeder: self.seeder.clone(),
@@ -489,6 +517,27 @@ fn run(command: &Command) -> Result<(), Error> {
                 domain: domain.as_deref(),
                 reason: reason.as_deref(),
                 lift: *lift,
+                token: token(&config)?,
+                org: &config.org.value,
+                now_ms: SystemClock.now_ms(),
+            })
+        }
+        Command::Supervise {
+            domain,
+            reason,
+            operator,
+            remove,
+            show,
+            dir,
+        } => {
+            let config = load(command)?;
+            supervise::run(&supervise::Options {
+                dir: std::path::Path::new(dir),
+                domain: domain.as_deref(),
+                reason: reason.as_deref(),
+                operator: operator.as_deref(),
+                remove: *remove,
+                show: *show,
                 token: token(&config)?,
                 org: &config.org.value,
                 now_ms: SystemClock.now_ms(),

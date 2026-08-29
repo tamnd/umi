@@ -22,13 +22,13 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Ulid, UrlKey, UrlKeyFull};
+use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Tier, Ulid, UrlKey, UrlKeyFull};
 
 use crate::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,
     Priority, Quotas, RefreshClass, Result, Revalidator, SegmentQuery, SegmentRow, State,
-    StateStats, UrlState, next_due_dated, retry_after_ms,
+    StateStats, SupervisionRow, UrlState, next_due_dated, retry_after_ms,
 };
 
 /// A [`State`] that lives entirely in memory.
@@ -52,6 +52,10 @@ struct Inner {
     /// lease paths is a hash of eight bytes. Lifted entries stay in it, so this
     /// is the published list and not just the enforced one.
     blocks: BTreeMap<PldId, BlockRow>,
+    /// Doc 05.7's T4 allowlist, keyed the same way and looked up on the lease
+    /// path for the same reason. Removed entries stay in it, so this is the
+    /// published list and not just the enforced one.
+    supervision: BTreeMap<PldId, SupervisionRow>,
     /// Sealed segments, keyed by ULID. A `BTreeMap` so that iteration is in
     /// seal order already and the sort in `segments` is doing nothing on the
     /// common path.
@@ -497,7 +501,23 @@ impl State for MemoryState {
                 depth: row.depth,
                 priority: row.priority,
                 attempt: row.fetch_count,
-                tier: host.tier.start_at(req.max_tier, req.now_ms),
+                // Doc 05.7's allowlist is the only thing in the system that
+                // produces a T4 lease. It is checked here rather than when the
+                // entry is written, for the same reason a block is checked
+                // here: a URL that arrived after the entry did would otherwise
+                // never see it. A fetcher that has not opted in to supervised
+                // work never gets one, because `max_tier` is what it said it
+                // would run and this cannot exceed it.
+                tier: if req.max_tier >= Tier::Supervised
+                    && inner
+                        .supervision
+                        .get(&key.pld)
+                        .is_some_and(SupervisionRow::in_force)
+                {
+                    Tier::Supervised
+                } else {
+                    host.tier.start_at(req.max_tier, req.now_ms)
+                },
                 probe: host.tier.probing(req.now_ms),
                 not_before_ms,
                 delay_ms: u32::try_from(delay).unwrap_or(u32::MAX),
@@ -742,6 +762,18 @@ impl State for MemoryState {
         // than in alphabetical order. Both are stable and neither is what a
         // reader wants, so whoever prints the list sorts it by name.
         Ok(self.lock().blocks.values().cloned().collect())
+    }
+
+    async fn supervise(&self, rows: &[SupervisionRow]) -> Result<usize> {
+        let mut inner = self.lock();
+        for row in rows {
+            inner.supervision.insert(row.pld, row.clone());
+        }
+        Ok(rows.len())
+    }
+
+    async fn supervision(&self) -> Result<Vec<SupervisionRow>> {
+        Ok(self.lock().supervision.values().cloned().collect())
     }
 
     async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()> {

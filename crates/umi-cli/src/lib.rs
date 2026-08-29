@@ -20,6 +20,7 @@ mod error;
 pub mod get;
 pub mod inspect;
 pub mod rdns;
+pub mod supervise;
 pub mod verify;
 
 #[cfg(test)]

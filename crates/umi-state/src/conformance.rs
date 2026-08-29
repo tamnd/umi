@@ -37,7 +37,7 @@ use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 use crate::{
     BlockRow, Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow,
     LeaseRequest, NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow,
-    State, Stream, retry_after_ms,
+    State, Stream, SupervisionRow, retry_after_ms,
 };
 
 /// A fixed instant to run every case from, so nothing in here depends on when
@@ -199,6 +199,10 @@ where
     run!(a_block_survives_being_applied_twice);
     run!(a_lift_is_dated_and_gives_the_domain_back);
     run!(the_block_list_reads_back_with_its_reason);
+    run!(nothing_reaches_t4_without_an_allowlist_entry);
+    run!(an_allowlist_entry_is_the_only_route_to_t4);
+    run!(an_allowlist_entry_does_not_overrule_the_fetcher);
+    run!(taking_a_domain_off_the_allowlist_takes_t4_with_it);
     run!(a_segment_record_round_trips);
     run!(an_unknown_segment_reads_back_as_none);
     run!(put_segment_replaces_rather_than_merges);
@@ -1294,6 +1298,143 @@ async fn apply(state: &dyn State, rows: &[BlockRow]) -> Result<crate::BlockRepor
         .block(rows)
         .await
         .map_err(|e| format!("block failed: {e}"))
+}
+
+/// Doc 05.7's reason, written the way a real one would be.
+const SUPERVISED_BECAUSE: &str =
+    "the archive asked us to mirror their catalogue, agreed 2026-08-20";
+
+async fn nothing_reaches_t4_without_an_allowlist_entry(state: &dyn State) -> Outcome {
+    // The point of the whole tier. A fetcher that says it will run supervised
+    // work still gets ordinary leases, because the allowlist is empty and
+    // nothing else in the system can raise the ceiling that far.
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let req = LeaseRequest {
+        max_tier: Tier::Supervised,
+        ..LeaseRequest::new(FetcherId::LOCAL, T0, 16)
+    };
+    let leases = state
+        .lease(&req)
+        .await
+        .map_err(|e| format!("lease failed: {e}"))?;
+    ensure!(
+        !leases.is_empty(),
+        "nothing was leasable, so this proves nothing"
+    );
+    ensure!(
+        leases.iter().all(|lease| lease.tier < Tier::Supervised),
+        "a lease reached T4 with an empty allowlist"
+    );
+    Ok(())
+}
+
+async fn an_allowlist_entry_is_the_only_route_to_t4(state: &dyn State) -> Outcome {
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let entry = SupervisionRow::new(BLOCKED_DOMAIN, "tam", SUPERVISED_BECAUSE, T0);
+    state
+        .supervise(std::slice::from_ref(&entry))
+        .await
+        .map_err(|e| format!("supervise failed: {e}"))?;
+
+    // A fetcher that has opted in gets the tier the list allows.
+    let opted_in = LeaseRequest {
+        max_tier: Tier::Supervised,
+        ..LeaseRequest::new(FetcherId::LOCAL, T0, 16)
+    };
+    let leases = state
+        .lease(&opted_in)
+        .await
+        .map_err(|e| format!("lease failed: {e}"))?;
+    ensure!(
+        leases.iter().all(|lease| lease.tier == Tier::Supervised),
+        "an allowlisted domain did not lease at T4: {:?}",
+        leases.iter().map(|lease| lease.tier).collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+async fn an_allowlist_entry_does_not_overrule_the_fetcher(state: &dyn State) -> Outcome {
+    // The allowlist raises a ceiling, it does not push work up to it. A fetcher
+    // with no browser and nobody watching it says so in its lease request, and
+    // an entry on the list is not allowed to argue.
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    state
+        .supervise(&[SupervisionRow::new(
+            BLOCKED_DOMAIN,
+            "tam",
+            SUPERVISED_BECAUSE,
+            T0,
+        )])
+        .await
+        .map_err(|e| format!("supervise failed: {e}"))?;
+
+    let leases = lease_one(state, T0).await?;
+    ensure!(
+        !leases.is_empty(),
+        "nothing was leasable, so this proves nothing"
+    );
+    ensure!(
+        leases.iter().all(|lease| lease.tier < Tier::Supervised),
+        "a fetcher that did not opt in was handed supervised work"
+    );
+    Ok(())
+}
+
+async fn taking_a_domain_off_the_allowlist_takes_t4_with_it(state: &dyn State) -> Outcome {
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let entry = SupervisionRow::new(BLOCKED_DOMAIN, "tam", SUPERVISED_BECAUSE, T0);
+    state
+        .supervise(std::slice::from_ref(&entry))
+        .await
+        .map_err(|e| format!("supervise failed: {e}"))?;
+    let removed_ms = T0 + DAY;
+    let off = entry.remove("the mirror is finished", removed_ms);
+    state
+        .supervise(&[off])
+        .await
+        .map_err(|e| format!("supervise failed: {e}"))?;
+
+    let req = LeaseRequest {
+        max_tier: Tier::Supervised,
+        ..LeaseRequest::new(FetcherId::LOCAL, removed_ms, 16)
+    };
+    let leases = state
+        .lease(&req)
+        .await
+        .map_err(|e| format!("lease failed: {e}"))?;
+    ensure!(
+        !leases.is_empty(),
+        "nothing was leasable, so this proves nothing"
+    );
+    ensure!(
+        leases.iter().all(|lease| lease.tier < Tier::Supervised),
+        "a domain taken off the allowlist still leased at T4"
+    );
+
+    // The record stays, dated, because the published list is the disclosure
+    // and a deleted row is a record only whoever deleted it can describe.
+    let list = state
+        .supervision()
+        .await
+        .map_err(|e| format!("supervision failed: {e}"))?;
+    let held = list
+        .first()
+        .ok_or_else(|| "a removed entry left no record behind".to_owned())?;
+    ensure_eq!(list.len(), 1, "one domain produced more than one entry");
+    ensure_eq!(held.added_ms, T0, "the date it went on the list was lost");
+    ensure_eq!(
+        held.removed_ms,
+        Some(removed_ms),
+        "the removal was not dated"
+    );
+    ensure!(held.operator == "tam", "the operator was lost");
+    ensure!(held.reason == SUPERVISED_BECAUSE, "the reason was lost");
+    Ok(())
 }
 
 async fn a_segment_record_round_trips(state: &dyn State) -> Outcome {
