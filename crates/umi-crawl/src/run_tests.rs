@@ -503,6 +503,110 @@ pub(crate) async fn seeded(urls: &[&str]) -> Arc<dyn State> {
     state
 }
 
+/// A store that takes real time over an ask and no time over anything else.
+///
+/// The one call the loop makes that is a scan rather than a write, and the
+/// reason it has its own decorator is that it is the only call whose cost the
+/// loop is meant to hide. Everything else here delegates, which is why there is
+/// so much of it: the trait has eighteen methods and a wrapper that implemented
+/// four would not be a store.
+struct SlowLease {
+    inner: MemoryState,
+    per_ask: Duration,
+}
+
+#[async_trait::async_trait]
+impl State for SlowLease {
+    async fn lease(
+        &self,
+        req: &umi_state::LeaseRequest<'_>,
+    ) -> umi_state::Result<Vec<umi_state::Lease>> {
+        tokio::time::sleep(self.per_ask).await;
+        self.inner.lease(req).await
+    }
+
+    async fn admit(&self, batch: &[Candidate<'_>]) -> umi_state::Result<umi_state::AdmitReport> {
+        self.inner.admit(batch).await
+    }
+
+    async fn complete(&self, outcomes: &[umi_state::FetchOutcome]) -> umi_state::Result<()> {
+        self.inner.complete(outcomes).await
+    }
+
+    async fn release(
+        &self,
+        lease_ids: &[umi_state::LeaseId],
+        reason: umi_state::NackReason,
+    ) -> umi_state::Result<()> {
+        self.inner.release(lease_ids, reason).await
+    }
+
+    async fn host(&self, id: umi_types::HostId) -> umi_state::Result<Option<umi_state::HostRow>> {
+        self.inner.host(id).await
+    }
+
+    async fn put_host(&self, rows: &[umi_state::HostRow]) -> umi_state::Result<()> {
+        self.inner.put_host(rows).await
+    }
+
+    async fn block(
+        &self,
+        rows: &[umi_state::BlockRow],
+    ) -> umi_state::Result<umi_state::BlockReport> {
+        self.inner.block(rows).await
+    }
+
+    async fn blocks(&self) -> umi_state::Result<Vec<umi_state::BlockRow>> {
+        self.inner.blocks().await
+    }
+
+    async fn supervise(&self, rows: &[umi_state::SupervisionRow]) -> umi_state::Result<usize> {
+        self.inner.supervise(rows).await
+    }
+
+    async fn supervision(&self) -> umi_state::Result<Vec<umi_state::SupervisionRow>> {
+        self.inner.supervision().await
+    }
+
+    async fn put_segment(&self, rows: &[umi_state::SegmentRow]) -> umi_state::Result<()> {
+        self.inner.put_segment(rows).await
+    }
+
+    async fn segment(
+        &self,
+        id: umi_types::Ulid,
+    ) -> umi_state::Result<Option<umi_state::SegmentRow>> {
+        self.inner.segment(id).await
+    }
+
+    async fn segments(
+        &self,
+        query: umi_state::SegmentQuery,
+    ) -> umi_state::Result<Vec<umi_state::SegmentRow>> {
+        self.inner.segments(query).await
+    }
+
+    async fn warm(&self, plds: &[umi_types::PldId]) -> umi_state::Result<()> {
+        self.inner.warm(plds).await
+    }
+
+    async fn evict(&self, plds: &[umi_types::PldId]) -> umi_state::Result<umi_state::EvictReport> {
+        self.inner.evict(plds).await
+    }
+
+    async fn resident(&self) -> umi_state::Result<Vec<umi_types::PldId>> {
+        self.inner.resident().await
+    }
+
+    async fn checkpoint(&self, now_ms: u64) -> umi_state::Result<umi_state::Checkpoint> {
+        self.inner.checkpoint(now_ms).await
+    }
+
+    async fn stats(&self) -> umi_state::Result<umi_state::StateStats> {
+        self.inner.stats().await
+    }
+}
+
 pub(crate) fn crawler(
     fetch: Canned,
     state: Arc<dyn State>,
@@ -1002,6 +1106,79 @@ async fn the_loop_keeps_fetching_while_the_last_window_is_being_written() {
         "the loop waited {} ms of a {} ms write path, so the store is still on it",
         report.store_waited_ms,
         report.store_ms
+    );
+}
+
+#[tokio::test]
+async fn the_loop_keeps_fetching_while_the_next_ask_is_on_its_way() {
+    // The ask is a scan of the store and it is what is left on the loop task
+    // after #177. On server3 it was thirty seconds of a sixty second tick, and
+    // it grew with the frontier: nine seconds at ten thousand rows and thirty
+    // at eight hundred thousand, against a gate 3.1 frontier of five hundred
+    // million. Every one of those seconds is the window draining with nothing
+    // to refill it.
+    //
+    // A hundred and twenty eight urls through a window of sixteen, so eight
+    // asks, each taking thirty milliseconds against a window that takes forty
+    // to work through. Seven of the eight have a full queue to hide behind.
+    // The first cannot: a tick with nothing in hand has to wait for its first
+    // ask, and that is the one this asserts around.
+    let (urls, canned) = a_page_each(128);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state: Arc<dyn State> = Arc::new(SlowLease {
+        inner: MemoryState::new(),
+        per_ask: Duration::from_millis(30),
+    });
+    let batch: Vec<Candidate<'_>> = refs
+        .iter()
+        .map(|url| {
+            let mut c = Candidate::new(url, T0).expect("a crawlable url");
+            c.discovery = umi_state::Discovery::Seed;
+            c
+        })
+        .collect();
+    state.admit(&batch).await.expect("admit");
+
+    let fetch = Slow {
+        inner: canned,
+        per_request: Duration::from_millis(20),
+    };
+    let crawler = Crawler::new(
+        fetch,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            batch: 128,
+            in_flight: 16,
+            ..config()
+        },
+    );
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    assert_eq!(report.fetched, 128, "{report:?}");
+    assert!(
+        report.asks >= 8,
+        "a window of sixteen over a batch of a hundred and twenty eight is eight \
+         asks and this made {}",
+        report.asks
+    );
+    assert!(
+        report.ask_ms >= 150,
+        "eight asks of thirty milliseconds took {} ms, so the store was not the \
+         slow part and this test proves nothing",
+        report.ask_ms
+    );
+    // Three and not eight, because the seven that overlap do not overlap
+    // perfectly and a loaded machine widens every one of them. The failure
+    // this catches is the loop waiting for all eight.
+    assert!(
+        report.ask_waited_ms * 3 < report.ask_ms,
+        "the loop waited {} ms of {} ms of asking, so the ask is still on it",
+        report.ask_waited_ms,
+        report.ask_ms
     );
 }
 
