@@ -493,7 +493,7 @@ fn with_scope(
 ///
 /// The step is [`TICK_STEP_MS`], and the ceiling is there so a loop that never
 /// drains fails the test rather than hanging the suite.
-async fn drain<F: Fetch>(
+async fn drain<F: Fetch + 'static>(
     crawler: &Crawler<F, Arc<FixedClock>>,
     clock: &FixedClock,
     sink: &dyn Sink,
@@ -751,6 +751,20 @@ async fn a_batch_covering_one_host_is_spread_out_rather_than_sent_at_once() {
             "two requests to one host {gap} ms apart, {delay} ms asked for: {sent:?}"
         );
     }
+    // And no wider than that, which is the half nothing was checking. Politeness
+    // has an obvious safe direction and it is not free: the tick is as long as
+    // its slowest host, so a host whose slots drift apart is a tick that takes
+    // longer for no benefit to anybody. Five requests one delay apart is four
+    // delays end to end, and the bug this catches turned that into twelve by
+    // having each waiting lease take itself to the back of the queue every time
+    // another lease on the same host claimed a slot.
+    let span = sent[sent.len() - 1] - sent[0];
+    assert_eq!(
+        span,
+        4 * delay,
+        "five requests one {delay} ms delay apart should span {} ms: {sent:?}",
+        4 * delay
+    );
 }
 
 #[tokio::test]
@@ -1515,9 +1529,10 @@ async fn a_retry_after_moves_the_leases_the_tick_is_still_holding() {
     // Measured from the outside on gate 2.3's origin before this existed: a
     // 429 asking for six seconds was followed by another request 960 ms later,
     // out of the same batch.
-    let state = seeded(&["https://example.com/a"]).await;
+    let state = seeded(&["https://example.com/warm"]).await;
     let fetch = Canned::new()
         .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/warm", &page("W", &[]))
         .outcome(
             "https://example.com/a",
             Outcome::Failed {
@@ -1531,23 +1546,35 @@ async fn a_retry_after_moves_the_leases_the_tick_is_still_holding() {
     let crawler = crawler(fetch, Arc::clone(&state));
     let sink = Collected::default();
 
-    // One url through the robots tick and the other two admitted after it, so
-    // that the tick under test leases all three as one batch. A test that
-    // seeded three would spend two of them paying for the robots.txt.
+    // A tick of its own to pay for the robots.txt, and the three under test
+    // admitted after it, so that the tick under test leases all three as one
+    // batch and the 429 is the first request in it. A tick that paid for
+    // robots.txt as well would send the other two while the lease that owed
+    // the file was still fetching it, and then there would be nothing left
+    // waiting for the 429 to hold back.
+    crawler.tick(&sink).await.expect("warm");
     let mut rest = Vec::new();
-    for url in ["https://example.com/b", "https://example.com/c"] {
+    for url in [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+    ] {
         let mut seed = Candidate::new(url, T0).expect("a crawlable url");
         seed.discovery = umi_state::Discovery::Seed;
         rest.push(seed);
     }
     state.admit(&rest).await.expect("admit");
+    // Past the politeness window the warm tick left behind, or the host has
+    // nothing due and the tick under test leases none of the three.
+    crawler.clock().advance(TICK_STEP_MS);
+    let began = crawler.clock().now_ms();
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 3, "the three were not leased together");
     assert_eq!(report.failed, 1);
     assert_eq!(report.fetched, 2);
     assert!(
-        crawler.clock().now_ms() >= T1 + 6_000,
+        crawler.clock().now_ms() >= began + 6_000,
         "the six seconds the origin asked for were not left empty"
     );
 }

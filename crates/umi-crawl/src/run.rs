@@ -102,7 +102,28 @@ const ALERT_FLOOR: usize = 100;
 /// asked for. It lives for one tick because the next tick leases against a
 /// host record the state layer has already moved.
 #[derive(Debug, Default)]
-struct HostFloors(Mutex<HashMap<HostId, u64>>);
+struct HostFloors(Mutex<HashMap<HostId, Floor>>);
+
+/// What one host's slots look like inside a tick.
+///
+/// Two numbers and not one, and the second is the whole reason a lease that
+/// woke up can tell whether it has to move. `next` walks forward every time
+/// anybody claims, so a lease that compared its slot against `next` would find
+/// it had moved every time another lease on the same host was handed a later
+/// one, and every lease in a window would take itself to the back of the queue
+/// in turn. On a host with five urls in the window that is not five slots, it
+/// is thirteen, and the tick is as long as its worst host.
+///
+/// `asked` only moves when an origin names a time, which is the one thing that
+/// invalidates a slot somebody is already holding. So that is what a waiting
+/// lease reads.
+#[derive(Clone, Copy, Debug, Default)]
+struct Floor {
+    /// The next free slot, moved on by every claim.
+    next: u64,
+    /// The earliest an origin will accept a request, from `Retry-After`.
+    asked: u64,
+}
 
 /// What a tick has finished and not yet stored.
 ///
@@ -153,28 +174,26 @@ impl HostFloors {
     /// spoken for further out than that hands out the further one.
     fn claim(&self, host: HostId, earliest_ms: u64, delay_ms: u32) -> u64 {
         let mut floors = self.lock();
-        let slot = floors.entry(host).or_default();
-        let at = (*slot).max(earliest_ms);
-        *slot = at + u64::from(delay_ms);
+        let floor = floors.entry(host).or_default();
+        let at = floor.next.max(floor.asked).max(earliest_ms);
+        floor.next = at + u64::from(delay_ms);
         at
     }
 
     /// A later slot for a lease whose slot went stale while it waited.
     ///
-    /// [`None`] when it did not, which is the ordinary case. It goes stale
-    /// when [`push`](Self::push) moves the host past the slot this lease was
-    /// holding, and the only thing that does that is an origin naming a time.
+    /// [`None`] when it did not, which is the ordinary case and has to stay
+    /// the ordinary case. A slot goes stale when [`push`](Self::push) moves
+    /// the host past it, and the only thing that does that is an origin naming
+    /// a time.
     fn reclaim(&self, host: HostId, held_ms: u64, delay_ms: u32) -> Option<u64> {
         let mut floors = self.lock();
-        let slot = floors.entry(host).or_default();
-        // The claim left the host at `held_ms + delay_ms`, so anything past
-        // that is somebody else moving it and anything at or before it is this
-        // lease's own reservation looking back at itself.
-        if *slot <= held_ms + u64::from(delay_ms) {
+        let floor = floors.entry(host).or_default();
+        if floor.asked <= held_ms {
             return None;
         }
-        let at = *slot;
-        *slot = at + u64::from(delay_ms);
+        let at = floor.next.max(floor.asked);
+        floor.next = at + u64::from(delay_ms);
         Some(at)
     }
 
@@ -182,11 +201,12 @@ impl HostFloors {
     /// disagreeing about the wait is not a thing to average.
     fn push(&self, host: HostId, at_ms: u64) {
         let mut floors = self.lock();
-        let slot = floors.entry(host).or_default();
-        *slot = (*slot).max(at_ms);
+        let floor = floors.entry(host).or_default();
+        floor.asked = floor.asked.max(at_ms);
+        floor.next = floor.next.max(at_ms);
     }
 
-    fn lock(&self) -> MutexGuard<'_, HashMap<HostId, u64>> {
+    fn lock(&self) -> MutexGuard<'_, HashMap<HostId, Floor>> {
         // Nothing under this lock can panic, and recovering the guard keeps a
         // poisoned map from taking the rest of the tick down.
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
@@ -457,12 +477,18 @@ fn scale(count: u32, scale: f32) -> u32 {
 
 /// The loop.
 pub struct Crawler<F, C> {
-    fetch: F,
-    frontier: Frontier<Arc<dyn State>>,
-    clock: C,
-    robots: RobotsCache,
-    render: RenderBudget,
-    config: CrawlConfig,
+    /// Everything a single fetch needs, behind one handle.
+    ///
+    /// Behind a handle because a fetch runs as its own task. Doc 16's gate 3.1
+    /// wants 250 pages a second and the work between a body arriving and a row
+    /// existing is html parsing, which is the most expensive thing the crawler
+    /// does per page. Running the whole window on the task that owns the loop
+    /// puts all of that on one core, and worse, means a loop that stops to talk
+    /// to the state layer stops every fetch on the wire with it. The state
+    /// backends are synchronous underneath, so that is not a theoretical pause,
+    /// it is a few hundred milliseconds with a full window of sockets going
+    /// quiet, which origins answer with timeouts.
+    shared: Arc<Shared<F, C>>,
     /// Doc 15.3's answer to the last set of signals.
     ///
     /// A lock rather than a field on the config because the config is what the
@@ -473,6 +499,27 @@ pub struct Crawler<F, C> {
     restraint: Mutex<Allowance>,
 }
 
+/// The half of a [`Crawler`] a fetch on its own task needs.
+///
+/// Split out for that reason and no other. [`Crawler`] derefs to it, so the
+/// loop reads `self.config` and `self.frontier` the way it always did.
+pub struct Shared<F, C> {
+    fetch: F,
+    frontier: Frontier<Arc<dyn State>>,
+    clock: C,
+    robots: RobotsCache,
+    render: RenderBudget,
+    config: CrawlConfig,
+}
+
+impl<F, C> std::ops::Deref for Crawler<F, C> {
+    type Target = Shared<F, C>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+
 impl<F: Fetch, C: Clock> Crawler<F, C> {
     /// Build a crawler.
     #[must_use]
@@ -480,12 +527,14 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         let frontier = Frontier::new(state, config.frontier());
         let render = RenderBudget::new(config.render);
         Self {
-            fetch,
-            frontier,
-            clock,
-            robots: RobotsCache::new(),
-            render,
-            config,
+            shared: Arc::new(Shared {
+                fetch,
+                frontier,
+                clock,
+                robots: RobotsCache::new(),
+                render,
+                config,
+            }),
             restraint: Mutex::new(Allowance::default()),
         }
     }
@@ -514,7 +563,9 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
 
+impl<F: Fetch, C: Clock> Shared<F, C> {
     /// Doc 05.9's render budget, so a caller can report what it is doing.
     #[must_use]
     pub const fn render(&self) -> &RenderBudget {
@@ -618,7 +669,9 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     pub const fn config(&self) -> &CrawlConfig {
         &self.config
     }
+}
 
+impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
     /// One batch of work, start to finish.
     ///
     /// Returns an idle report when the frontier had nothing ready, which is
@@ -672,9 +725,9 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             ..TickReport::default()
         };
 
-        // Before `pending`, because the futures in it borrow this and the
-        // borrow has to outlive them.
-        let floors = HostFloors::default();
+        // Shared rather than borrowed because every fetch is spawned, and a
+        // spawned task cannot borrow the tick's stack frame.
+        let floors = Arc::new(HostFloors::default());
         let mut pending = FuturesUnordered::new();
         let mut supply = Supply {
             queue: VecDeque::new(),
@@ -705,7 +758,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             else {
                 break;
             };
-            pending.push(self.one(lease, at, &floors));
+            pending.push(self.start(lease, at, &floors));
         }
         if report.leased == 0 {
             // Nothing was ready, so there is nothing to commit and no reason to
@@ -713,6 +766,14 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             return Ok(report);
         }
         while let Some(done) = pending.next().await {
+            // A fetch task can only end without a `Fetched` by panicking, and
+            // swallowing that would leave the lease out on loan and the tick's
+            // counts quietly short. Carry it out of here the way it came out
+            // when the fetch ran on this task.
+            let done = match done {
+                Ok(fetched) => fetched,
+                Err(joined) => std::panic::resume_unwind(joined.into_panic()),
+            };
             // This fetch is over, so the host it was on is free and the clock
             // has moved, which are the two things that can turn a scheduler
             // that had nothing ready into one that has.
@@ -730,7 +791,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 .next_lease(&mut supply, &allowance, window, &mut deferred, &mut report)
                 .await?
             {
-                pending.push(self.one(lease, at, &floors));
+                pending.push(self.start(lease, at, &floors));
             }
             let Fetched {
                 row,
@@ -839,6 +900,38 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         Ok(report)
     }
 
+    /// Put one lease on the wire, on a task of its own.
+    ///
+    /// On a task of its own for two reasons, and neither of them is that a
+    /// fetch is slow. A fetch is mostly waiting, which a future on the loop's
+    /// own task already does perfectly well.
+    ///
+    /// The first is that the work either side of the wait is not waiting. An
+    /// html page has to be parsed, its links found and its text extracted, and
+    /// on a full window that is the busiest thing the crawler does. On one task
+    /// it is one core, and gate 3.1 wants 250 pages a second.
+    ///
+    /// The second is the state layer. Every backend we ship is synchronous
+    /// underneath, and sqlite in particular reaches for `block_in_place`, which
+    /// moves the other tasks on that worker somewhere else but does not move
+    /// the caller. So a loop that stops to lease or to record a completion
+    /// stops the whole window with it, and a few hundred sockets going silent
+    /// for a few hundred milliseconds is how origins get the idea that we have
+    /// gone away. Spawned, the sockets keep reading while the loop is inside
+    /// the store.
+    fn start(
+        &self,
+        lease: umi_state::Lease,
+        at: u64,
+        floors: &Arc<HostFloors>,
+    ) -> tokio::task::JoinHandle<Fetched> {
+        let shared = Arc::clone(&self.shared);
+        let floors = Arc::clone(floors);
+        tokio::spawn(async move { shared.one(lease, at, &floors).await })
+    }
+}
+
+impl<F: Fetch, C: Clock> Shared<F, C> {
     /// Store what the tick has finished and is still holding.
     ///
     /// Rows first, then completions. The order is the crash safety rule from
