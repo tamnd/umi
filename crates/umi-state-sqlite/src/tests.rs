@@ -361,6 +361,17 @@ async fn the_lease_query_walks_the_index() {
         !plan.contains("TEMP B-TREE"),
         "the lease query is sorting the frontier instead of walking it:\n{plan}"
     );
+    // The expensive word is COVERING. A scan that has to leave the index for
+    // one column leaves it in priority order, and priority order is a random
+    // walk of the ledger's primary key b-tree: 28 percent of a crawl process
+    // on server3, measured, against a frontier of 1.18 million rows. Adding a
+    // column to the select list is all it takes to lose it, and nothing else
+    // in the suite would notice.
+    assert!(
+        plan.contains("COVERING INDEX ledger_ready"),
+        "the lease scan is reading a column ledger_ready does not carry, so it \
+         seeks into the ledger once per candidate:\n{plan}"
+    );
 }
 
 #[tokio::test]
