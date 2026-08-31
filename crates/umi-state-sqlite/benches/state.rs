@@ -197,6 +197,20 @@ async fn leasing(state: &SqliteState, repeat: usize) {
 }
 
 /// Part 3. What a tick pays to record what it fetched.
+///
+/// Twice, because the order a batch arrives in is not a detail here. The
+/// ledger is `WITHOUT ROWID` and keyed by `(pld, host, url_key)`, so the rows
+/// are stored in that order and a batch that walks them in it reads and
+/// writes each leaf page once, in file order. `lease` hands its answer back
+/// in index order, so a bench that completes exactly what it just leased is
+/// measuring the best case the table has and printing it as the number.
+///
+/// The crawl never sees that case. Completions come back in the order origins
+/// answered, which against a blake3 derived key is noise, and every one of
+/// them is a seek to a leaf nothing else in the batch is near. Both lines are
+/// printed because the gap between them is the thing worth watching: it is
+/// small while the ledger fits in the page cache and it is the whole cost
+/// once it does not.
 async fn completing(state: &SqliteState, repeat: usize) {
     println!("part 3: complete, one call a tick");
     println!(
@@ -204,9 +218,22 @@ async fn completing(state: &SqliteState, repeat: usize) {
         "", "urls/s", "us per url", "core at 250/s"
     );
 
+    for shuffled in [false, true] {
+        completions(state, repeat, shuffled).await;
+    }
+    println!();
+}
+
+/// One of part 3's two lines.
+async fn completions(state: &SqliteState, repeat: usize, shuffled: bool) {
     let mut best = f64::MAX;
     for pass in 0..repeat {
-        let now = T0 + (pass as u64 + 10) * 60_000;
+        // Every pass gets a minute of its own, the second line's passes after
+        // the first line's. A `complete` only counts if it is newer than the
+        // answer already on the row, so two passes sharing a clock would have
+        // the second one do nothing and time it.
+        let nth = pass + if shuffled { repeat } else { 0 };
+        let now = T0 + (nth as u64 + 10) * 60_000;
         let leases = state
             .lease(&LeaseRequest {
                 max_tier: Tier::Rendered,
@@ -217,7 +244,7 @@ async fn completing(state: &SqliteState, repeat: usize) {
         if leases.is_empty() {
             continue;
         }
-        let outcomes: Vec<FetchOutcome> = leases
+        let mut outcomes: Vec<FetchOutcome> = leases
             .iter()
             .enumerate()
             .map(|(n, lease)| FetchOutcome {
@@ -247,12 +274,36 @@ async fn completing(state: &SqliteState, repeat: usize) {
                 },
             })
             .collect();
+        if shuffled {
+            scatter(&mut outcomes, nth as u64 + 1);
+        }
         let start = Instant::now();
         state.complete(&outcomes).await.expect("complete");
         best = best.min(start.elapsed().as_secs_f64() / outcomes.len() as f64);
     }
-    at_rate("complete", best);
-    println!();
+    at_rate(
+        if shuffled {
+            "complete, fetch order"
+        } else {
+            "complete, key order"
+        },
+        best,
+    );
+}
+
+/// Shuffle in place, the same way on every run.
+///
+/// A Fisher Yates with a xorshift behind it rather than a real generator. The
+/// only two things asked of it are that the order stop matching the key and
+/// that two runs somebody is comparing get the same one.
+fn scatter<T>(items: &mut [T], seed: u64) {
+    let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+    for at in (1..items.len()).rev() {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        items.swap(at, (state % (at as u64 + 1)) as usize);
+    }
 }
 
 /// Part 4. What doc 14.3's progress line and the crawl loop's idle branch pay.

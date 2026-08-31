@@ -951,6 +951,29 @@ impl State for SqliteState {
             return Ok(());
         }
 
+        // The order the ledger is stored in, not the order the origins
+        // answered in. `ledger` is `WITHOUT ROWID` keyed by `(pld, host,
+        // url_key)`, so the row and the key live in the same b-tree and the
+        // batch is a walk of it. Taken in arrival order that walk is random:
+        // `url_key` is a truncated blake3 digest, so two urls fetched one
+        // after another are nowhere near each other on disk, and every
+        // completion is a seek to a leaf page the rest of the batch will not
+        // touch again. Taken in key order it is one pass from the front of
+        // the table to the back, each leaf read once, updated, and left.
+        //
+        // Sorting is a few hundred microseconds for a window and it does not
+        // grow with the ledger. The seeks do, which is the point: this costs
+        // nothing to nothing while the table fits in the page cache and it is
+        // most of the write path once it stops fitting.
+        //
+        // Stable, so that two completions carrying the same key stay in the
+        // order they arrived. That is not hypothetical politeness about ties:
+        // the second one is only recorded if it is newer than the first, and
+        // an unstable sort would decide which of the two that is by whatever
+        // the sort felt like doing.
+        let mut order: Vec<usize> = (0..outcomes.len()).collect();
+        order.sort_by_key(|&at| outcomes[at].key);
+
         blocking(|| {
             let mut guard = self.lock();
             let inner = &mut *guard;
@@ -968,9 +991,21 @@ impl State for SqliteState {
             // host. A tick made entirely of robots exclusions is a real tick
             // and it made no requests, so it must not leave a host record
             // behind saying we spoke to somebody we did not.
+            //
+            // Read and written in a pass of its own, after the ledger, because
+            // the two passes want opposite orders. The ledger wants key order
+            // and doc 07.6's limiter wants the order the fetches finished in:
+            // eight completions for one host are eight observations of that
+            // host in sequence, and `observe` reads a streak off them.
             let mut paced: HashMap<HostId, (HostRow, bool)> = HashMap::new();
+            // Which completions actually moved a ledger row. The two below
+            // that do not are a completion for a url we have no row for and
+            // one that is older than the answer already recorded, and neither
+            // of them is an observation of anything.
+            let mut landed = vec![false; outcomes.len()];
 
-            for outcome in outcomes {
+            for &at in &order {
+                let outcome = &outcomes[at];
                 let before: Option<LedgerRow> = tx
                     .prepare_cached(sql::SELECT_LEDGER)
                     .state()?
@@ -1139,11 +1174,15 @@ impl State for SqliteState {
                     ])
                     .state()?;
 
+                landed[at] = true;
+            }
+
+            for (at, outcome) in outcomes.iter().enumerate() {
                 // A completion with no latency behind it never reached the
                 // wire, so it has nothing to say about the host and there is no
                 // point reading one. A tick spent entirely on a disallowed site
                 // is all of these, and it should cost no host statements at all.
-                if outcome.pace.latency_ms.is_none() {
+                if !landed[at] || outcome.pace.latency_ms.is_none() {
                     continue;
                 }
 
@@ -1173,8 +1212,14 @@ impl State for SqliteState {
             }
 
             {
+                // In key order for the same reason the ledger is, and cheaper
+                // to reach: `hosts` is keyed by host alone, there is one row
+                // per host rather than one per url, and the batch is already
+                // gathered in a map that only has to be sorted on the way out.
+                let mut hosts: Vec<&(HostRow, bool)> = paced.values().collect();
+                hosts.sort_by_key(|(host, _)| host.host);
                 let mut pace = tx.prepare_cached(sql::PACE_HOST).state()?;
-                for (host, moved) in paced.values() {
+                for (host, moved) in hosts {
                     if !*moved {
                         continue;
                     }
