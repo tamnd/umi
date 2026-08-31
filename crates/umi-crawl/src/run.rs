@@ -8,8 +8,8 @@
 //! # Shape
 //!
 //! One [`tick`](Crawler::tick) is a batch: take leases from the scheduler, run
-//! them all concurrently, and hand the answers back in one call. The batch is
-//! the unit because doc 08.5's whole design is batched, and because the
+//! them concurrently, and store the answers in batches as they land. The batch
+//! is the unit because doc 08.5's whole design is batched, and because the
 //! alternative costs a database round trip per URL, which at 250 pages a second
 //! is 250 of them a second for no benefit.
 //!
@@ -24,9 +24,17 @@
 //! fixed chunks. The difference matters more than it looks: fetch times on the
 //! web run from 40 ms to the timeout, so a barrier every N URLs spends most of
 //! its time with almost every slot idle waiting for the slowest site in the
-//! chunk. Unordered keeps every slot full and finishes a tick in roughly the
-//! time of its slowest single fetch rather than the sum of its slowest per
-//! chunk.
+//! chunk. Unordered keeps every slot full.
+//!
+//! The tick asks the scheduler repeatedly rather than once. That is the same
+//! argument one level up, and it is worth the same amount: a tick that takes
+//! its whole batch in one ask has nothing left to top the window up from once
+//! the batch is spent, so the window empties out at the end of every tick and
+//! the rate is the batch over the slowest lease in it. Measured on server3 over
+//! twenty thousand hosts, that shape ran at 3.8 pages a second with 512 slots
+//! open. Asking again as the window drains makes the rate the window over the
+//! mean instead, and the batch becomes what it should have been all along,
+//! which is how much a tick gets through before it commits and returns.
 //!
 //! # What is not here
 //!
@@ -36,7 +44,7 @@
 //! wants them in a `.umi` file. Splitting it that way also keeps this file
 //! free of any I/O that is not a fetch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -95,6 +103,46 @@ const ALERT_FLOOR: usize = 100;
 /// host record the state layer has already moved.
 #[derive(Debug, Default)]
 struct HostFloors(Mutex<HashMap<HostId, u64>>);
+
+/// What a tick has finished and not yet stored.
+///
+/// See [`Crawler::store`], which empties it.
+#[derive(Default)]
+struct Held {
+    /// Pages, for the sink.
+    rows: Vec<PageRow>,
+    /// Completions, for the state layer.
+    outcomes: Vec<FetchOutcome>,
+    /// Links found, with the depth they were found at.
+    candidates: Vec<(String, u8)>,
+    /// What the answers said about the tiers they came back on, merged per
+    /// host by [`learn`].
+    signals: Vec<Learned>,
+}
+
+/// A tick's supply of leases.
+///
+/// The queue is what has been taken from the scheduler and not yet put on the
+/// wire and `left` is how much of the batch the tick may still take. See
+/// [`Crawler::next_lease`].
+#[derive(Debug)]
+struct Supply {
+    /// Leases in hand, earliest due first within each ask.
+    queue: VecDeque<umi_state::Lease>,
+    /// How many more URLs this tick may lease.
+    left: u32,
+    /// Completions owed before the tick asks a scheduler that just said no.
+    ///
+    /// An ask that comes back empty means nothing was ready at that moment, and
+    /// the only thing this tick does that can change that is finish a fetch,
+    /// which frees a host and moves the clock. Asking again on the very next
+    /// completion would be a scan of the store per page at the end of every
+    /// batch, so the tick waits for half a window of them instead. That is one
+    /// wasted scan per half window rather than one per page, and it bounds the
+    /// wasted scans on a genuinely empty frontier at two before the window
+    /// drains and the tick ends.
+    patience: usize,
+}
 
 impl HostFloors {
     /// Take the next slot on a host and leave the one after it for whoever
@@ -180,17 +228,25 @@ pub enum CrawlError {
 pub struct CrawlConfig {
     /// Who we are, for doc 04's receipts and doc 10.5's `fetcher_id` column.
     pub fetcher: FetcherId,
-    /// How many URLs to take per tick.
+    /// How many URLs one tick may take, at most.
+    ///
+    /// Not taken in one ask. A tick leases a window's worth at a time and asks
+    /// again as the window empties, so this is the point at which it stops
+    /// asking, finishes what it is holding and commits. It is therefore also
+    /// the flush granularity, and the reason it is not simply unbounded is that
+    /// everything a tick fetches is held in memory until it commits.
     pub batch: u32,
     /// How many fetches to have in flight at once.
     ///
-    /// Not the same as `batch` and usually smaller. The batch is how much work
-    /// is held, this is how much of it is on the wire, and the gap between them
-    /// is what lets a tick start its next fetch the instant one finishes rather
-    /// than at the top of the next tick.
+    /// Not the same as `batch` and always smaller. This is how much is on the
+    /// wire and the batch is how much a tick will get through before it
+    /// commits, so the ratio between them is how many times the window refills
+    /// inside one tick. A ratio of one is the shape that made gate 3.1 measure
+    /// 3.8 pages a second on server3: the window fills once, drains to empty,
+    /// and the tick waits on its slowest lease with every other slot idle.
     pub in_flight: usize,
-    /// Ceiling per host inside one tick, on top of doc 07.6's one request in
-    /// flight per host.
+    /// Ceiling per host inside one ask to the scheduler, on top of doc 07.6's
+    /// one request in flight per host. See [`FrontierConfig::max_per_host`].
     pub max_per_host: u32,
     /// The most expensive tier this process will run.
     pub max_tier: Tier,
@@ -216,10 +272,10 @@ pub struct CrawlConfig {
     /// adds up to a lot of traffic at one operator, so the cap that matters to
     /// them is this one.
     pub rate: Rate,
-    /// How many domains one tick may take work from.
+    /// How many domains one ask to the scheduler may take work from.
     ///
     /// The scheduler asks the store once per domain, so this is also the most
-    /// round trips a tick can cost. See [`umi_frontier::Config::max_domains`].
+    /// round trips an ask can cost. See [`umi_frontier::Config::max_domains`].
     pub max_domains: usize,
     /// One in how many 304s to check by fetching the page anyway.
     ///
@@ -272,7 +328,11 @@ impl Default for CrawlConfig {
     fn default() -> Self {
         Self {
             fetcher: FetcherId::LOCAL,
-            batch: 512,
+            // Sixteen refills of the window below. The number that matters is
+            // the ratio rather than either side of it: a tick pays for its
+            // slowest lease once, so sixteen refills spread that over sixteen
+            // window's worth of work instead of one.
+            batch: 2048,
             // Doc 05.4's client allows 2 connections per host and doc 07.6
             // allows one request in flight per host, so the useful ceiling is
             // set by how many distinct hosts a batch covers rather than by the
@@ -607,54 +667,20 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 ..TickReport::default()
             });
         }
-        // Through the scheduler and not straight to the store. The store hands
-        // out work per host; doc 09.3's cap is per pay level domain, and the
-        // two are not the same thing. A site on fifty hosts under one domain is
-        // fifty polite hosts and one operator wondering why fifty of our
-        // connections turned up at once, and the frontier is where that is
-        // counted.
-        let leases = self
-            .frontier
-            .tick(&Ask {
-                fetcher: self.config.fetcher,
-                now_ms,
-                max_urls: batch,
-                // The lower of the two, always. The config is the most this
-                // process will ever pay for and the allowance is the most it
-                // can afford today, and neither may raise the other.
-                max_tier: self.config.max_tier.min(allowance.max_tier),
-                budget: Some(allowance.budget(self.config.budget)),
-            })
-            .await?;
-
         let mut report = TickReport {
-            leased: leases.len(),
             restrained: batch < self.config.batch,
             ..TickReport::default()
         };
-        if leases.is_empty() {
-            return Ok(report);
-        }
-
-        // Earliest first, because a lease that is not due yet still occupies a
-        // slot in the window while it waits. Sorted, the only time a slot holds
-        // a waiting lease is when everything ahead of it is waiting too, so
-        // nothing that could have been fetched is sitting behind something that
-        // could not. Unsorted, one host that owes a minute of politeness can
-        // park the whole window while other hosts have work ready to go.
-        let mut leases = leases;
-        leases.sort_by_key(|lease| lease.not_before_ms);
 
         // Before `pending`, because the futures in it borrow this and the
         // borrow has to outlive them.
         let floors = HostFloors::default();
         let mut pending = FuturesUnordered::new();
-        let mut queue = leases.into_iter();
-        let mut rows = Vec::with_capacity(report.leased);
-        let mut outcomes = Vec::with_capacity(report.leased);
-        let mut candidates: Vec<(String, u8)> = Vec::new();
-        let mut signals: Vec<Learned> = Vec::new();
-        let mut deferred: Vec<LeaseId> = Vec::new();
+        let mut supply = Supply {
+            queue: VecDeque::new(),
+            left: batch,
+            patience: 0,
+        };
 
         // Fill the window, then top it up as each one lands, which is what
         // keeps every slot busy rather than waiting on the slowest of a chunk.
@@ -665,13 +691,32 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             u32::try_from(self.config.in_flight).unwrap_or(u32::MAX),
             allowance.lease_scale,
         ) as usize;
+        let mut held = Held {
+            rows: Vec::with_capacity(window),
+            outcomes: Vec::with_capacity(window),
+            ..Held::default()
+        };
+        let mut deferred: Vec<LeaseId> = Vec::new();
+
         for _ in 0..window {
-            let Some((lease, at)) = self.gate(&mut queue, &mut deferred, &mut report) else {
+            let Some((lease, at)) = self
+                .next_lease(&mut supply, &allowance, window, &mut deferred, &mut report)
+                .await?
+            else {
                 break;
             };
             pending.push(self.one(lease, at, &floors));
         }
+        if report.leased == 0 {
+            // Nothing was ready, so there is nothing to commit and no reason to
+            // spend a round trip saying so.
+            return Ok(report);
+        }
         while let Some(done) = pending.next().await {
+            // This fetch is over, so the host it was on is free and the clock
+            // has moved, which are the two things that can turn a scheduler
+            // that had nothing ready into one that has.
+            supply.patience = supply.patience.saturating_sub(1);
             // Before the lease that replaces it, and before anything else this
             // loop does, so that a `Retry-After` on this answer reaches the
             // rest of the batch rather than the request after next.
@@ -681,7 +726,10 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                     done.outcome.finished_ms.saturating_add(u64::from(after)),
                 );
             }
-            if let Some((lease, at)) = self.gate(&mut queue, &mut deferred, &mut report) {
+            if let Some((lease, at)) = self
+                .next_lease(&mut supply, &allowance, window, &mut deferred, &mut report)
+                .await?
+            {
                 pending.push(self.one(lease, at, &floors));
             }
             let Fetched {
@@ -713,7 +761,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 // page that cannot teach anything costs a pass over the batch
                 // per page, and a healthy crawl is nothing but those pages.
                 if learned.teaches() {
-                    learn(&mut signals, learned);
+                    learn(&mut held.signals, learned);
                 }
             }
             // After the signal, because a lease that spent its slot on
@@ -746,30 +794,27 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 }
                 report.bytes_fetched += u64::from(row.content_length);
                 report.links_seen += links_seen;
-                candidates.extend(links);
+                held.candidates.extend(links);
                 // The bytes and the links are counted either way, because we
                 // paid for both. Only the row is dropped, and only when it
                 // would be the second copy of one already published.
                 if unchanged {
                     report.unchanged += 1;
                 } else {
-                    rows.push(row);
+                    held.rows.push(row);
                 }
             }
-            outcomes.push(outcome);
+            held.outcomes.push(outcome);
+            // One window's worth at a time, which is what a tick used to store
+            // in one go at the end of itself. A tick that keeps its window full
+            // runs until its whole batch is spent, and holding every page of
+            // that in memory until the last one lands is both a lot of memory
+            // and a lot to lose if the process dies.
+            if held.outcomes.len() >= window {
+                self.store(sink, &mut held, now_ms, &mut report).await?;
+            }
         }
-
-        report.rows = rows.len();
-
-        // Rows first, then completions. The order is the crash safety rule
-        // from doc 16's gate 1.3 and it is not an implementation detail: a
-        // completion recorded before its row is stored is a URL the crawler
-        // believes it has and will not fetch again, and the page is gone. The
-        // other order costs a refetch, which is the cheaper mistake.
-        if !rows.is_empty() {
-            sink.take(&rows).await?;
-        }
-        self.state().complete(&outcomes).await?;
+        self.store(sink, &mut held, now_ms, &mut report).await?;
 
         // After the completions rather than before, so that a store that
         // refuses the release still keeps the answers of everything this tick
@@ -791,18 +836,134 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             self.state().release(&deferred, NackReason::Refused).await?;
         }
         self.alert(&report);
-
-        // After the completions, because both write the host record and the
-        // completion is the one that owns doc 07.6's pacing columns. Reading
-        // first would mean writing back a politeness timer from before this
-        // tick moved it.
-        report.learned = self.relearn(&signals, now_ms).await?;
-        report.links_admitted = self.admit(&candidates, now_ms).await?;
         Ok(report)
     }
 
-    /// The next lease this tick can actually run, and the earliest moment it
-    /// may start.
+    /// Store what the tick has finished and is still holding.
+    ///
+    /// Rows first, then completions. The order is the crash safety rule from
+    /// doc 16's gate 1.3 and it is not an implementation detail: a completion
+    /// recorded before its row is stored is a URL the crawler believes it has
+    /// and will not fetch again, and the page is gone. The other order costs a
+    /// refetch, which is the cheaper mistake.
+    ///
+    /// The links and the signals go in after the completions, because a
+    /// completion and a relearn both write the host record and the completion
+    /// is the one that owns doc 07.6's pacing columns. Doing it the other way
+    /// round would write back a politeness timer from before this tick moved
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// [`CrawlError::Sink`] if the rows could not be stored and
+    /// [`CrawlError::State`] if the completions could not be recorded.
+    async fn store(
+        &self,
+        sink: &dyn Sink,
+        held: &mut Held,
+        now_ms: u64,
+        report: &mut TickReport,
+    ) -> Result<(), CrawlError> {
+        if !held.rows.is_empty() {
+            sink.take(&held.rows).await?;
+            report.rows += held.rows.len();
+            held.rows.clear();
+        }
+        if !held.outcomes.is_empty() {
+            self.state().complete(&held.outcomes).await?;
+            held.outcomes.clear();
+        }
+        if !held.signals.is_empty() {
+            report.learned += self.relearn(&held.signals, now_ms).await?;
+            held.signals.clear();
+        }
+        if !held.candidates.is_empty() {
+            report.links_admitted += self.admit(&held.candidates, now_ms).await?;
+            held.candidates.clear();
+        }
+        Ok(())
+    }
+
+    /// The next lease to put on the wire, fetching more from the scheduler when
+    /// what is in hand runs out.
+    ///
+    /// Through the scheduler and not straight to the store. The store hands out
+    /// work per host; doc 09.3's cap is per pay level domain, and the two are
+    /// not the same thing. A site on fifty hosts under one domain is fifty
+    /// polite hosts and one operator wondering why fifty of our connections
+    /// turned up at once, and the frontier is where that is counted.
+    ///
+    /// A window's worth at a time, rather than the whole batch in one ask at
+    /// the top of the tick, and that is the difference between the gate 3.1
+    /// number and a tenth of it. A tick that leases everything up front tops
+    /// its window up only from what it already holds, so the window drains to
+    /// empty at the end of every tick and the rate is the batch over the
+    /// slowest lease in it. Asking as the window empties keeps every slot busy
+    /// until the batch is spent, and the rate is the window over the mean.
+    /// Leases also go on the wire soon after they are taken this way, which
+    /// matters because a lease is only good for [`CrawlConfig::lease_for`] and
+    /// the tail of a big batch can sit in hand for longer than that.
+    ///
+    /// [`None`] when the batch is spent or the scheduler has nothing ready.
+    ///
+    /// # Errors
+    ///
+    /// [`CrawlError::State`] if the leases could not be taken.
+    async fn next_lease(
+        &self,
+        supply: &mut Supply,
+        allowance: &Allowance,
+        chunk: usize,
+        deferred: &mut Vec<LeaseId>,
+        report: &mut TickReport,
+    ) -> Result<Option<(umi_state::Lease, u64)>, CrawlError> {
+        loop {
+            if let Some(next) = self.gate(&mut supply.queue, deferred, report) {
+                return Ok(Some(next));
+            }
+            if supply.patience > 0 || supply.left == 0 {
+                return Ok(None);
+            }
+            let ask = u32::try_from(chunk).unwrap_or(u32::MAX).min(supply.left);
+            let mut leases = self
+                .frontier
+                .tick(&Ask {
+                    fetcher: self.config.fetcher,
+                    // Read again rather than carried down from the top of the
+                    // tick, because the tick no longer takes all its work in
+                    // one moment and a stale clock would ask for the domains
+                    // that were ready when it started.
+                    now_ms: self.clock.now_ms(),
+                    max_urls: ask,
+                    // The lower of the two, always. The config is the most this
+                    // process will ever pay for and the allowance is the most
+                    // it can afford today, and neither may raise the other.
+                    max_tier: self.config.max_tier.min(allowance.max_tier),
+                    budget: Some(allowance.budget(self.config.budget)),
+                })
+                .await?;
+            if leases.is_empty() {
+                supply.patience = (chunk / 2).max(1);
+                return Ok(None);
+            }
+            report.leased += leases.len();
+            supply.left = supply
+                .left
+                .saturating_sub(u32::try_from(leases.len()).unwrap_or(u32::MAX));
+            // Earliest first, because a lease that is not due yet still
+            // occupies a slot in the window while it waits. Sorted, the only
+            // time a slot holds a waiting lease is when everything ahead of it
+            // is waiting too, so nothing that could have been fetched is
+            // sitting behind something that could not. Unsorted, one host that
+            // owes a minute of politeness can park the whole window while other
+            // hosts have work ready to go.
+            leases.sort_by_key(|lease| lease.not_before_ms);
+            supply.queue.extend(leases);
+        }
+    }
+
+    /// The next lease already in hand that this tick can actually run, and the
+    /// earliest moment it may start.
     ///
     /// Everything below T3 comes straight back with its politeness time. A T3
     /// lease has to get past doc 05.9's budget first, and one that cannot is
@@ -815,11 +976,11 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
     /// that a different tick will be better placed to run.
     fn gate(
         &self,
-        queue: &mut impl Iterator<Item = umi_state::Lease>,
+        queue: &mut VecDeque<umi_state::Lease>,
         deferred: &mut Vec<LeaseId>,
         report: &mut TickReport,
     ) -> Option<(umi_state::Lease, u64)> {
-        for lease in queue.by_ref() {
+        while let Some(lease) = queue.pop_front() {
             let due = lease.not_before_ms;
             if lease.tier < Tier::Rendered {
                 if lease.tier == Tier::Emulated {
