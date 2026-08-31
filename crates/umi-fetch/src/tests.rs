@@ -593,6 +593,52 @@ async fn an_origin_that_trickles_forever_hits_the_total_timeout() {
     );
 }
 
+#[tokio::test]
+async fn a_robots_txt_gives_up_on_its_own_budget_and_not_the_page_one() {
+    // One origin, two budgets. It answers in about half a second, which is
+    // inside the page budget and well outside the robots one, so the only thing
+    // that decides the answer is which of the two leashes the fetch was given.
+    // That is the whole point of the split: the file that gates every host on
+    // the web is not worth a page's patience when the median one arrives in
+    // well under a second and the tail never arrives at all.
+    //
+    // A silent origin rather than a slow one. Every other budget here is five
+    // seconds, so the only clock that can fire inside a second is the robots
+    // one, and the elapsed time says which clock it was without the test
+    // having to race anything. That matters because the suite runs in parallel
+    // and a test whose answer depends on hitting a two hundred millisecond
+    // window is a test that fails on a busy box for no reason.
+    let origin = Origin::start(|_| Reply::Silence(Vec::new())).await;
+
+    let config = FetchConfig {
+        connect_timeout: Duration::from_secs(5),
+        read_timeout: Duration::from_secs(5),
+        total_timeout: Duration::from_secs(5),
+        robots_timeout: Duration::from_millis(200),
+        ..FetchConfig::default()
+    };
+
+    let began = std::time::Instant::now();
+    let robots = fetcher(config)
+        .fetch_robots(&origin.url("/robots.txt"))
+        .await
+        .expect("the url parses");
+    let took = began.elapsed();
+
+    assert_eq!(
+        robots,
+        Outcome::Failed {
+            status: None,
+            failure: Failure::Timeout(Stage::Total),
+            retry_after: None,
+        }
+    );
+    assert!(
+        took < Duration::from_secs(2),
+        "robots.txt was given the page budget: {took:?}"
+    );
+}
+
 /// One status, the headers that came with it, and what the pair should mean.
 struct Case {
     status: u16,

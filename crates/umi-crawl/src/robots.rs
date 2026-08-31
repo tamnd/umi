@@ -213,14 +213,18 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
     // two apart on the way back out is the authoritative flag.
     let mut digest = digest_of(b"");
     loop {
-        // Never conditional. A stale robots.txt that a 304 confirmed is still
-        // a file we are about to re-read from a cache we already dropped, so
-        // the saving is nothing and the code path is one more thing to get
-        // wrong.
+        // Never conditional, which `fetch_robots` now enforces by not taking a
+        // revalidator. A stale robots.txt that a 304 confirmed is still a file
+        // we are about to re-read from a cache we already dropped, so the
+        // saving is nothing and the code path is one more thing to get wrong.
         // The rungs it took are not this function's business. A robots.txt
         // that came back over plain HTTP because the browser would not hand
         // back a `text/plain` body is still this origin's robots.txt.
-        let robots = match fetch.fetch(&url, None, tier).await.map(|s| s.outcome) {
+        // The short leash is the other half of `fetch_robots`. The host that
+        // holds a slot in the fetch window for ten seconds and then sends
+        // nothing is not rare, and doc 05.4's page budget is the wrong one to
+        // spend on it.
+        let robots = match fetch.fetch_robots(&url, tier).await.map(|s| s.outcome) {
             Ok(umi_fetch::Outcome::Ok(page)) => {
                 digest = digest_of(page.body.as_ref());
                 Robots::for_status(page.status, page.body.as_ref())

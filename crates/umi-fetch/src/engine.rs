@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use futures_util::{Stream, StreamExt};
@@ -127,6 +127,38 @@ impl<T: Transport> Engine<T> {
         url: &str,
         revalidate: Option<&Revalidator>,
     ) -> Result<Outcome> {
+        self.fetch_within(url, revalidate, self.config.total_timeout)
+            .await
+    }
+
+    /// A robots.txt, on [`FetchConfig::robots_timeout`] rather than the page
+    /// budget.
+    ///
+    /// A separate entry point rather than a flag on [`fetch`](Self::fetch),
+    /// because the caller that wants the short leash is the robots cache and
+    /// nothing else, and a boolean parameter would be one more thing every
+    /// other call site has to say no to.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`fetch`](Self::fetch).
+    pub(crate) async fn fetch_robots(&self, url: &str) -> Result<Outcome> {
+        self.fetch_within(url, None, self.config.robots_timeout)
+            .await
+    }
+
+    /// One fetch, given how long it may take in total.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Url`] when the URL does not parse or is not http(s), and
+    /// nothing else. Everything that goes wrong on the wire is an [`Outcome`].
+    async fn fetch_within(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+        deadline: Duration,
+    ) -> Result<Outcome> {
         let parsed = Url::parse(url).map_err(|e| FetchError::Url(format!("{url}: {e}")))?;
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(FetchError::Url(format!(
@@ -144,7 +176,6 @@ impl<T: Transport> Engine<T> {
         let _permit = permits.acquire().await.expect("the semaphore is open");
 
         let started = Instant::now();
-        let deadline = self.config.total_timeout;
         match tokio::time::timeout(deadline, self.walk(parsed, revalidate, started)).await {
             Ok(outcome) => Ok(outcome),
             Err(_) => Ok(Outcome::Failed {

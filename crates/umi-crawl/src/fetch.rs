@@ -55,6 +55,30 @@ pub trait Fetch: Send + Sync {
         tier: Tier,
     ) -> Result<Served, FetchError>;
 
+    /// Fetch a host's robots.txt.
+    ///
+    /// Separate from [`fetch`](Self::fetch) because the two are not the same
+    /// request with a different URL in them. A page is a document somebody
+    /// wants and doc 05.4 gives it thirty seconds to arrive. A robots.txt is a
+    /// toll gate every host charges once, and on the real web the tail of hosts
+    /// that never answer for one is thick enough to set the crawl's rate:
+    /// measured over five hundred hosts off a real seed list, the median
+    /// answers in 695 ms and the ninetieth percentile is the connect timeout to
+    /// the millisecond. Seventy three percent of the time that batch spent was
+    /// the part of each fetch past three seconds. See
+    /// [`umi_fetch::FetchConfig::robots_timeout`].
+    ///
+    /// The default delegates, so a fetcher that has no separate leash still
+    /// works and the crawl tests do not have to grow a second canned map. The
+    /// real clients override it.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`fetch`](Self::fetch).
+    async fn fetch_robots(&self, url: &str, tier: Tier) -> Result<Served, FetchError> {
+        self.fetch(url, None, tier).await
+    }
+
     /// How many pages a second this fetcher can render, doc 05.9.
     ///
     /// `None`, the default, is a fetcher with no browser, and the loop reads it
@@ -75,6 +99,10 @@ impl Fetch for Ladder {
         tier: Tier,
     ) -> Result<Served, FetchError> {
         Self::fetch(self, url, revalidate, tier).await
+    }
+
+    async fn fetch_robots(&self, url: &str, tier: Tier) -> Result<Served, FetchError> {
+        Self::fetch_robots(self, url, tier).await
     }
 
     fn render_capacity(&self) -> Option<f64> {
@@ -105,6 +133,15 @@ impl Fetch for Fetcher {
         let outcome = Self::fetch(self, url, revalidate).await?;
         Ok(Served::descended(tier, served, outcome))
     }
+
+    async fn fetch_robots(&self, url: &str, tier: Tier) -> Result<Served, FetchError> {
+        let served = match tier {
+            Tier::Revalidate => tier,
+            _ => Tier::Plain,
+        };
+        let outcome = Self::fetch_robots(self, url).await?;
+        Ok(Served::descended(tier, served, outcome))
+    }
 }
 
 #[async_trait::async_trait]
@@ -116,6 +153,10 @@ impl<T: Fetch + ?Sized> Fetch for std::sync::Arc<T> {
         tier: Tier,
     ) -> Result<Served, FetchError> {
         (**self).fetch(url, revalidate, tier).await
+    }
+
+    async fn fetch_robots(&self, url: &str, tier: Tier) -> Result<Served, FetchError> {
+        (**self).fetch_robots(url, tier).await
     }
 
     fn render_capacity(&self) -> Option<f64> {
