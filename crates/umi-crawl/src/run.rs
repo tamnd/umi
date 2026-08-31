@@ -346,16 +346,19 @@ pub struct TickReport {
     pub emulated: usize,
     /// Leases fetched at T3 or above.
     ///
-    /// Counted where doc 05.9's budget grants the slot, which is where the
-    /// lease is allowed to open a browser and not where it does.
+    /// Counted where doc 05.9's budget grants the slot, which is before the
+    /// lease finds out whether the host's robots.txt is going to send it back.
+    /// One that does gives the slot back and this number is a render high for
+    /// that tick.
     pub rendered: usize,
     /// Leases given back to the frontier without an answer.
     ///
-    /// One thing ends up here: doc 05.9's render budget turns some T3 leases
-    /// away. They keep their due time and their priority and the next tick
-    /// offers the most important of them again. They are not failures and no
-    /// row exists for them, which is why they are counted apart from
-    /// everything else.
+    /// Two things end up here. Doc 05.9's render budget turns some T3 leases
+    /// away, and the lease that fetches a host's robots.txt gives up when the
+    /// file publishes a `Crawl-delay` longer than the slot it was given. Both
+    /// keep their due time and their priority and the next tick offers the
+    /// most important of them again. They are not failures and no row exists
+    /// for them, which is why they are counted apart from everything else.
     pub deferred: usize,
     /// Whether doc 15.3's ladder is what kept this tick small.
     ///
@@ -688,6 +691,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 links_seen,
                 disallowed,
                 unchanged,
+                give_back,
                 signal,
             } = done;
 
@@ -711,6 +715,15 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 if learned.teaches() {
                     learn(&mut signals, learned);
                 }
+            }
+            // After the signal, because a lease that spent its slot on
+            // robots.txt still learned what the file said and that is the one
+            // lease a day that knows it. Before everything else, because there
+            // is no answer here to record: the url keeps its due time and the
+            // next tick offers it again.
+            if give_back {
+                deferred.push(outcome.lease);
+                continue;
             }
             // Counted off the completion rather than off the row, because a
             // 304 has no row. Everything else does.
@@ -1030,18 +1043,45 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         // the same two requests to the same host in the same order with the
         // same spacing, and the second one is a page.
         //
-        // The delay is the host's, or the file's own `Crawl-delay` when that
-        // is longer. The host record has not learned the file yet, since this
-        // is the lease that fetched it, so the number has to come off the
-        // parse rather than off the lease.
+        // Unless the file asks for longer than the lease was spaced for, and
+        // then the lease does go back. Doc 07.4 clamps a published
+        // `Crawl-delay` at 300 seconds and a tick does not return until the
+        // last of its leases does, so one host in a batch of five hundred
+        // asking for five minutes is a tick that takes five minutes and a
+        // crawl doing one page a second. Measured on server3: a tick of 512
+        // hosts had exactly one of those in it and had not returned after five
+        // minutes.
+        //
+        // The url keeps its due time either way and this tick has just taught
+        // the host record what the file said, so the state layer spaces the
+        // next lease on that host correctly rather than this loop holding a
+        // slot open to do it by hand. The number comes off the parse and not
+        // off the lease because the record does not learn it until the end of
+        // the tick, which is after this decision.
         if robots_fetched {
             let stated = entry
                 .robots
                 .crawl_delay()
                 .map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
-            let delay = stated.max(lease.delay_ms);
-            self.wait_for(lease.key.host, slot + u64::from(delay), delay, floors)
-                .await;
+            if stated > lease.delay_ms {
+                // A T3 lease was holding one of doc 05.9's render slots, taken
+                // before anything here knew there was a robots.txt to fetch.
+                // No browser ran, so the slot goes back. The guard is the tier
+                // and not whether a slot was granted, because the one case
+                // that reaches here without a grant is a process with no
+                // browser at all, and `refund` on that process does nothing.
+                if lease.tier >= Tier::Rendered {
+                    self.render.refund();
+                }
+                return Fetched::robots_cost(&lease, now()).taught(&lease, robots);
+            }
+            self.wait_for(
+                lease.key.host,
+                slot + u64::from(lease.delay_ms),
+                lease.delay_ms,
+                floors,
+            )
+            .await;
         }
 
         let robots_checked_ms = entry.fetched_ms;
@@ -1287,6 +1327,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             links_seen,
             disallowed: false,
             unchanged,
+            give_back: false,
             signal: learned,
         }
         .taught(&lease, robots)
@@ -1425,6 +1466,16 @@ struct Fetched {
     /// the completion goes back, and the host learns that its validators are
     /// worth nothing.
     unchanged: bool,
+    /// Whether this lease is going back on the queue with no answer.
+    ///
+    /// One case, and it is doc 07.4's clamp rather than doc 05.9's budget:
+    /// this is the lease that found the host's robots.txt missing, fetched it,
+    /// and read a `Crawl-delay` in it longer than the slot the lease was
+    /// given. Waiting that out would hold a slot for up to the five minutes
+    /// doc 07.4 allows and hold the whole tick with it, so the url goes back
+    /// and the state layer spaces the next lease with the delay this one just
+    /// taught it.
+    give_back: bool,
     /// What the answer said about the tier it came back on, when it said
     /// anything. A robots exclusion and a malformed URL say nothing, because
     /// no request was sent.
@@ -1653,6 +1704,28 @@ impl Fetched {
         Self::answered(lease, now_ms, FetchResult::Excluded { reason })
     }
 
+    /// A lease that spent its slot on robots.txt.
+    ///
+    /// One case, and it is doc 07.4's clamp rather than doc 05.9's budget: the
+    /// file this lease fetched publishes a `Crawl-delay` longer than the lease
+    /// was spaced for, up to the five minutes doc 07.4 allows, and a tick that
+    /// waited that out inside a slot would be a tick that took five minutes.
+    ///
+    /// The url is untouched and comes straight back, at the due time it
+    /// already had, which the state layer has already moved past this request.
+    /// Doc 08.3's `Refused` is what the release says, because that is what
+    /// happened: the loop declined this work now and the page has not failed
+    /// at anything.
+    fn robots_cost(lease: &umi_state::Lease, now_ms: u64) -> Self {
+        // The outcome is built and thrown away. `give_back` sends the lease
+        // down the release path instead, and building one anyway keeps this
+        // constructor the same shape as the others rather than making
+        // `outcome` an `Option` that only one caller ever leaves empty.
+        let mut out = Self::excluded(lease, now_ms, umi_state::ExcludeReason::Robots);
+        out.give_back = true;
+        out
+    }
+
     /// A lease whose URL this fetcher could not send at all.
     ///
     /// `Malformed` rather than `Excluded`, because exclusion is a decision
@@ -1689,6 +1762,7 @@ impl Fetched {
             links_seen: 0,
             disallowed: false,
             unchanged: false,
+            give_back: false,
             signal: None,
         }
     }

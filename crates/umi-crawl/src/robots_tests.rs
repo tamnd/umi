@@ -271,7 +271,15 @@ async fn a_crawl_delay_is_clamped_and_reaches_the_host_record() {
         .html(&url, &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    // The lease fetched the file and stopped there. A lease normally goes on
+    // to fetch its page after one politeness delay, and this one would have
+    // had to hold its slot for five minutes to do that, which is a tick that
+    // takes five minutes because a tick does not return until its last lease
+    // does.
+    assert_eq!(report.deferred, 1, "{report:?}");
+    assert_eq!(report.fetched, 0, "{report:?}");
+
     let host = host_of(&reading, &url).await;
     assert_eq!(
         host.crawl_delay_ms,
@@ -283,19 +291,16 @@ async fn a_crawl_delay_is_clamped_and_reaches_the_host_record() {
         Duration::from_millis(300_000),
         "the pacer is still on its own delay"
     );
-    // The lease that fetched robots.txt read the published delay straight off
-    // the parse and waited it out before sending the page, so the page went
-    // 300 seconds after the file rather than one. That is the whole point of
-    // reading the number here and not off the host record: the record learns
-    // it at the end of this tick and the request that would have broken the
-    // rule is inside the tick.
-    //
-    // The second addend is the old delay and not the clamped one, because the
+    // The lease read the published delay off the parse, saw that it was longer
+    // than the slot it had been given, and put its url back rather than hold a
+    // slot open for five minutes. So the only request this tick made to this
+    // host is robots.txt, and the timer it set is the old delay: the
     // completion owns doc 07.6's pacing columns and runs before the ladder is
-    // relearned. From the tick after this one both numbers are 300 seconds.
+    // relearned. The clamped delay is on the record now and the next lease is
+    // spaced by it.
     assert_eq!(
         host.next_allowed_ms,
-        T0 + 300_000 + u64::from(HostRow::INITIAL_DELAY_MS)
+        T0 + u64::from(HostRow::INITIAL_DELAY_MS)
     );
 }
 
