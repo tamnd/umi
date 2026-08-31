@@ -80,7 +80,10 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
     assert_eq!(report.failed, 1, "{report:?}");
     assert_eq!(report.disallowed, 0, "{report:?}");
@@ -121,7 +124,10 @@ async fn a_robots_file_longer_than_the_limit_is_honoured_up_to_the_limit() {
     // One tick per URL, because doc 07.6 gives a host one request a second and
     // the clock here does not move on its own.
     for _ in 0..3 {
-        crawler.tick(&Collected::default()).await.expect("tick");
+        crawler
+            .tick(&Arc::new(Collected::default()))
+            .await
+            .expect("tick");
     }
     let asked = crawler.fetcher();
     assert!(
@@ -166,7 +172,10 @@ async fn a_robots_file_the_fetcher_would_not_finish_disallows_the_host() {
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
     assert_eq!(report.failed, 1, "{report:?}");
     assert_eq!(report.disallowed, 0, "{report:?}");
@@ -204,7 +213,10 @@ async fn a_robots_redirect_off_the_domain_is_followed() {
     let crawler = crawler(fetch, state);
 
     for _ in 0..2 {
-        crawler.tick(&Collected::default()).await.expect("tick");
+        crawler
+            .tick(&Arc::new(Collected::default()))
+            .await
+            .expect("tick");
     }
     let asked = crawler.fetcher();
     assert!(
@@ -261,7 +273,10 @@ async fn a_robots_redirect_that_never_lands_disallows_the_host() {
     let state = seeded(&[&format!("{ORIGIN}/a")]).await;
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
     assert_eq!(report.failed, 1, "{report:?}");
     assert_eq!(report.disallowed, 0, "{report:?}");
@@ -299,7 +314,10 @@ async fn a_crawl_delay_is_clamped_and_reaches_the_host_record() {
         .html(&url, &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     // The lease fetched the file and stopped there. A lease normally goes on
     // to fetch its page after one politeness delay, and this one would have
     // had to hold its slot for five minutes to do that, which is a tick that
@@ -347,7 +365,10 @@ async fn a_crawl_delay_below_the_floor_is_raised_to_it() {
         .html(&url, &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    crawler.tick(&Collected::default()).await.expect("tick");
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     let host = host_of(&reading, &url).await;
     assert_eq!(host.crawl_delay_ms, Some(100));
     // The floor is below our own starting delay, so the published number
@@ -384,7 +405,10 @@ async fn the_file_a_host_served_is_described_in_its_host_record() {
         .html(&url, &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    crawler.tick(&Collected::default()).await.expect("tick");
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     let host = host_of(&reading, &url).await;
     let robots = host
         .robots
@@ -430,7 +454,10 @@ async fn a_server_error_is_written_down_as_an_answer_we_did_not_get() {
         .html(&url, &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    crawler.tick(&Collected::default()).await.expect("tick");
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     let host = host_of(&reading, &url).await;
     let robots = host.robots.expect("we asked, so that is worth recording");
     assert!(!robots.authoritative, "a 503 is not an answer");
@@ -456,7 +483,10 @@ async fn a_file_with_no_crawl_delay_leaves_the_host_on_our_own_pace() {
         .html(&url, &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    crawler.tick(&Collected::default()).await.expect("tick");
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     let host = host_of(&reading, &url).await;
     assert_eq!(host.crawl_delay_ms, None);
 }
@@ -484,7 +514,10 @@ async fn a_host_whose_robots_would_not_load_comes_round_again() {
         )
         .html(&url, &page("A", &[]));
     let first = crawler(broken, Arc::clone(&state));
-    let report = first.tick(&Collected::default()).await.expect("tick");
+    let report = first
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.failed, 1, "{report:?}");
     assert!(!first.fetcher().asked_for(&url));
 
@@ -497,7 +530,10 @@ async fn a_host_whose_robots_would_not_load_comes_round_again() {
         Arc::new(FixedClock::at(T0 + A_DAY_MS)),
         config(),
     );
-    let report = later.tick(&Collected::default()).await.expect("tick");
+    let report = later
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.fetched, 1, "the site never came back: {report:?}");
     assert!(later.fetcher().asked_for(&url));
 }

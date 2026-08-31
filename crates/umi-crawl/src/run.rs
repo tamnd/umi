@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
+use tokio::task::JoinHandle;
 use umi_extract::extract;
 use umi_fetch::Outcome;
 use umi_frontier::{Ask, Config as FrontierConfig, Frontier, Rate};
@@ -139,6 +140,47 @@ struct Held {
     /// What the answers said about the tiers they came back on, merged per
     /// host by [`learn`].
     signals: Vec<Learned>,
+}
+
+impl Held {
+    /// An empty batch with room for one window of answers.
+    ///
+    /// A constructor rather than [`Default`] because the tick swaps this out
+    /// for a fresh one every time it hands a batch to the store, and a batch
+    /// that starts with no capacity grows by doubling through the whole window
+    /// on every swap.
+    fn new(window: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(window),
+            outcomes: Vec::with_capacity(window),
+            ..Self::default()
+        }
+    }
+
+    /// Whether there is anything here worth a round trip.
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+            && self.outcomes.is_empty()
+            && self.candidates.is_empty()
+            && self.signals.is_empty()
+    }
+}
+
+/// What one store wrote, for the tick to fold into its report when it collects.
+///
+/// Returned rather than added to a `&mut TickReport` because the store runs on
+/// a task of its own now and cannot hold a borrow of the tick's report. The
+/// four numbers travel back the way the batch went out.
+#[derive(Debug, Default)]
+struct Stored {
+    /// Rows the sink took.
+    rows: usize,
+    /// Hosts whose tier memory moved.
+    learned: usize,
+    /// Links that were new to the frontier.
+    links_admitted: usize,
+    /// How long the whole thing took, on its own task.
+    store_ms: u64,
 }
 
 /// A tick's supply of leases.
@@ -294,8 +336,9 @@ pub struct CrawlConfig {
     pub rate: Rate,
     /// How many domains one ask to the scheduler may take work from.
     ///
-    /// The scheduler asks the store once per domain, so this is also the most
-    /// round trips an ask can cost. See [`umi_frontier::Config::max_domains`].
+    /// They go to the store together, so this is how wide one ask is rather
+    /// than how many round trips it takes. See
+    /// [`umi_frontier::Config::max_domains`].
     pub max_domains: usize,
     /// One in how many 304s to check by fetching the page anyway.
     ///
@@ -470,14 +513,24 @@ pub struct TickReport {
     /// the window over that number is the rate. Everything else in this block
     /// is here to say which part of it to go and fix.
     pub lease_ms: u64,
-    /// Milliseconds the tick spent inside the state layer writing.
+    /// Milliseconds spent inside the state layer writing.
     ///
     /// Rows, completions, relearned hosts and admitted links, once per window.
-    /// Not divided by anything, because it is time on the one task that also
-    /// harvests fetches and starts their replacements, so it is time the window
-    /// was not being topped up. Against the tick's own length it is the share
-    /// of the crawl that was bookkeeping.
+    /// Measured on the store's own task rather than on the loop, so against the
+    /// tick's own length it can be more than one and that is the point: two
+    /// seconds of writing inside a ten second tick that the loop never waited
+    /// for is two seconds the crawl got for free. It is the cost of the write
+    /// path and not the cost to the crawl. See `store_waited_ms` for that.
     pub store_ms: u64,
+    /// Milliseconds the loop spent waiting for a store to finish.
+    ///
+    /// The number that says whether one store at a time is enough. The loop
+    /// hands a full window to the store and goes back to harvesting, and it
+    /// only waits here if the next window filled before the last one finished
+    /// writing. Zero means the write path is free, and anything approaching
+    /// `store_ms` means it is not keeping up and the answer is a deeper queue
+    /// or a faster store rather than anything on the fetch path.
+    pub store_waited_ms: u64,
     /// Milliseconds the tick spent asking the scheduler for more work.
     ///
     /// The other half of what the loop task does that is not a fetch, and it is
@@ -807,6 +860,13 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
     /// inside its politeness window, and the answer is to wait rather than to
     /// ask again immediately.
     ///
+    /// The sink comes in behind a handle because the writing happens on a task
+    /// of its own. A borrowed sink cannot outlive this call and a spawned task
+    /// has to, and the alternative is what this used to do: write a window's
+    /// worth on the same task that harvests fetches and starts their
+    /// replacements, with every socket in the window idle for as long as it
+    /// took.
+    ///
     /// # Errors
     ///
     /// [`CrawlError::State`] if the leases could not be taken or the
@@ -814,7 +874,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
     /// could not be stored. In every case the leases are left to expire rather
     /// than released, because an error here means we do not know what happened
     /// and the safe reading of that is that the work was not done.
-    pub async fn tick(&self, sink: &dyn Sink) -> Result<TickReport, CrawlError> {
+    pub async fn tick<S: Sink + 'static>(&self, sink: &Arc<S>) -> Result<TickReport, CrawlError> {
         // The schedule lives in memory and the urls do not, so a crawler whose
         // gate is empty has no domains to take work from and leases nothing
         // however full the store is. Seeds go in through `umi seed` and through
@@ -876,11 +936,21 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             u32::try_from(self.config.in_flight).unwrap_or(u32::MAX),
             allowance.lease_scale,
         ) as usize;
-        let mut held = Held {
-            rows: Vec::with_capacity(window),
-            outcomes: Vec::with_capacity(window),
-            ..Held::default()
-        };
+        let mut held = Held::new(window);
+        // One store outstanding at a time, and never two. Doc 16's gate 1.3
+        // rule is that a row is on disk before the completion that says we have
+        // it, and a second store running alongside the first would put the
+        // completions of one window next to the rows of another with no order
+        // between them. One at a time keeps the rule exactly as it was and
+        // still takes the whole write path off this task: store N runs while
+        // the loop harvests the fetches that will make up store N plus one.
+        //
+        // Deeper would buy nothing anyway. The loop only waits here if a
+        // window fills faster than the last one can be written, and a window
+        // takes seconds to fetch against a store measured in hundreds of
+        // milliseconds. `store_waited_ms` is what says if that stops being
+        // true.
+        let mut storing: Option<JoinHandle<Result<Stored, CrawlError>>> = None;
         let mut deferred: Vec<LeaseId> = Vec::new();
 
         for _ in 0..window {
@@ -1008,10 +1078,18 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             // that in memory until the last one lands is both a lot of memory
             // and a lot to lose if the process dies.
             if held.outcomes.len() >= window {
-                self.store(sink, &mut held, now_ms, &mut report).await?;
+                collect(storing.take(), &mut report).await?;
+                let batch = std::mem::replace(&mut held, Held::new(window));
+                storing = Some(self.put(sink, batch, now_ms));
             }
         }
-        self.store(sink, &mut held, now_ms, &mut report).await?;
+        // Both, in order. The one in flight has the earlier window in it and
+        // has to land first, for the same reason the two halves of a single
+        // store are in the order they are.
+        collect(storing, &mut report).await?;
+        if !held.is_empty() {
+            fold(self.store(&**sink, held, now_ms).await?, &mut report);
+        }
 
         // After the completions rather than before, so that a store that
         // refuses the release still keeps the answers of everything this tick
@@ -1061,11 +1139,74 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         lease: umi_state::Lease,
         at: u64,
         floors: &Arc<HostFloors>,
-    ) -> tokio::task::JoinHandle<Fetched> {
+    ) -> JoinHandle<Fetched> {
         let shared = Arc::clone(&self.shared);
         let floors = Arc::clone(floors);
         tokio::spawn(async move { shared.one(lease, at, &floors).await })
     }
+
+    /// Hand a finished window to the store, on a task of its own.
+    ///
+    /// The same reasoning as [`start`](Self::start) and the same mechanism, for
+    /// the other end of the loop. A window of rows is a segment write, a
+    /// durable transaction for the completions, a host record per learned tier
+    /// and an admit for every link found, and every backend we ship is
+    /// synchronous underneath. On the loop's task that is a full window of
+    /// sockets sitting idle for the length of a write. Spawned, the loop goes
+    /// straight back to harvesting and the write happens beside it.
+    fn put<S: Sink + 'static>(
+        &self,
+        sink: &Arc<S>,
+        held: Held,
+        now_ms: u64,
+    ) -> JoinHandle<Result<Stored, CrawlError>> {
+        let shared = Arc::clone(&self.shared);
+        let sink = Arc::clone(sink);
+        tokio::spawn(async move { shared.store(&*sink, held, now_ms).await })
+    }
+}
+
+/// Wait for a store to finish and fold what it wrote into the report.
+///
+/// Takes the [`Option`] rather than making the caller unwrap it, because the
+/// first window of a tick has nothing outstanding and every other one does,
+/// and a caller that has to say so twice is a caller that will one day say it
+/// once.
+///
+/// # Errors
+///
+/// Whatever the store reported. A store that failed leaves the leases of its
+/// window out on loan to expire, which is the same answer the tick has always
+/// given when it could not write: we do not know what happened, so the safe
+/// reading is that the work was not done.
+async fn collect(
+    storing: Option<JoinHandle<Result<Stored, CrawlError>>>,
+    report: &mut TickReport,
+) -> Result<(), CrawlError> {
+    let Some(handle) = storing else {
+        return Ok(());
+    };
+    let began = Instant::now();
+    let done = match handle.await {
+        Ok(done) => done?,
+        // A store task can only end without an answer by panicking, and
+        // swallowing that would leave the tick reporting rows it never wrote.
+        Err(joined) => std::panic::resume_unwind(joined.into_panic()),
+    };
+    // Around the await and not around the store, which is timing itself. This
+    // is the part that cost the crawl anything: the store ran while the loop
+    // was busy, and this is what was left over.
+    report.store_waited_ms += u64::from(ms(began));
+    fold(done, report);
+    Ok(())
+}
+
+/// Add one store's work to the tick's report.
+fn fold(done: Stored, report: &mut TickReport) {
+    report.rows += done.rows;
+    report.learned += done.learned;
+    report.links_admitted += done.links_admitted;
+    report.store_ms += done.store_ms;
 }
 
 impl<F: Fetch, C: Clock> Shared<F, C> {
@@ -1083,41 +1224,40 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// round would write back a politeness timer from before this tick moved
     /// it.
     ///
+    /// Takes the batch by value because it runs on a task of its own and the
+    /// tick has already swapped in an empty one to keep filling.
+    ///
     /// # Errors
     ///
     /// [`CrawlError::Sink`] if the rows could not be stored and
     /// [`CrawlError::State`] if the completions could not be recorded.
-    async fn store(
+    async fn store<S: Sink + ?Sized>(
         &self,
-        sink: &dyn Sink,
-        held: &mut Held,
+        sink: &S,
+        held: Held,
         now_ms: u64,
-        report: &mut TickReport,
-    ) -> Result<(), CrawlError> {
+    ) -> Result<Stored, CrawlError> {
         let began = Instant::now();
+        let mut done = Stored::default();
         if !held.rows.is_empty() {
             sink.take(&held.rows).await?;
-            report.rows += held.rows.len();
-            held.rows.clear();
+            done.rows = held.rows.len();
         }
         if !held.outcomes.is_empty() {
             self.state().complete(&held.outcomes).await?;
-            held.outcomes.clear();
         }
         if !held.signals.is_empty() {
-            report.learned += self.relearn(&held.signals, now_ms).await?;
-            held.signals.clear();
+            done.learned = self.relearn(&held.signals, now_ms).await?;
         }
         if !held.candidates.is_empty() {
-            report.links_admitted += self.admit(&held.candidates, now_ms).await?;
-            held.candidates.clear();
+            done.links_admitted = self.admit(&held.candidates, now_ms).await?;
         }
         // At the end and not on each of the four, because the question this
-        // answers is how long the loop was in here rather than which call was
+        // answers is how long the write path takes rather than which call was
         // the slow one. A `?` above skips it, and a tick that failed to store
         // is not a tick anybody is reading a rate off.
-        report.store_ms += u64::from(ms(began));
-        Ok(())
+        done.store_ms = u64::from(ms(began));
+        Ok(done)
     }
 
     /// The next lease to put on the wire, fetching more from the scheduler when

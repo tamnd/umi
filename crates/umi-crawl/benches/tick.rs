@@ -697,7 +697,7 @@ async fn prime_robots<F: Fetch + 'static>(crawler: &Crawler<F, Arc<FixedClock>>,
 /// nothing. A daemon sleeps here; this is that sleep without the sleeping, and
 /// it is why the clock advance sits outside the work rather than inside it.
 async fn run<F: Fetch + 'static>(crawler: &Crawler<F, Arc<FixedClock>>, n: usize) -> TickReport {
-    let sink = Counter::default();
+    let sink = Arc::new(Counter::default());
     let mut total = TickReport::default();
     for i in 0..n {
         let report = crawler.tick(&sink).await.expect("tick");

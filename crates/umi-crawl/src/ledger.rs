@@ -221,21 +221,26 @@ fn escape(s: &str) -> String {
 /// sink argument. The ledger goes first: a T4 fetch that cannot be recorded
 /// should not reach the corpus, because then the corpus would hold a row the
 /// record does not explain.
-pub struct Recorded<'a, S> {
-    ledger: &'a SupervisedLedger,
-    inner: &'a S,
+///
+/// It owns both halves rather than borrowing them, because the crawl loop
+/// writes on a task of its own and a spawned task cannot hold a borrow of the
+/// tick that spawned it. The sink comes in behind a handle for the same reason
+/// the loop takes one: the caller goes on using it to seal and to harvest.
+pub struct Recorded<S> {
+    ledger: SupervisedLedger,
+    inner: std::sync::Arc<S>,
 }
 
-impl<'a, S: Sink> Recorded<'a, S> {
+impl<S: Sink> Recorded<S> {
     /// Wrap a sink.
     #[must_use]
-    pub const fn new(ledger: &'a SupervisedLedger, inner: &'a S) -> Self {
+    pub const fn new(ledger: SupervisedLedger, inner: std::sync::Arc<S>) -> Self {
         Self { ledger, inner }
     }
 }
 
 #[async_trait::async_trait]
-impl<S: Sink + Sync> Sink for Recorded<'_, S> {
+impl<S: Sink + Sync> Sink for Recorded<S> {
     async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError> {
         self.ledger.record(rows)?;
         self.inner.take(rows).await
