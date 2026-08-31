@@ -15,9 +15,14 @@ use std::time::Duration;
 use umi_state::{HostRow, State};
 use umi_types::RowKey;
 
-use crate::run_tests::{Canned, Collected, T0, crawler, page, seeded};
+use crate::clock::FixedClock;
+use crate::run::Crawler;
+use crate::run_tests::{Canned, Collected, T0, config, crawler, page, seeded};
 
 const ORIGIN: &str = "https://example.com";
+
+/// How long a robots.txt answer is good for, which is doc 07.3's 24 hours.
+const A_DAY_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// The host record for a URL, after a tick has run.
 async fn host_of(state: &Arc<dyn State>, url: &str) -> HostRow {
@@ -56,6 +61,12 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
     // it. It is also unsafe in the ordinary sense: the rules the site wrote
     // are still there, we just cannot read them, so crawling anyway means
     // crawling what the site asked us not to.
+    //
+    // Disallowed for now and not retired, which is the second half of the same
+    // RFC paragraph and the half that is easy to drop. A 503 is a bad day and
+    // not a decision, so the url comes back as a failure and gets the backoff
+    // every other failure gets. Retiring it instead loses the site for good on
+    // the strength of one bad afternoon.
     let state = seeded(&[&format!("{ORIGIN}/a")]).await;
     let fetch = Canned::new()
         .outcome(
@@ -67,11 +78,15 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
             },
         )
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
-    let crawler = crawler(fetch, state);
+    let crawler = crawler(fetch, Arc::clone(&state));
 
     let report = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.disallowed, 0, "{report:?}");
+    let stats = state.stats().await.expect("stats");
+    assert_eq!(stats.urls_excluded, 0, "the site was retired over a 503");
+    assert_eq!(stats.urls_failed, 1, "{stats:?}");
 }
 
 #[tokio::test]
@@ -134,6 +149,10 @@ async fn a_robots_file_the_fetcher_would_not_finish_disallows_the_host() {
     // is 12 KiB rather than something a site would land in by accident, and
     // why reading a truncated body for robots.txt specifically is worth doing
     // later.
+    //
+    // A failure and not an exclusion, for the same reason as the 503 above. We
+    // did not read a rule that says no, we failed to read the file, and those
+    // are different enough that one of them should come round again.
     let state = seeded(&[&format!("{ORIGIN}/a")]).await;
     let fetch = Canned::new()
         .outcome(
@@ -145,11 +164,14 @@ async fn a_robots_file_the_fetcher_would_not_finish_disallows_the_host() {
             },
         )
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
-    let crawler = crawler(fetch, state);
+    let crawler = crawler(fetch, Arc::clone(&state));
 
     let report = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.disallowed, 0, "{report:?}");
+    let stats = state.stats().await.expect("stats");
+    assert_eq!(stats.urls_excluded, 0, "the site was retired over one file");
 }
 
 #[tokio::test]
@@ -212,6 +234,9 @@ async fn a_robots_redirect_that_never_lands_disallows_the_host() {
     // that spends its politeness budget on a redirect chain and never fetches
     // a page from the site at all, which reads to the origin as a crawler
     // hammering one URL.
+    //
+    // Disallowed and not retired, again. A chain that does not land is a site
+    // that is misconfigured today, and a site fixes that.
     let mut fetch = Canned::new();
     for hop in 0..8 {
         fetch = fetch.outcome(
@@ -234,11 +259,14 @@ async fn a_robots_redirect_that_never_lands_disallows_the_host() {
         )
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let state = seeded(&[&format!("{ORIGIN}/a")]).await;
-    let crawler = crawler(fetch, state);
+    let crawler = crawler(fetch, Arc::clone(&state));
 
     let report = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.disallowed, 0, "{report:?}");
+    let stats = state.stats().await.expect("stats");
+    assert_eq!(stats.urls_excluded, 0, "the site was retired over a loop");
     // Five hops attempted and then stopped, so the sixth target is never
     // asked for. The first request is the origin's own robots.txt.
     let hops = crawler
@@ -431,4 +459,45 @@ async fn a_file_with_no_crawl_delay_leaves_the_host_on_our_own_pace() {
     crawler.tick(&Collected::default()).await.expect("tick");
     let host = host_of(&reading, &url).await;
     assert_eq!(host.crawl_delay_ms, None);
+}
+
+#[tokio::test]
+async fn a_host_whose_robots_would_not_load_comes_round_again() {
+    // The other half of the 503 rule, said as a crawl rather than as a
+    // counter. Doc 07.3 says to retry with backoff, so the point is not that
+    // the url stays in some state, it is that a later tick fetches the page.
+    //
+    // Two crawlers over one state layer, because the robots cache is per
+    // process and a site whose robots.txt is fixed the next day is a site the
+    // next process meets with a cold cache. The first one asks and gets a 503.
+    // The second one asks a day later and gets a file.
+    let url = format!("{ORIGIN}/a");
+    let state = seeded(&[&url]).await;
+    let broken = Canned::new()
+        .outcome(
+            &format!("{ORIGIN}/robots.txt"),
+            umi_fetch::Outcome::Failed {
+                failure: umi_fetch::Failure::ServerError,
+                status: Some(503),
+                retry_after: None,
+            },
+        )
+        .html(&url, &page("A", &[]));
+    let first = crawler(broken, Arc::clone(&state));
+    let report = first.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert!(!first.fetcher().asked_for(&url));
+
+    let fixed = Canned::new()
+        .robots(ORIGIN, "User-agent: *\nAllow: /\n")
+        .html(&url, &page("A", &[]));
+    let later = Crawler::new(
+        Arc::new(fixed),
+        Arc::clone(&state),
+        Arc::new(FixedClock::at(T0 + A_DAY_MS)),
+        config(),
+    );
+    let report = later.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.fetched, 1, "the site never came back: {report:?}");
+    assert!(later.fetcher().asked_for(&url));
 }

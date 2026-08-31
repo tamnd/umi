@@ -730,6 +730,15 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             if matches!(outcome.result, umi_state::FetchResult::NotModified { .. }) {
                 report.not_modified += 1;
             }
+            // Off the completion for the same reason, because the three
+            // failures that never reach an origin have no row either: a url
+            // this fetcher cannot send, and a robots.txt that was a 5xx or
+            // would not load. All three are answers and all three come round
+            // again, so a report that left them out would show a tick doing
+            // less work than it did.
+            if row.is_none() && matches!(outcome.result, umi_state::FetchResult::Failed { .. }) {
+                report.failed += 1;
+            }
             if let Some(row) = row {
                 match row.outcome {
                     umi_types::OutcomeCode::Ok => report.fetched += 1,
@@ -1020,9 +1029,8 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         // and has nothing to say the host record does not already hold.
         let robots = robots_fetched.then(|| RobotsFacts::of(&entry));
         if !decision.is_allowed() {
-            let mut out = Fetched::excluded(&lease, now(), umi_state::ExcludeReason::Robots);
-            out.disallowed = true;
-            return out.taught(&lease, robots);
+            return Fetched::refused(&lease, now(), entry.robots.provenance())
+                .taught(&lease, robots);
         }
         // Doc 07.6 again, and the reason the wait above is before the robots
         // check rather than after it: robots.txt is a request to the same host
@@ -1702,6 +1710,38 @@ impl Fetched {
     /// crawled and this was not.
     fn excluded(lease: &umi_state::Lease, now_ms: u64, reason: umi_state::ExcludeReason) -> Self {
         Self::answered(lease, now_ms, FetchResult::Excluded { reason })
+    }
+
+    /// A lease robots.txt would not let through, which is two different things.
+    ///
+    /// A file the origin served and that says no is a decision about this URL
+    /// and it is final until the file changes, so the URL is excluded and the
+    /// tick counts it as disallowed.
+    ///
+    /// A file we could not read is not a decision about anything. RFC 9309
+    /// 2.3.1.4 says to treat an unreachable or failing robots.txt as a full
+    /// disallow, and doc 07.3 says the same thing and then says the words that
+    /// matter here, which are "retry with backoff". So the URL comes back as a
+    /// failure and gets the same backoff any other transient failure gets,
+    /// rather than being retired.
+    ///
+    /// The difference is not academic. Measured on server3 against a twenty
+    /// thousand host seed, a ten minute crawl retired 7,090 urls this way, all
+    /// of them ordinary homepages whose robots.txt had timed out while the box
+    /// was busy. Under the old shape one bad afternoon at a resolver was enough
+    /// to lose a site permanently, and nothing would ever look at it again.
+    fn refused(lease: &umi_state::Lease, now_ms: u64, provenance: umi_robots::Provenance) -> Self {
+        use umi_robots::Provenance as From;
+        let kind = match provenance {
+            From::Parsed | From::NotFound => {
+                let mut out = Self::excluded(lease, now_ms, umi_state::ExcludeReason::Robots);
+                out.disallowed = true;
+                return out;
+            }
+            From::Unreachable => umi_state::FailureKind::Connect,
+            From::ServerError => umi_state::FailureKind::ServerError,
+        };
+        Self::answered(lease, now_ms, FetchResult::Failed { status: None, kind })
     }
 
     /// A lease that spent its slot on robots.txt.
