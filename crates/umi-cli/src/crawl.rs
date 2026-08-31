@@ -1052,22 +1052,32 @@ fn run(
     let fetcher = runtime.block_on(ladder(fetch_config, signer, options.tabs))?;
 
     let scope = Arc::new(scope.clone());
-    let sink = SegmentSink::create(
-        &layout.segments,
-        SegmentInfo {
-            stream: StreamKind::Pages,
-            coordinator: coordinator_key(&layout.dir),
-            crawl_profile: scope.id,
-            ..SegmentInfo::default()
-        },
-        WriterConfig::default(),
-    )
-    .map_err(Error::Io)?;
+    // Behind a handle because the crawl loop writes on a task of its own and
+    // this function keeps using the same sink to seal and to harvest.
+    let sink = Arc::new(
+        SegmentSink::create(
+            &layout.segments,
+            SegmentInfo {
+                stream: StreamKind::Pages,
+                coordinator: coordinator_key(&layout.dir),
+                crawl_profile: scope.id,
+                ..SegmentInfo::default()
+            },
+            WriterConfig::default(),
+        )
+        .map_err(Error::Io)?,
+    );
 
     // Doc 05.7's record. It writes nothing until something is leased at T4, so
     // a crawl that never opts in leaves no file behind, and it wraps the
     // segment sink rather than replacing it because the same rows go to both.
-    let ledger = SupervisedLedger::in_dir(&layout.dir);
+    //
+    // Wrapped once here rather than per tick, because the pair is the same
+    // every time and the wrapper is what the loop hands to its store task.
+    let recorded = Arc::new(Recorded::new(
+        SupervisedLedger::in_dir(&layout.dir),
+        Arc::clone(&sink),
+    ));
 
     let crawler = Crawler::new(
         fetcher,
@@ -1208,7 +1218,7 @@ fn run(
             }
 
             let report = crawler
-                .tick(&Recorded::new(&ledger, &sink))
+                .tick(&recorded)
                 .await
                 .map_err(|e| Error::Crawl(e.to_string()))?;
             add(&mut summary, &report);
@@ -2084,10 +2094,17 @@ impl Pressure {
 /// the case where the first two do not add up. The window and the lease cost
 /// are what the fetches did, and they are measured on the fetch tasks. This is
 /// measured on the loop task, and it is the seconds of the tick that the loop
-/// spent inside the store rather than putting the next lease on the wire. A
-/// tick whose window is full and whose leases are quick and whose rate is still
-/// nowhere near the window over the lease cost is a tick that spent its time
-/// here, and no amount of work on the fetch path will move it.
+/// spent anywhere other than putting the next lease on the wire. A tick whose
+/// window is full and whose leases are quick and whose rate is still nowhere
+/// near the window over the lease cost is a tick that spent its time here, and
+/// no amount of work on the fetch path will move it.
+///
+/// The write is inside the brackets and outside the total, because writing
+/// happens on a task of its own and mostly costs the crawl nothing. `waited` is
+/// what it did cost: the seconds the loop sat waiting for the last window to be
+/// written before it could hand over the next one. A write figure much bigger
+/// than the wait is the write path keeping up, which is the ordinary case. The
+/// two converging is the store falling behind the fetches.
 fn progress(
     summary: &Summary,
     report: &TickReport,
@@ -2098,8 +2115,8 @@ fn progress(
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  {} ms per page ({} robots, {} polite)  \
-         state {:.0}s ({:.0}s write, {:.0}s over {} asks, {} empty)  {} MB fetched  \
-         {} MB stored  {} failed  bottleneck: {}",
+         state {:.0}s ({:.0}s over {} asks, {} empty, {:.0}s waited on a {:.0}s write)  \
+         {} MB fetched  {} MB stored  {} failed  bottleneck: {}",
         summary.rows,
         report.window_mean(),
         queued,
@@ -2107,11 +2124,12 @@ fn progress(
         report.lease_mean_ms(),
         report.robots_mean_ms(),
         report.waited_mean_ms(),
-        (report.store_ms + report.ask_ms) as f64 / 1000.0,
-        report.store_ms as f64 / 1000.0,
+        (report.store_waited_ms + report.ask_ms) as f64 / 1000.0,
         report.ask_ms as f64 / 1000.0,
         report.asks,
         report.asks_empty,
+        report.store_waited_ms as f64 / 1000.0,
+        report.store_ms as f64 / 1000.0,
         summary.bytes_fetched / (1 << 20),
         summary.bytes_stored / (1 << 20),
         summary.failed,

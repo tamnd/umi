@@ -439,6 +439,24 @@ impl Collected {
     }
 }
 
+/// A sink that takes real time over every batch.
+///
+/// The counterpart to [`Slow`] and for the same reason. The loop hands a full
+/// window to the store and goes back to harvesting, and a sink that answers in
+/// the poll it was called in leaves nothing to overlap with the fetches.
+struct Sleepy {
+    inner: Collected,
+    per_batch: Duration,
+}
+
+#[async_trait::async_trait]
+impl Sink for Sleepy {
+    async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError> {
+        tokio::time::sleep(self.per_batch).await;
+        self.inner.take(rows).await
+    }
+}
+
 /// A sink that always refuses, to check what the loop does about it.
 struct Broken;
 
@@ -519,10 +537,10 @@ fn with_scope(
 ///
 /// The step is [`TICK_STEP_MS`], and the ceiling is there so a loop that never
 /// drains fails the test rather than hanging the suite.
-async fn drain<F: Fetch + 'static>(
+async fn drain<F: Fetch + 'static, S: Sink + 'static>(
     crawler: &Crawler<F, Arc<FixedClock>>,
     clock: &FixedClock,
-    sink: &dyn Sink,
+    sink: &Arc<S>,
 ) -> TickReport {
     let mut total = TickReport::default();
     for _ in 0..64 {
@@ -563,7 +581,7 @@ async fn a_tick_leases_fetches_and_completes() {
         .robots("https://example.com", "User-agent: *\nAllow: /\n")
         .html("https://example.com/a", &page("A", &[]));
     let crawler = crawler(fetch, Arc::clone(&state));
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 1);
@@ -598,7 +616,10 @@ async fn robots_is_fetched_before_the_page_and_only_once_per_host() {
         .html("https://example.com/c", &page("C", &[]));
     let crawler = crawler(fetch, state);
 
-    let first = crawler.tick(&Collected::default()).await.expect("tick");
+    let first = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(first.fetched, 3);
 
     // Three pages on one host is one robots.txt. A cache that let every task
@@ -634,7 +655,7 @@ async fn the_lease_that_fetches_robots_goes_on_to_fetch_its_page() {
             .html(url, &page("A", &[]))
     }));
     let crawler = Crawler::new(Arc::clone(&fetch), state, Arc::clone(&clock), config());
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 1, "{report:?}");
@@ -704,7 +725,10 @@ async fn a_tick_asks_the_scheduler_again_rather_than_letting_its_window_drain() 
         },
     );
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.leased, urls.len(), "{report:?}");
     assert_eq!(report.fetched, urls.len(), "{report:?}");
 
@@ -757,7 +781,10 @@ async fn a_batch_covering_one_host_is_spread_out_rather_than_sent_at_once() {
         },
     );
 
-    let first = crawler.tick(&Collected::default()).await.expect("tick");
+    let first = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(first.fetched, 4, "{first:?}");
 
     // robots.txt is in the list rather than filtered out of it. Doc 07.6
@@ -821,7 +848,10 @@ async fn forty_hosts_under_one_domain_are_still_one_domain() {
     }));
     let crawler = Crawler::new(Arc::clone(&fetch), state, Arc::clone(&clock), config());
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.leased, urls.len(), "{report:?}");
 
     // The cap is 20 a second and the burst is a second's worth, so the forty
@@ -849,7 +879,10 @@ async fn forty_hosts_under_one_domain_are_still_one_domain() {
         );
     }
 
-    let next = crawler.tick(&Collected::default()).await.expect("tick");
+    let next = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert!(
         next.idle(),
         "the frontier was empty and handed out {} anyway",
@@ -871,15 +904,11 @@ async fn a_tick_reports_how_full_its_fetch_window_actually_was() {
     // is what counting the tick's fetch tasks gives: the loop takes one out and
     // puts one in on every pass, so that count is pinned to the window size and
     // reads full for a crawl that has stopped fetching.
-    let urls: Vec<String> = (0..16).map(|n| format!("https://h{n}.example/p")).collect();
+    let (urls, canned) = a_page_each(16);
     let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
     let state = seeded(&refs).await;
     let fetch = Slow {
-        inner: urls.iter().fold(Canned::new(), |f, url| {
-            let origin = url.trim_end_matches("/p");
-            f.robots(origin, "User-agent: *\nAllow: /\n")
-                .html(url, &page("P", &[]))
-        }),
+        inner: canned,
         per_request: Duration::from_millis(20),
     };
     let crawler = Crawler::new(
@@ -892,7 +921,10 @@ async fn a_tick_reports_how_full_its_fetch_window_actually_was() {
         },
     );
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.fetched, 16, "{report:?}");
     // Loosely, because the tick also has a store in it and the last four leases
     // are not replaced. The bug this catches is off by a factor of four, so a
@@ -904,6 +936,101 @@ async fn a_tick_reports_how_full_its_fetch_window_actually_was() {
         report.leased,
         report.elapsed_ms
     );
+}
+
+/// Sixteen hosts with one page each, and the canned robots.txt to reach them.
+fn a_page_each(count: usize) -> (Vec<String>, Canned) {
+    let urls: Vec<String> = (0..count)
+        .map(|n| format!("https://h{n}.example/p"))
+        .collect();
+    let fetch = urls.iter().fold(Canned::new(), |f, url| {
+        let origin = url.trim_end_matches("/p");
+        f.robots(origin, "User-agent: *\nAllow: /\n")
+            .html(url, &page("P", &[]))
+    });
+    (urls, fetch)
+}
+
+#[tokio::test]
+async fn the_loop_keeps_fetching_while_the_last_window_is_being_written() {
+    // Doc 16's gate 3.1 is a rate on one box, and on server3 twenty seconds of
+    // a hundred and ten second tick were the loop task inside the store rather
+    // than putting the next lease on the wire. Every socket in the window goes
+    // quiet for that whole time, which is both a slower crawl and a rude one.
+    //
+    // Thirty two urls on thirty two hosts, a window of four, and both ends of
+    // the loop given real time to spend: ten milliseconds a request and twenty
+    // a batch. Eight windows, so eight writes, and seven of them have a window
+    // of fetching to hide behind. Only the last has nothing left to overlap
+    // with, so the loop waits for one write out of eight.
+    let (urls, canned) = a_page_each(32);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let fetch = Slow {
+        inner: canned,
+        per_request: Duration::from_millis(10),
+    };
+    let crawler = Crawler::new(
+        fetch,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let sink = Arc::new(Sleepy {
+        inner: Collected::default(),
+        per_batch: Duration::from_millis(20),
+    });
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.rows, 32, "{report:?}");
+    assert_eq!(sink.inner.rows().len(), 32, "{report:?}");
+    assert!(
+        report.store_ms >= 100,
+        "eight writes of twenty milliseconds took {} ms, so the sink was not \
+         the slow part and this test proves nothing",
+        report.store_ms
+    );
+    // Three and not eight, because the seven that overlap do not overlap
+    // perfectly and a loaded machine widens every one of them. The failure
+    // this catches is the loop waiting for all eight, and that is a factor of
+    // eight away from here.
+    assert!(
+        report.store_waited_ms * 3 < report.store_ms,
+        "the loop waited {} ms of a {} ms write path, so the store is still on it",
+        report.store_waited_ms,
+        report.store_ms
+    );
+}
+
+#[tokio::test]
+async fn a_write_that_fails_off_the_loop_still_fails_the_tick() {
+    // The store runs on a task of its own, and a task of its own is a place
+    // for an error to go missing. A tick whose rows were not written must not
+    // report them as stored, because the completions for that window are
+    // written by the same call and a tick that swallowed this would be a tick
+    // that marked pages crawled and threw them away.
+    //
+    // Sixteen urls against a window of four, so the failure happens in a
+    // spawned write and not in the last one on the loop's own task.
+    let (urls, _) = a_page_each(16);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let (_, canned) = a_page_each(16);
+    let crawler = Crawler::new(
+        canned,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let failed = crawler.tick(&Arc::new(Broken)).await;
+    assert!(matches!(failed, Err(CrawlError::Sink(_))), "{failed:?}");
 }
 
 #[tokio::test]
@@ -941,7 +1068,10 @@ async fn a_lease_that_is_ready_now_does_not_wait_behind_one_that_is_not() {
         },
     );
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.fetched, 8, "{report:?}");
     assert_eq!(report.deferred, 0, "{report:?}");
 
@@ -977,7 +1107,7 @@ async fn a_disallowed_url_is_never_fetched() {
         )
         .html("https://example.com/private/secret", &page("Secret", &[]));
     let crawler = crawler(fetch, state);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 1);
@@ -1015,7 +1145,7 @@ async fn aipref_reaches_the_row_from_both_sources_at_once() {
             ),
         );
     let crawler = crawler(fetch, state);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     crawler.tick(&sink).await.expect("tick");
     let rows = sink.rows();
@@ -1045,7 +1175,7 @@ async fn a_pattern_scoped_aipref_line_reaches_only_the_pages_it_names() {
         .html("https://example.com/ai-ok/yes", &page("Yes", &[]))
         .html("https://example.com/blog/no", &page("No", &[]));
     let crawler = crawler(fetch, state);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     crawler.tick(&sink).await.expect("tick");
     let rows = sink.rows();
@@ -1074,7 +1204,7 @@ async fn an_unreadable_aipref_value_is_recorded_rather_than_dropped() {
         )
         .html("https://example.com/a", &page("A", &[]));
     let crawler = crawler(fetch, state);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     crawler.tick(&sink).await.expect("tick");
     assert_eq!(
@@ -1093,7 +1223,10 @@ async fn a_missing_robots_allows_the_host() {
     let fetch = Canned::new().html("https://example.com/a", &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.disallowed, 0);
     assert_eq!(report.fetched, 1);
 }
@@ -1113,7 +1246,7 @@ async fn links_found_on_a_page_go_into_the_frontier() {
         .html("https://example.com/c", &page("C", &[]))
         .html("https://elsewhere.example/d", &page("D", &[]));
     let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let first = crawler.tick(&sink).await.expect("tick");
     assert_eq!(first.links_seen, 3);
@@ -1153,7 +1286,7 @@ async fn a_nofollow_page_keeps_its_row_and_gives_up_its_links() {
         .robots("https://example.com", "User-agent: *\nAllow: /\n")
         .html("https://example.com/a", body);
     let crawler = crawler(fetch, state);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.rows, 1);
@@ -1174,7 +1307,7 @@ async fn a_rel_nofollow_link_is_followed_and_is_still_in_the_row() {
         .robots("https://example.com", "User-agent: *\nAllow: /\n")
         .html("https://example.com/a", body);
     let crawler = crawler(fetch, state);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.links_seen, 2);
@@ -1203,7 +1336,7 @@ async fn the_head_puts_its_pages_in_the_frontier_and_keeps_its_assets_out() {
         .html("https://example.com/b", &page("B", &[]));
     let clock = Arc::new(FixedClock::at(T0));
     let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.links_seen, 1, "an asset was offered to the frontier");
@@ -1234,7 +1367,7 @@ async fn the_depth_ceiling_stops_the_crawl_going_deeper() {
     }
     let clock = Arc::new(FixedClock::at(T0));
     let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let total = drain(&crawler, &clock, &sink).await;
 
@@ -1264,7 +1397,7 @@ async fn a_failed_fetch_still_produces_a_row() {
             },
         );
     let crawler = crawler(fetch, state);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.rows, 1);
@@ -1288,7 +1421,7 @@ async fn a_sink_that_fails_leaves_the_url_uncompleted() {
         .html("https://example.com/a", &page("A", &[]));
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    let failed = crawler.tick(&Broken).await;
+    let failed = crawler.tick(&Arc::new(Broken)).await;
     assert!(matches!(failed, Err(CrawlError::Sink(_))), "{failed:?}");
 
     // The lease is still out, so nothing is leasable until it expires. Once it
@@ -1305,7 +1438,10 @@ async fn a_sink_that_fails_leaves_the_url_uncompleted() {
 async fn an_empty_frontier_is_idle_and_not_an_error() {
     let state = seeded(&[]).await;
     let crawler = crawler(Canned::new(), state);
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(
         TickReport {
             // The one ask it took to find that out, which is the report saying
@@ -1333,7 +1469,7 @@ async fn two_runs_over_the_same_pages_produce_the_same_rows() {
             .html("https://example.com/a", &page("A", &["/b"]))
             .html("https://example.com/b", &page("B", &["/a"]));
         let crawler = crawler(fetch, state);
-        let sink = Collected::default();
+        let sink = Arc::new(Collected::default());
         crawler.tick(&sink).await.expect("tick");
         let mut rows = sink.rows();
         rows.sort_by(|a, b| a.url.cmp(&b.url));
@@ -1373,7 +1509,10 @@ async fn the_robots_cache_expires_after_a_day() {
         },
     );
 
-    crawler.tick(&Collected::default()).await.expect("tick");
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     let after_first = fetch
         .asked()
         .iter()
@@ -1382,7 +1521,10 @@ async fn the_robots_cache_expires_after_a_day() {
     assert_eq!(after_first, 1);
 
     clock.advance(crate::robots::TTL_MS + 1);
-    crawler.tick(&Collected::default()).await.expect("tick");
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     let after_second = fetch
         .asked()
         .iter()
@@ -1407,7 +1549,7 @@ async fn a_scope_keeps_the_crawl_on_its_own_site() {
     let scope = Scope::for_target("example.com").expect("target");
     let crawler = with_scope(fetch, Arc::clone(&state), scope);
     let clock = Arc::clone(crawler.clock());
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
     let report = drain(&crawler, &clock, &sink).await;
 
     // Both links were seen, because the row records what the page said. One
@@ -1448,7 +1590,7 @@ async fn one_hop_fetches_the_page_it_cites_and_stops_there() {
     };
     let crawler = with_scope(fetch, Arc::clone(&state), scope);
     let clock = Arc::clone(crawler.clock());
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
     let report = drain(&crawler, &clock, &sink).await;
 
     assert_eq!(report.rows, 2, "the cited page is fetched");
@@ -1514,7 +1656,7 @@ async fn a_filtered_content_type_costs_the_fetch_and_produces_no_row() {
     };
     let crawler = with_scope(fetch, Arc::clone(&state), scope);
     let clock = Arc::clone(crawler.clock());
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
     let report = drain(&crawler, &clock, &sink).await;
 
     assert_eq!(report.leased, 2, "both were leased and both were fetched");
@@ -1540,7 +1682,7 @@ async fn a_filtered_language_produces_no_row_either() {
         ..Scope::for_target("example.com").expect("target")
     };
     let crawler = with_scope(fetch, Arc::clone(&state), scope);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
     let report = crawler.tick(&sink).await.expect("tick");
 
     assert_eq!(report.leased, 1);
@@ -1559,7 +1701,7 @@ async fn rows_are_stamped_with_the_scope_that_admitted_them() {
     let id = scope.id;
     assert_ne!(id, 0);
     let crawler = with_scope(fetch, Arc::clone(&state), scope);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
     crawler.tick(&sink).await.expect("tick");
 
     assert_eq!(sink.rows()[0].crawl_profile, id);
@@ -1583,7 +1725,10 @@ async fn what_the_origin_said_about_its_rate_reaches_the_scheduler() {
         );
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.failed, 1);
 
     let host = umi_types::RowKey::for_url("https://example.com/a", None)
@@ -1629,7 +1774,7 @@ async fn a_retry_after_moves_the_leases_the_tick_is_still_holding() {
         .html("https://example.com/b", &page("B", &[]))
         .html("https://example.com/c", &page("C", &[]));
     let crawler = crawler(fetch, Arc::clone(&state));
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     // A tick of its own to pay for the robots.txt, and the three under test
     // admitted after it, so that the tick under test leases all three as one
@@ -1676,7 +1821,10 @@ async fn a_page_that_came_back_quickly_counts_towards_the_fast_floor() {
         .html("https://example.com/a", &page("A", &[]));
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    crawler.tick(&Collected::default()).await.expect("tick");
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
 
     let host = umi_types::RowKey::for_url("https://example.com/a", None)
         .expect("a crawlable url")
@@ -1703,7 +1851,7 @@ async fn a_challenge_page_is_not_counted_as_a_fetch() {
         .robots("https://example.com", "User-agent: *\nAllow: /\n")
         .html("https://example.com/a", &interstitial());
     let crawler = crawler(fetch, Arc::clone(&state));
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.challenged, 1);
@@ -1741,7 +1889,7 @@ async fn an_origin_that_stops_blocking_is_probed_back_down() {
         Arc::clone(&clock),
         config(),
     );
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.failed, 1);
@@ -1816,7 +1964,10 @@ async fn a_learned_tier_outlives_the_process() {
             .robots("https://example.com", "User-agent: *\nAllow: /\n")
             .outcome(url, blocked());
         let crawler = crawler(fetch, Arc::clone(&state));
-        let report = crawler.tick(&Collected::default()).await.expect("tick");
+        let report = crawler
+            .tick(&Arc::new(Collected::default()))
+            .await
+            .expect("tick");
         assert_eq!(report.learned, 1);
     }
 
@@ -1867,7 +2018,7 @@ async fn a_304_moves_the_schedule_and_writes_no_row() {
         Arc::clone(&clock),
         config(),
     );
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let first = crawler.tick(&sink).await.expect("tick");
     assert_eq!(first.fetched, 1);
@@ -1923,7 +2074,7 @@ async fn three_full_bodies_for_a_conditional_request_drop_t0() {
         Arc::clone(&clock),
         config(),
     );
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
     let host = umi_types::RowKey::for_url(url, None)
         .expect("a crawlable url")
         .host;
@@ -2000,7 +2151,7 @@ async fn a_refresh_holding_a_validator_is_leased_at_t0() {
         Arc::clone(&clock),
         config(),
     );
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     crawler.tick(&sink).await.expect("tick");
     let rows = sink.rows();
@@ -2060,7 +2211,7 @@ async fn a_full_body_that_has_not_changed_writes_no_second_row() {
         Arc::clone(&clock),
         config(),
     );
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let first = crawler.tick(&sink).await.expect("tick");
     assert_eq!(first.rows, 1);
@@ -2110,7 +2261,7 @@ async fn a_304_contradicted_by_the_body_disables_t0_for_the_host() {
             ..config()
         },
     );
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
     let host = umi_types::RowKey::for_url(url, None)
         .expect("a crawlable url")
         .host;
@@ -2192,7 +2343,7 @@ async fn a_validator_outlives_the_process() {
         );
         assert_eq!(
             crawler
-                .tick(&Collected::default())
+                .tick(&Arc::new(Collected::default()))
                 .await
                 .expect("tick")
                 .fetched,
@@ -2212,7 +2363,10 @@ async fn a_validator_outlives_the_process() {
     ));
     let crawler = Crawler::new(Arc::clone(&fetch), Arc::clone(&state), clock, config());
 
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.not_modified, 1, "the etag did not survive the store");
     assert_eq!(report.rows, 0);
     assert_eq!(fetch.conditional(), vec![true]);
@@ -2280,7 +2434,7 @@ async fn rendering_past_the_budget_is_deferred_and_not_fetched() {
 
     let clock = Arc::new(FixedClock::at(T0));
     let crawler = with_browser(fetch, Arc::clone(&state), &clock);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 8);
@@ -2331,7 +2485,7 @@ async fn a_fleet_with_no_browser_at_all_fetches_the_page_anyway() {
         .html(url, &page("A", &[]));
     let clock = Arc::new(FixedClock::at(T0));
     let crawler = with_browser(fetch, Arc::clone(&state), &clock);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 1);
@@ -2369,7 +2523,7 @@ async fn a_page_deferred_for_a_busy_browser_is_not_a_failure() {
     }
     let clock = Arc::new(FixedClock::at(T0));
     let crawler = with_browser(fetch, Arc::clone(&state), &clock);
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
 
     // One slot a second and a five second wait, so the second page is inside
     // the wait and both go through. Making the second one defer needs a tick
@@ -2417,7 +2571,7 @@ async fn a_row_records_the_rungs_that_ran_and_not_the_rung_it_asked_for() {
         },
     );
 
-    let sink = Collected::default();
+    let sink = Arc::new(Collected::default());
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.rows, 1);
 
@@ -2465,7 +2619,10 @@ async fn the_budget_only_holds_back_the_tier_it_is_for() {
 
     let clock = Arc::new(FixedClock::at(T0));
     let crawler = with_browser(fetch, Arc::clone(&state), &clock);
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.fetched, 4);
     assert_eq!(report.deferred, 0);
     assert_eq!(report.rendered, 0);
@@ -2483,7 +2640,10 @@ async fn a_lease_scale_of_zero_leases_nothing_and_says_it_was_the_ladder() {
         lease_scale: 0.0,
         ..crate::Allowance::default()
     });
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert!(report.idle());
     assert!(report.restrained);
 
@@ -2491,7 +2651,10 @@ async fn a_lease_scale_of_zero_leases_nothing_and_says_it_was_the_ladder() {
     // so the tick after the pressure lifts fetches what the paused one would
     // have.
     crawler.restrain(crate::Allowance::default());
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert!(!report.restrained);
     assert_eq!(report.leased, 1);
 }
@@ -2517,7 +2680,10 @@ async fn a_half_lease_scale_takes_half_the_batch() {
         lease_scale: 0.5,
         ..crate::Allowance::default()
     });
-    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
     assert_eq!(report.leased, 4);
     // Smaller than the configured batch, which is the thing the caller has to
     // know so that it does not read the short tick as a drained frontier.

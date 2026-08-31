@@ -112,7 +112,7 @@ fn main() {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("runtime");
-    let counter = Counter::default();
+    let counter = std::sync::Arc::new(Counter::default());
     let bare = best(5, || {
         runtime
             .block_on(counter.take(black_box(&plain)))
@@ -121,7 +121,7 @@ fn main() {
     });
     batch_line("the sink on its own", bare);
 
-    let wrapped = Recorded::new(&ledger, &counter);
+    let wrapped = Recorded::new(ledger, std::sync::Arc::clone(&counter));
     let through = best(5, || {
         runtime
             .block_on(wrapped.take(black_box(&plain)))
