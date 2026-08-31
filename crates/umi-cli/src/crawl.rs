@@ -75,8 +75,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use umi_crawl::{
-    Backpressure, Clock, CrawlConfig, Crawler, Recorded, Scope, SegmentInfo, SegmentSink, Signals,
-    SupervisedLedger, SystemClock, TickReport, probe,
+    Backpressure, Clock, CrawlConfig, Crawler, Live, Recorded, Scope, SegmentInfo, SegmentSink,
+    Signals, SupervisedLedger, SystemClock, TickReport, probe,
 };
 use umi_fetch::webbotauth::Signer;
 use umi_fetch::{FetchConfig, Ladder};
@@ -110,7 +110,33 @@ const PUBLISHED: &str = "published.jsonl";
 
 /// How many times a tick's fetch window refills before the tick commits and
 /// returns, which is the batch as a multiple of `--concurrency`.
-const REFILLS: usize = 16;
+///
+/// Sixty four and not sixteen because of what a tick costs to end. The last
+/// window has no replacements coming, so it drains at the pace of its slowest
+/// lease, and against a 30 second total timeout on a crawl whose mean lease is
+/// under two seconds that is a long stretch of a window emptying out. The cost
+/// is per tick whatever the batch is, so the only lever is how much fetching
+/// each one gets done first. Measured on server3 as an A/B in the same twelve
+/// minutes, 10,000 non overlapping seeds each, T1, depth 2, concurrency 256:
+/// 29,870 rows at sixteen against 39,719 at sixty four, which is 37.7 pages a
+/// second against 53.5. Mean window occupancy went from 115 sockets of 256 to
+/// 177.
+///
+/// What it costs is the report, because a tick is also the reporting boundary
+/// and sixty four windows of it is minutes. See [`WORKING`], which is the
+/// answer to that and the reason this number could move at all.
+const REFILLS: usize = 64;
+
+/// How often a crawl says what it is doing while a tick is still running.
+///
+/// A tick ends with a full account of itself and that is the line worth
+/// reading, but a tick is a batch and a batch is thousands of pages, so on a
+/// slow crawl the gap between two of them is minutes. Doc 14.1 asks for
+/// progress that means something and a command that prints nothing for four
+/// minutes is indistinguishable from a hung one. Thirty seconds is often
+/// enough that the log answers "is it alive" without burying the line that
+/// answers "is it fast".
+const WORKING: Duration = Duration::from_secs(30);
 
 /// How long to wait before asking an idle frontier again.
 ///
@@ -801,11 +827,11 @@ fn settings(options: &Options) -> Result<Settings, Error> {
     };
     // Doc 16's gate 3.1 needs the fetch window to refill many times inside one
     // tick, because a tick that fills its window once and drains it runs at the
-    // batch over its slowest lease rather than the window over the mean.
-    // Sixteen refills puts the cost of the last drain at a sixteenth of the
-    // tick. Capped by `--max-pages`, because a tick runs to the end of its
-    // batch and the batch is therefore also how far past the page limit a crawl
-    // can go before the loop between ticks notices.
+    // batch over its slowest lease rather than the window over the mean. See
+    // `REFILLS` for how many and why that many. Capped by `--max-pages`,
+    // because a tick runs to the end of its batch and the batch is therefore
+    // also how far past the page limit a crawl can go before the loop between
+    // ticks notices.
     let in_flight = usize::from(options.concurrency.max(1));
     let batch = u32::try_from(in_flight.saturating_mul(REFILLS))
         .unwrap_or(u32::MAX)
@@ -1199,6 +1225,9 @@ fn run(
         let mut heartbeat = Heartbeat::default();
         let mut interrupt = interrupt();
         let mut pressure = Pressure::new(layout);
+        // Taken once, because it is the same handle for the life of the crawl
+        // and the tick writes to it from whichever task is holding it.
+        let live = crawler.live();
         loop {
             // Before the tick, so a box that has just filled up is restrained
             // on the next batch rather than after one more.
@@ -1217,10 +1246,28 @@ fn run(
                 }
             }
 
-            let report = crawler
-                .tick(&recorded)
-                .await
-                .map_err(|e| Error::Crawl(e.to_string()))?;
+            // Not a plain await, because a tick is a batch of sixty four
+            // windows and on a slow crawl that is minutes of silence. The tick
+            // is the only thing being waited on here and the heartbeat reads
+            // counters it writes as it goes, so nothing is held up by it and
+            // nothing has to be threaded through the loop.
+            let report = {
+                let ticking = crawler.tick(&recorded);
+                tokio::pin!(ticking);
+                let mut beat = tokio::time::interval(WORKING);
+                // The first one fires straight away, and a heartbeat in the
+                // same instant as the tick that started it says nothing.
+                beat.tick().await;
+                loop {
+                    tokio::select! {
+                        done = &mut ticking => break done,
+                        _ = beat.tick() => {
+                            log.line(&working(&live, started_ms, clock.now_ms()))?;
+                        }
+                    }
+                }
+            }
+            .map_err(|e| Error::Crawl(e.to_string()))?;
             add(&mut summary, &report);
             harvest(
                 &sink,
@@ -2138,6 +2185,28 @@ fn progress(
         summary.bytes_stored / (1 << 20),
         summary.failed,
         bottleneck(report),
+    )
+}
+
+/// The line a crawl prints while a tick is still going.
+///
+/// Deliberately short next to [`progress`], and none of it is a mean. Every
+/// number a tick reports about itself is an average over the tick and there is
+/// no honest average over a tick that has not finished, so this is four running
+/// totals and the count of sockets that are open right now. It answers whether
+/// the crawl is alive and roughly how fast, and leaves why it is that fast to
+/// the line at the end of the tick.
+fn working(live: &Live, started_ms: u64, now_ms: u64) -> String {
+    let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
+    let rows = live.rows();
+    format!(
+        "working  {} done  {} in flight  {:.1} p/s  {} MB fetched  {} failed  up {}",
+        rows,
+        live.in_flight(),
+        rows as f64 / elapsed,
+        live.bytes_fetched() / (1 << 20),
+        live.failed(),
+        span(now_ms.saturating_sub(started_ms)),
     )
 }
 
