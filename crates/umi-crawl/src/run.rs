@@ -218,8 +218,14 @@ struct Supply {
 /// work in hand and the window never sits idle waiting for one.
 #[derive(Debug)]
 struct Asking {
-    /// The task doing the asking.
-    handle: JoinHandle<Result<Vec<umi_state::Lease>, StateError>>,
+    /// The task doing the asking, and how long the query itself took.
+    ///
+    /// Timed inside the task rather than around the join, because an ask that
+    /// comes back while the loop is still working through the queue then sits
+    /// there finished until the loop next needs it. Timed from out here that
+    /// idle stretch would be counted as query time, which is the one number
+    /// the whole change exists to watch.
+    handle: JoinHandle<Result<(Vec<umi_state::Lease>, u32), StateError>>,
     /// How much of the tick's allowance this took before it knew what it would
     /// find. The difference goes back when it lands.
     ///
@@ -227,8 +233,6 @@ struct Asking {
     /// is in flight, and an allowance that two asks both read before either
     /// spent it is an allowance they would each spend in full.
     reserved: u32,
-    /// When it went out, which is not when the loop started waiting for it.
-    began: Instant,
 }
 
 impl HostFloors {
@@ -1293,9 +1297,12 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         let max_tier = self.config.max_tier.min(allowance.max_tier);
         let budget = allowance.budget(self.config.budget);
         supply.asking = Some(Asking {
-            handle: tokio::spawn(async move { shared.ask(want, max_tier, budget).await }),
+            handle: tokio::spawn(async move {
+                let began = Instant::now();
+                let leases = shared.ask(want, max_tier, budget).await?;
+                Ok((leases, ms(began)))
+            }),
             reserved: want,
-            began: Instant::now(),
         });
     }
 
@@ -1317,14 +1324,14 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             return Ok(0);
         };
         let waited = Instant::now();
-        let leases = match asking.handle.await {
-            Ok(leases) => leases?,
+        let (leases, took_ms) = match asking.handle.await {
+            Ok(asked) => asked?,
             // An ask task can only end without an answer by panicking, and a
             // tick that swallowed that would quietly stop leasing.
             Err(joined) => std::panic::resume_unwind(joined.into_panic()),
         };
         report.ask_waited_ms += u64::from(ms(waited));
-        report.ask_ms += u64::from(ms(asking.began));
+        report.ask_ms += u64::from(took_ms);
         report.asks += 1;
         let took = u32::try_from(leases.len()).unwrap_or(u32::MAX);
         // What it reserved and did not use. A frontier with less ready than we
