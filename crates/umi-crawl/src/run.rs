@@ -127,7 +127,7 @@ struct Floor {
 
 /// What a tick has finished and not yet stored.
 ///
-/// See [`Crawler::store`], which empties it.
+/// See [`Shared::store`], which empties it.
 #[derive(Default)]
 struct Held {
     /// Pages, for the sink.
@@ -145,7 +145,7 @@ struct Held {
 ///
 /// The queue is what has been taken from the scheduler and not yet put on the
 /// wire and `left` is how much of the batch the tick may still take. See
-/// [`Crawler::next_lease`].
+/// [`Shared::next_lease`].
 #[derive(Debug)]
 struct Supply {
     /// Leases in hand, earliest due first within each ask.
@@ -598,7 +598,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// Rebuild the domain schedule from what the store holds, per doc 09.8.
     ///
     /// Call it once after the seeds are in and before the first
-    /// [`tick`](Self::tick). The schedule is in memory and the urls are not, so
+    /// [`tick`](Crawler::tick). The schedule is in memory and the urls are not, so
     /// a coordinator that comes back up has every url and no idea which domains
     /// they belong to until this runs, and a tick before it leases nothing.
     ///
@@ -621,7 +621,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// Seed from an origin's own sitemaps, per doc 13.6.
     ///
     /// Call it with the origins the seeds are on, before the first
-    /// [`tick`](Self::tick). It is the difference between starting a site at
+    /// [`tick`](Crawler::tick). It is the difference between starting a site at
     /// its front page and starting it with everything the site says it has, and
     /// on a site whose pages are behind a search form it is the only way to
     /// find them at all.
@@ -2074,7 +2074,7 @@ impl Fetched {
 
     /// Attach what this lease's robots.txt fetch taught about the host.
     ///
-    /// Every exit out of [`Crawler::one`] past the robots check goes through
+    /// Every exit out of [`Shared::one`] past the robots check goes through
     /// here, including the ones that failed, because what the file said about
     /// the host is true whatever happened to the URL afterwards. A lease that
     /// read the file out of the cache passes `None` and this does nothing.
