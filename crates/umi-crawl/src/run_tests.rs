@@ -2040,6 +2040,71 @@ async fn a_retry_after_moves_the_leases_the_tick_is_still_holding() {
 }
 
 #[tokio::test]
+async fn a_lease_whose_turn_is_too_far_out_goes_back_rather_than_holding_its_slot() {
+    // The same shape as the test above with a bigger number on it, and the
+    // number is the point. Honouring a `Retry-After` exactly is right and
+    // waiting it out inside a slot in the fetch window is not: `umi-fetch`
+    // reads one up to a day, so on the open web a single 429 can park every
+    // lease behind it for the rest of the run. Measured on server3 before this
+    // existed: a crawl asked to stop sat at one lease in flight for over six
+    // minutes on an idle box, which is a window of 256 doing the work of one.
+    //
+    // Nothing here disagrees with the origin. The two urls behind the 429 are
+    // not sent, they keep their due time, and the ask that says the origin has
+    // asked for ten minutes is written to the host record by the completion,
+    // so the scheduler will not offer this host again until it may. What
+    // changes is who waits: the state layer, which costs nothing, rather than
+    // two sockets.
+    let state = seeded(&["https://example.com/warm"]).await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/warm", &page("W", &[]))
+        .outcome(
+            "https://example.com/a",
+            Outcome::Failed {
+                failure: umi_fetch::Failure::RateLimited,
+                status: Some(429),
+                retry_after: Some(umi_fetch::RetryAfter::After(600)),
+            },
+        )
+        .html("https://example.com/b", &page("B", &[]))
+        .html("https://example.com/c", &page("C", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+    let sink = Arc::new(Collected::default());
+
+    crawler.tick(&sink).await.expect("warm");
+    let mut rest = Vec::new();
+    for url in [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+    ] {
+        let mut seed = Candidate::new(url, T0).expect("a crawlable url");
+        seed.discovery = umi_state::Discovery::Seed;
+        rest.push(seed);
+    }
+    state.admit(&rest).await.expect("admit");
+    crawler.clock().advance(TICK_STEP_MS);
+    let began = crawler.clock().now_ms();
+
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.leased, 3, "the three were not leased together");
+    assert_eq!(report.failed, 1, "{report:?}");
+    assert_eq!(report.deferred, 2, "{report:?}");
+    assert_eq!(report.fetched, 0, "nothing was sent inside the ten minutes");
+    assert_eq!(report.completed(), 1, "{report:?}");
+    assert!(
+        crawler.clock().now_ms() < began + 600_000,
+        "the tick waited out the whole ask instead of giving the leases back"
+    );
+
+    // And they are still there to fetch, which is what makes giving them back
+    // different from dropping them.
+    let counts = state.stats().await.expect("stats");
+    assert_eq!(counts.urls_pending, 2, "{counts:?}");
+}
+
+#[tokio::test]
 async fn a_page_that_came_back_quickly_counts_towards_the_fast_floor() {
     // The other direction, and the one that is easy to leave unwired: the
     // fetcher measured 40 ms and the host row has to hear about it, or no host
