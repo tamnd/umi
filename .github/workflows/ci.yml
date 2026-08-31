@@ -95,7 +95,7 @@ jobs:
           digest=$(sed -n 's/^corpus blake3=//p' crates/umi-extract/golden/wide.txt)
           test -n "$digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: cache
         with:
           path: corpus/wide.parquet
