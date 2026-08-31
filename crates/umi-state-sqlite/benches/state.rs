@@ -19,6 +19,8 @@
 //! segments       partial index, not a table scan   part 5
 //! resident       doc 09.8 rebuilds the domain      part 6
 //!                schedule from it at startup
+//! complete       the same call, from a runtime      part 8
+//!                with a fetch window on it
 //! ```
 //!
 //! Part 4 is the one worth explaining. The crawl loop calls `stats` on every
@@ -44,6 +46,11 @@
 //! * `UMI_BENCH_SEGMENTS` how much segment history, default 365000, a year
 //! * `UMI_BENCH_REPEAT` how many times to repeat the timed sections, default 3
 //!
+//! Part 8 is the exception to the pinning below. Parts 1 to 7 are shares of one
+//! core and are quoted that way; part 8 is about what happens when this backend
+//! is called from a runtime with a fetch window on it, so it builds its own
+//! runtime with eight workers and has to be left unpinned to mean anything.
+//!
 //! Run it pinned, because the numbers are shares of one core:
 //!
 //! ```text
@@ -51,11 +58,13 @@
 //! taskset -c 1 ./target/release/deps/state-<hash>
 //! ```
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use umi_state::{
-    Candidate, Discovery, FetchOutcome, FetchResult, LeaseRequest, Pace, Priority, RemoteCopy,
-    Revalidator, SegmentQuery, SegmentRow, State, Stream,
+    Candidate, Discovery, FetchOutcome, FetchResult, Lease, LeaseRequest, Pace, Priority,
+    RemoteCopy, Revalidator, SegmentQuery, SegmentRow, State, Stream,
 };
 use umi_state_sqlite::SqliteState;
 use umi_types::{Digest, FetcherId, RowKey, Tier, Ulid};
@@ -76,6 +85,18 @@ const BATCH: usize = 1000;
 /// `(pld, host, url_key)` ordering only pays off when there are many.
 const HOSTS: usize = 2000;
 
+/// How many worker threads part 8 gives its runtime. server3 has eight cores
+/// and the crawl takes the default, which is one worker a core.
+const WORKERS: usize = 8;
+
+/// The fetch window part 8 puts on that runtime, which is what `--concurrency`
+/// sets on the crawl and what gate 3.1 has been run at.
+const WINDOW: usize = 256;
+
+/// What part 8 completes in one call, the crawl's window rather than doc
+/// 08.4's batch, because the crawl stores a window at a time.
+const STORE: u32 = 256;
+
 fn main() {
     let urls = env("UMI_BENCH_URLS", 200_000);
     let history = env("UMI_BENCH_SEGMENTS", 365_000);
@@ -84,7 +105,7 @@ fn main() {
     println!("umi-state-sqlite, {urls} urls over {HOSTS} hosts, best of {repeat}\n");
 
     let dir = tempfile::tempdir().expect("tempdir");
-    let state = SqliteState::open(dir.path().join("state.umistate")).expect("a store");
+    let state = Arc::new(SqliteState::open(dir.path().join("state.umistate")).expect("a store"));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -99,6 +120,16 @@ fn main() {
         segments(&state, history, repeat).await;
         residency(repeat).await;
     });
+    // Its own runtime, with workers, because the whole point of part 8 is the
+    // runtime. Dropped before part 7 reads the file, so nothing is still
+    // writing to it.
+    let crowded = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(WORKERS)
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    crowded.block_on(crowding(&state, repeat));
+    drop(crowded);
 
     let bytes = std::fs::metadata(dir.path().join("state.umistate"))
         .map(|m| m.len())
@@ -244,36 +275,7 @@ async fn completions(state: &SqliteState, repeat: usize, shuffled: bool) {
         if leases.is_empty() {
             continue;
         }
-        let mut outcomes: Vec<FetchOutcome> = leases
-            .iter()
-            .enumerate()
-            .map(|(n, lease)| FetchOutcome {
-                lease: lease.id,
-                key: lease.key,
-                finished_ms: now,
-                tier_used: Tier::Plain,
-                // A latency, so doc 07.6's rate limiter actually runs. It
-                // reads and writes a host row per host in the batch and that
-                // cost belongs in the number, not outside it.
-                pace: Pace {
-                    latency_ms: Some(120 + (n % 400) as u32),
-                    retry_after_ms: None,
-                },
-                result: FetchResult::Fetched {
-                    status: 200,
-                    // Half the pages changed, so both branches of
-                    // `next_due_after` are exercised rather than one.
-                    content_hash: [(n % 2) as u8; 8],
-                    // A real one, because interning an ETag is part of what
-                    // `complete` costs and half of them repeat, which is what
-                    // the pool exists for.
-                    revalidate: Revalidator {
-                        etag: Some(format!("\"{}\"", n % 500)),
-                        last_modified_ms: Some(now - 3_600_000),
-                    },
-                },
-            })
-            .collect();
+        let mut outcomes = answers(&leases, now);
         if shuffled {
             scatter(&mut outcomes, nth as u64 + 1);
         }
@@ -289,6 +291,40 @@ async fn completions(state: &SqliteState, repeat: usize, shuffled: bool) {
         },
         best,
     );
+}
+
+/// The answers a window of fetches would come back with, one per lease.
+fn answers(leases: &[Lease], now: u64) -> Vec<FetchOutcome> {
+    leases
+        .iter()
+        .enumerate()
+        .map(|(n, lease)| FetchOutcome {
+            lease: lease.id,
+            key: lease.key,
+            finished_ms: now,
+            tier_used: Tier::Plain,
+            // A latency, so doc 07.6's rate limiter actually runs. It reads
+            // and writes a host row per host in the batch and that cost
+            // belongs in the number, not outside it.
+            pace: Pace {
+                latency_ms: Some(120 + (n % 400) as u32),
+                retry_after_ms: None,
+            },
+            result: FetchResult::Fetched {
+                status: 200,
+                // Half the pages changed, so both branches of `next_due_after`
+                // are exercised rather than one.
+                content_hash: [(n % 2) as u8; 8],
+                // A real one, because interning an ETag is part of what
+                // `complete` costs and half of them repeat, which is what the
+                // pool exists for.
+                revalidate: Revalidator {
+                    etag: Some(format!("\"{}\"", n % 500)),
+                    last_modified_ms: Some(now - 3_600_000),
+                },
+            },
+        })
+        .collect()
 }
 
 /// Shuffle in place, the same way on every run.
@@ -456,6 +492,115 @@ async fn residency(repeat: usize) {
         );
     }
     println!();
+}
+
+/// Part 8. The same call, made the way the crawl makes it.
+///
+/// Everything above runs one caller at a time on a runtime with one worker.
+/// Nothing uses this backend that way. The crawl holds a window of two hundred
+/// and fifty six fetches on an eight worker runtime and calls in from
+/// whichever of them lands first, and there are two things in the path that
+/// cost nothing except under exactly those conditions. Every call goes through
+/// `block_in_place`, which turns the calling worker into a blocking thread and
+/// hands its run queue somewhere else. Every call then goes through one mutex
+/// around one connection, which the asks are queueing for at the same time.
+///
+/// The reason to measure it is a gap that nothing above explains. A six minute
+/// crawl on server3 at concurrency 256 attributes five and a half milliseconds
+/// to each completion by its third tick, and part 3 says the operation costs
+/// sixty five microseconds against a bigger ledger than that crawl had. Two
+/// orders of magnitude is not a query plan, and the difference between the
+/// bench and the crawl is not the ledger. It is everything in this paragraph.
+///
+/// Three rows, all the same `complete` of a window: alone on the runtime, then
+/// with the window of tasks on it, then with the window and a second caller of
+/// this backend. If the first two differ it is the runtime, and if only the
+/// third moves it is the mutex.
+async fn crowding(state: &Arc<SqliteState>, repeat: usize) {
+    println!("part 8: complete, with the crawl's runtime under it");
+    println!(
+        "  {:<24} {:>12} {:>14} {:>16}",
+        "", "urls/s", "us per url", "core at 250/s"
+    );
+
+    for (nth, (label, window, rival)) in [
+        ("alone", 0, false),
+        ("a window in flight", WINDOW, false),
+        ("and admitting beside", WINDOW, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut crowd = Vec::with_capacity(window + 1);
+        for _ in 0..window {
+            crowd.push(tokio::spawn(idling(Arc::clone(&stop))));
+        }
+        if rival {
+            crowd.push(tokio::spawn(admitting(Arc::clone(state), Arc::clone(&stop))));
+        }
+
+        let mut best = f64::MAX;
+        for pass in 0..repeat {
+            // Well past part 3's clock, and a minute per pass, for the same
+            // reason part 3 moves its own: a completion older than the answer
+            // already on the row does nothing.
+            let now = T0 + ((nth * repeat + pass) as u64 + 100) * 60_000;
+            let leases = state
+                .lease(&LeaseRequest {
+                    max_tier: Tier::Rendered,
+                    ..LeaseRequest::new(FetcherId::LOCAL, now, STORE)
+                })
+                .await
+                .expect("lease");
+            if leases.is_empty() {
+                continue;
+            }
+            let mut outcomes = answers(&leases, now);
+            // Always shuffled here. Part 3 prints both orders because that is
+            // what part 3 is about; this part is about the runtime, and the
+            // order the crawl actually produces is the one to hold fixed.
+            scatter(&mut outcomes, pass as u64 + 1);
+            let start = Instant::now();
+            state.complete(&outcomes).await.expect("complete");
+            best = best.min(start.elapsed().as_secs_f64() / outcomes.len() as f64);
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        for task in crowd {
+            task.await.expect("the crowd finishes");
+        }
+        at_rate(label, best);
+    }
+    println!();
+}
+
+/// One of part 8's in flight fetches.
+///
+/// Asleep almost all of the time and awake often, which is what a fetch is:
+/// the window is two hundred and fifty six sockets waiting on origins, not two
+/// hundred and fifty six threads doing arithmetic. What it is here for is to
+/// keep the runtime's queues from being empty, because an empty queue is the
+/// case `block_in_place` is cheap in and the crawl never has one.
+async fn idling(stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// Part 8's second caller, admitting links while the completions run.
+///
+/// Links off a page, which is what the crawl admits and roughly how much of
+/// it: fifty a page over a window is a few thousand candidates, and almost all
+/// of them have been seen before.
+async fn admitting(state: Arc<SqliteState>, stop: Arc<AtomicBool>) {
+    let mut at = 0usize;
+    while !stop.load(Ordering::Relaxed) {
+        let batch: Vec<String> = (0..BATCH).map(|n| url(at + n)).collect();
+        let candidates: Vec<Candidate<'_>> = batch.iter().map(|u| candidate(u)).collect();
+        state.admit(&candidates).await.expect("admit");
+        at = at.wrapping_add(BATCH);
+    }
 }
 
 fn url(n: usize) -> String {
