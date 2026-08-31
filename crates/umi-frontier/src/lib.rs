@@ -77,13 +77,21 @@ pub use priority::{MAX_DEPTH, MAX_DEPTH_SCORE, depth_score, within_depth};
 pub struct Config {
     /// The per pay level domain cap from doc 09.3.
     pub rate: Rate,
-    /// How many domains one tick will visit, which is doc 09.3's
-    /// `lease_batch`. Each one is a round trip to the state layer, so this
-    /// bounds the work a tick can do rather than the work it will do.
+    /// How many domains one [`tick`](Frontier::tick) will visit, which is doc
+    /// 09.3's `lease_batch`. Each one is a round trip to the state layer, so
+    /// this bounds the work an ask can do rather than the work it will do.
+    ///
+    /// Per ask and not per crawl tick. A crawl tick asks several times as its
+    /// fetch window drains, and the rate a domain is charged at is [`rate`],
+    /// which is measured against the clock rather than counted per ask.
+    ///
+    /// [`rate`]: Self::rate
     pub max_domains: usize,
-    /// How many URLs one tick will take from a single host. Doc 07.6 already
-    /// holds a host to one request in flight, so this bounds the queue a
-    /// fetcher carries and not the concurrency it may use.
+    /// How many URLs one [`tick`](Frontier::tick) will take from a single host.
+    /// Doc 07.6 already holds a host to one request in flight, so this bounds
+    /// the queue a fetcher carries and not the concurrency it may use.
+    ///
+    /// Per ask, for the same reason as [`max_domains`](Self::max_domains).
     pub max_per_host: u32,
     /// How long a lease is good for.
     pub lease_for: Duration,

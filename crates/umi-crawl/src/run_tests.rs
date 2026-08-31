@@ -493,7 +493,7 @@ fn with_scope(
 ///
 /// The step is [`TICK_STEP_MS`], and the ceiling is there so a loop that never
 /// drains fails the test rather than hanging the suite.
-async fn drain<F: Fetch>(
+async fn drain<F: Fetch + 'static>(
     crawler: &Crawler<F, Arc<FixedClock>>,
     clock: &FixedClock,
     sink: &dyn Sink,
@@ -632,6 +632,70 @@ async fn the_lease_that_fetches_robots_goes_on_to_fetch_its_page() {
 }
 
 #[tokio::test]
+async fn a_tick_asks_the_scheduler_again_rather_than_letting_its_window_drain() {
+    // The gate 3.1 shape. A tick used to take its whole batch in one ask, put
+    // as much of it on the wire as the window allowed, and top the window up
+    // only from what was left of that one ask. So the window emptied out at the
+    // end of every tick and the rate was the batch over the slowest lease in
+    // it, which on the twenty thousand host probe on server3 was 3.8 pages a
+    // second. Now the tick asks again as the window drains and the rate is the
+    // window over the mean.
+    //
+    // Twenty four urls on twenty four domains, and a scheduler allowed to visit
+    // eight domains per ask. One url per domain, so an ask is worth eight
+    // leases and no more, and twenty four fetched in one tick means the tick
+    // asked three times. Before this it fetched eight and returned.
+    let urls: Vec<String> = (0..24)
+        .map(|n| format!("https://site{n}.example{n}.com/a"))
+        .collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Timed::new(&clock, |f| {
+        let mut f = f;
+        for n in 0..24 {
+            f = f
+                .robots(
+                    &format!("https://site{n}.example{n}.com"),
+                    "User-agent: *\nAllow: /\n",
+                )
+                .html(
+                    &format!("https://site{n}.example{n}.com/a"),
+                    &page("P", &[]),
+                );
+        }
+        f
+    }));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        state,
+        Arc::clone(&clock),
+        CrawlConfig {
+            max_domains: 8,
+            in_flight: 8,
+            batch: 64,
+            ..config()
+        },
+    );
+
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.leased, urls.len(), "{report:?}");
+    assert_eq!(report.fetched, urls.len(), "{report:?}");
+
+    // Two requests per url, because the first lease on a host fetches its
+    // robots.txt before it fetches its page, and nothing was fetched twice.
+    let sent = fetch.sent();
+    assert_eq!(sent.len(), urls.len() * 2, "{sent:?}");
+    for url in &urls {
+        assert_eq!(
+            sent.iter().filter(|(sent, _)| sent == url).count(),
+            1,
+            "{url}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_batch_covering_one_host_is_spread_out_rather_than_sent_at_once() {
     // Doc 07.6. The state layer already staggers the leases of a batch by the
     // host's delay and reports each one's earliest send in `not_before_ms`, and
@@ -687,6 +751,20 @@ async fn a_batch_covering_one_host_is_spread_out_rather_than_sent_at_once() {
             "two requests to one host {gap} ms apart, {delay} ms asked for: {sent:?}"
         );
     }
+    // And no wider than that, which is the half nothing was checking. Politeness
+    // has an obvious safe direction and it is not free: the tick is as long as
+    // its slowest host, so a host whose slots drift apart is a tick that takes
+    // longer for no benefit to anybody. Five requests one delay apart is four
+    // delays end to end, and the bug this catches turned that into twelve by
+    // having each waiting lease take itself to the back of the queue every time
+    // another lease on the same host claimed a slot.
+    let span = sent[sent.len() - 1] - sent[0];
+    assert_eq!(
+        span,
+        4 * delay,
+        "five requests one {delay} ms delay apart should span {} ms: {sent:?}",
+        4 * delay
+    );
 }
 
 #[tokio::test]
@@ -702,38 +780,54 @@ async fn forty_hosts_under_one_domain_are_still_one_domain() {
         .collect();
     let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
     let state = seeded(&refs).await;
-    let mut fetch = Canned::new();
-    for n in 0..40 {
-        fetch = fetch
-            .robots(
-                &format!("https://h{n}.example.com"),
-                "User-agent: *\nAllow: /\n",
-            )
-            .html(&format!("https://h{n}.example.com/a"), &page("P", &[]));
-    }
     let clock = Arc::new(FixedClock::at(T0));
-    let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
+    let fetch = Arc::new(Timed::new(&clock, |f| {
+        let mut f = f;
+        for n in 0..40 {
+            f = f
+                .robots(
+                    &format!("https://h{n}.example.com"),
+                    "User-agent: *\nAllow: /\n",
+                )
+                .html(&format!("https://h{n}.example.com/a"), &page("P", &[]));
+        }
+        f
+    }));
+    let crawler = Crawler::new(Arc::clone(&fetch), state, Arc::clone(&clock), config());
 
-    // The cap is 20 a second and the burst is a second's worth, so forty urls
-    // that are all due take two ticks whatever the window is. Without the
-    // frontier on the path the first tick would have handed out all forty.
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.leased, urls.len(), "{report:?}");
+
+    // The cap is 20 a second and the burst is a second's worth, so the forty
+    // leases go out over two seconds however wide the window is. A tick refills
+    // its window from the frontier as the window drains, so all forty land
+    // inside one tick and what there is to check is when they went out rather
+    // than how many ticks it took. Without the frontier on the path all forty
+    // would have gone out at once.
     let cap = umi_frontier::Rate::DEFAULT_PER_SECOND as usize;
-    let first = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(first.leased, cap, "{first:?}");
+    let mut started: Vec<u64> = fetch
+        .sent()
+        .into_iter()
+        .filter(|(url, _)| url.ends_with("/robots.txt"))
+        .map(|(_, at)| at)
+        .collect();
+    started.sort_unstable();
+    assert_eq!(started.len(), urls.len(), "{started:?}");
+    for (n, at) in started.iter().enumerate() {
+        let window = &started[n.saturating_sub(cap)..=n];
+        let span = at.saturating_sub(window[0]);
+        assert!(
+            window.len() <= cap || span >= 1000,
+            "{} requests to one domain inside {span} ms: {started:?}",
+            window.len()
+        );
+    }
 
-    // No `advance` between the two, because the first tick moved the clock on
-    // its own: every host in it was fetching its robots.txt for the first
-    // time, and doc 07.6 makes the page that follows wait out a delay. A
-    // second of crawling is a second of the domain's allowance whether it was
-    // spent waiting or fetching.
-    let second = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(second.leased, urls.len() - cap, "{second:?}");
-
-    let third = crawler.tick(&Collected::default()).await.expect("tick");
+    let next = crawler.tick(&Collected::default()).await.expect("tick");
     assert!(
-        third.idle(),
+        next.idle(),
         "the frontier was empty and handed out {} anyway",
-        third.leased
+        next.leased
     );
 }
 
@@ -1435,9 +1529,10 @@ async fn a_retry_after_moves_the_leases_the_tick_is_still_holding() {
     // Measured from the outside on gate 2.3's origin before this existed: a
     // 429 asking for six seconds was followed by another request 960 ms later,
     // out of the same batch.
-    let state = seeded(&["https://example.com/a"]).await;
+    let state = seeded(&["https://example.com/warm"]).await;
     let fetch = Canned::new()
         .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/warm", &page("W", &[]))
         .outcome(
             "https://example.com/a",
             Outcome::Failed {
@@ -1451,23 +1546,35 @@ async fn a_retry_after_moves_the_leases_the_tick_is_still_holding() {
     let crawler = crawler(fetch, Arc::clone(&state));
     let sink = Collected::default();
 
-    // One url through the robots tick and the other two admitted after it, so
-    // that the tick under test leases all three as one batch. A test that
-    // seeded three would spend two of them paying for the robots.txt.
+    // A tick of its own to pay for the robots.txt, and the three under test
+    // admitted after it, so that the tick under test leases all three as one
+    // batch and the 429 is the first request in it. A tick that paid for
+    // robots.txt as well would send the other two while the lease that owed
+    // the file was still fetching it, and then there would be nothing left
+    // waiting for the 429 to hold back.
+    crawler.tick(&sink).await.expect("warm");
     let mut rest = Vec::new();
-    for url in ["https://example.com/b", "https://example.com/c"] {
+    for url in [
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+    ] {
         let mut seed = Candidate::new(url, T0).expect("a crawlable url");
         seed.discovery = umi_state::Discovery::Seed;
         rest.push(seed);
     }
     state.admit(&rest).await.expect("admit");
+    // Past the politeness window the warm tick left behind, or the host has
+    // nothing due and the tick under test leases none of the three.
+    crawler.clock().advance(TICK_STEP_MS);
+    let began = crawler.clock().now_ms();
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 3, "the three were not leased together");
     assert_eq!(report.failed, 1);
     assert_eq!(report.fetched, 2);
     assert!(
-        crawler.clock().now_ms() >= T1 + 6_000,
+        crawler.clock().now_ms() >= began + 6_000,
         "the six seconds the origin asked for were not left empty"
     );
 }

@@ -108,6 +108,10 @@ const LOG: &str = "crawl.log";
 const STAGING: &str = "parquet";
 const PUBLISHED: &str = "published.jsonl";
 
+/// How many times a tick's fetch window refills before the tick commits and
+/// returns, which is the batch as a multiple of `--concurrency`.
+const REFILLS: usize = 16;
+
 /// How long to wait before asking an idle frontier again.
 ///
 /// Doc 07.6 starts every host at a one second delay, so a frontier that is
@@ -795,10 +799,23 @@ fn settings(options: &Options) -> Result<Settings, Error> {
         }
         None => None,
     };
+    // Doc 16's gate 3.1 needs the fetch window to refill many times inside one
+    // tick, because a tick that fills its window once and drains it runs at the
+    // batch over its slowest lease rather than the window over the mean.
+    // Sixteen refills puts the cost of the last drain at a sixteenth of the
+    // tick. Capped by `--max-pages`, because a tick runs to the end of its
+    // batch and the batch is therefore also how far past the page limit a crawl
+    // can go before the loop between ticks notices.
+    let in_flight = usize::from(options.concurrency.max(1));
+    let batch = u32::try_from(in_flight.saturating_mul(REFILLS))
+        .unwrap_or(u32::MAX)
+        .min(u32::try_from(options.max_pages.unwrap_or(u64::MAX)).unwrap_or(u32::MAX))
+        .max(1);
     Ok(Settings {
         config: CrawlConfig {
             fetcher: FetcherId::LOCAL,
-            in_flight: usize::from(options.concurrency.max(1)),
+            in_flight,
+            batch,
             max_tier: tier(options.tier_max, options.allow_supervised),
             ..CrawlConfig::default()
         },

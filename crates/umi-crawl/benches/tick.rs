@@ -669,7 +669,7 @@ async fn seeded(hosts: usize) -> Arc<dyn State> {
 /// A cold cache costs one extra fetch per host on the first tick, which is real
 /// but is not what either part is measuring: part 1 would count 512 extracts
 /// where 256 pages were crawled, and part 2 would sleep twice per page.
-async fn prime_robots<F: Fetch>(crawler: &Crawler<F, Arc<FixedClock>>, hosts: usize) {
+async fn prime_robots<F: Fetch + 'static>(crawler: &Crawler<F, Arc<FixedClock>>, hosts: usize) {
     const BODY: &[u8] = b"User-agent: *\nAllow: /\n";
     let robots = Arc::new(umi_robots::Robots::for_status(200, BODY));
     let digest = umi_types::Digest::from_bytes(*blake3::hash(BODY).as_bytes());
@@ -696,7 +696,7 @@ async fn prime_robots<F: Fetch>(crawler: &Crawler<F, Arc<FixedClock>>, hosts: us
 /// second, so a clock that does not move leases every host once and then
 /// nothing. A daemon sleeps here; this is that sleep without the sleeping, and
 /// it is why the clock advance sits outside the work rather than inside it.
-async fn run<F: Fetch>(crawler: &Crawler<F, Arc<FixedClock>>, n: usize) -> TickReport {
+async fn run<F: Fetch + 'static>(crawler: &Crawler<F, Arc<FixedClock>>, n: usize) -> TickReport {
     let sink = Counter::default();
     let mut total = TickReport::default();
     for i in 0..n {
