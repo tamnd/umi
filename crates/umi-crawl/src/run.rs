@@ -182,6 +182,12 @@ struct Stored {
     links_admitted: usize,
     /// How long the whole thing took, on its own task.
     store_ms: u64,
+    /// How much of that was the sink taking rows.
+    rows_ms: u64,
+    /// How much of it was writing completions.
+    complete_ms: u64,
+    /// How much of it was admitting links.
+    admit_ms: u64,
 }
 
 /// A tick's supply of leases.
@@ -551,6 +557,23 @@ pub struct TickReport {
     /// for is two seconds the crawl got for free. It is the cost of the write
     /// path and not the cost to the crawl. See `store_waited_ms` for that.
     pub store_ms: u64,
+    /// How much of `store_ms` was the sink taking rows.
+    ///
+    /// A segment write, so it scales with bytes rather than pages and it is
+    /// lumpy: a seal is the whole open segment in one call and the rest are
+    /// buffered appends.
+    pub rows_ms: u64,
+    /// How much of `store_ms` was writing completions.
+    ///
+    /// One durable transaction per window, scaling with pages.
+    pub complete_ms: u64,
+    /// How much of `store_ms` was admitting links.
+    ///
+    /// The one that scales with links rather than pages, which on the open web
+    /// is about fifty to one, and the one that also grows with the size of the
+    /// frontier it is inserting into. If the write path is slow and getting
+    /// slower as the crawl runs, this is where to look first.
+    pub admit_ms: u64,
     /// Milliseconds the loop spent waiting for a store to finish.
     ///
     /// The number that says whether one store at a time is enough. The loop
@@ -1472,6 +1495,9 @@ fn fold(done: Stored, report: &mut TickReport) {
     report.learned += done.learned;
     report.links_admitted += done.links_admitted;
     report.store_ms += done.store_ms;
+    report.rows_ms += done.rows_ms;
+    report.complete_ms += done.complete_ms;
+    report.admit_ms += done.admit_ms;
 }
 
 impl<F: Fetch, C: Clock> Shared<F, C> {
@@ -1505,22 +1531,36 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         let began = Instant::now();
         let mut done = Stored::default();
         if !held.rows.is_empty() {
+            let at = Instant::now();
             sink.take(&held.rows).await?;
             done.rows = held.rows.len();
+            done.rows_ms = u64::from(ms(at));
         }
         if !held.outcomes.is_empty() {
+            let at = Instant::now();
             self.state().complete(&held.outcomes).await?;
+            done.complete_ms = u64::from(ms(at));
         }
         if !held.signals.is_empty() {
             done.learned = self.relearn(&held.signals, now_ms).await?;
         }
         if !held.candidates.is_empty() {
+            let at = Instant::now();
             done.links_admitted = self.admit(&held.candidates, now_ms).await?;
+            done.admit_ms = u64::from(ms(at));
         }
-        // At the end and not on each of the four, because the question this
-        // answers is how long the write path takes rather than which call was
-        // the slow one. A `?` above skips it, and a tick that failed to store
-        // is not a tick anybody is reading a rate off.
+        // Three of the four separately as well as the whole, because the four
+        // scale with different things and the answer to a slow write path is
+        // whichever one it is. Rows are a segment write and scale with bytes.
+        // Completions scale with pages. Admitting scales with links, which is
+        // fifty times pages on the open web and is the one that also grows with
+        // the frontier it is inserting into. Relearning is the fourth and is
+        // left out of the split because it is a host record for the handful of
+        // hosts whose tier moved, and a tick where that is the slow part is a
+        // tick where nothing else happened.
+        //
+        // A `?` above skips all of it, and a tick that failed to store is not a
+        // tick anybody is reading a rate off.
         done.store_ms = u64::from(ms(began));
         Ok(done)
     }

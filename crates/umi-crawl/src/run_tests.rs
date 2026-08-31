@@ -1107,6 +1107,20 @@ async fn the_loop_keeps_fetching_while_the_last_window_is_being_written() {
         report.store_waited_ms,
         report.store_ms
     );
+    // The sink is the only thing in this write path with any time in it, so
+    // the split has to put the time there and the whole has to cover the split.
+    // A split that is not a split of anything is worse than no split at all,
+    // because it is the number the next change gets chosen off.
+    assert!(
+        report.rows_ms >= 100,
+        "the sink slept for {} ms of a {} ms write path",
+        report.rows_ms,
+        report.store_ms
+    );
+    assert!(
+        report.rows_ms + report.complete_ms + report.admit_ms <= report.store_ms,
+        "the parts came to more than the whole: {report:?}"
+    );
 }
 
 #[tokio::test]
