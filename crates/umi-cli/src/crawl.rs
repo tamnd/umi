@@ -2154,6 +2154,13 @@ impl Pressure {
 /// two converging is one that has stopped. That is the number to watch as the
 /// frontier grows to doc 16's five hundred million rows, and it is the reason
 /// the durations are printed at all.
+///
+/// The write is split three ways because the three scale with different things
+/// and the answer to a slow one is whichever it is. Rows are a segment write
+/// and scale with bytes, completions scale with pages, and links scale with
+/// links, which is about fifty per page on the open web and is also the only
+/// one of the three that gets slower as the frontier it inserts into gets
+/// bigger.
 fn progress(
     summary: &Summary,
     report: &TickReport,
@@ -2165,7 +2172,8 @@ fn progress(
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  {} ms per page ({} robots, {} polite)  \
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
-         {:.0}s waited on writes costing {:.0}s)  \
+         {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
+         {:.0}s links)  \
          {} MB fetched  {} MB stored  {} failed  bottleneck: {}",
         summary.rows,
         report.window_mean(),
@@ -2181,6 +2189,9 @@ fn progress(
         report.asks_empty,
         report.store_waited_ms as f64 / 1000.0,
         report.store_ms as f64 / 1000.0,
+        report.rows_ms as f64 / 1000.0,
+        report.complete_ms as f64 / 1000.0,
+        report.admit_ms as f64 / 1000.0,
         summary.bytes_fetched / (1 << 20),
         summary.bytes_stored / (1 << 20),
         summary.failed,
