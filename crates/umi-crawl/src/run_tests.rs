@@ -173,6 +173,32 @@ impl Fetch for Timed {
     }
 }
 
+/// A fetcher that takes real time over every request.
+///
+/// Real time and not the fake clock, which is the only unusual thing about it
+/// and is the point. Everything else in this file wants a clock it controls so
+/// that a politeness delay costs nothing to test. A window's occupancy is the
+/// one measurement that cannot be taken that way: it is lease time over tick
+/// time, both read from `Instant`, and a fetcher that answers in the same poll
+/// it was asked leaves a tick with no time in it to divide by.
+struct Slow {
+    inner: Canned,
+    per_request: Duration,
+}
+
+#[async_trait::async_trait]
+impl Fetch for Slow {
+    async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+        tier: umi_types::Tier,
+    ) -> Result<Served, FetchError> {
+        tokio::time::sleep(self.per_request).await;
+        self.inner.fetch(url, revalidate, tier).await
+    }
+}
+
 /// A fetcher that blocks one URL until it is told to stop.
 ///
 /// Doc 05.8's de-escalation cannot be written against a map of canned answers,
@@ -832,6 +858,55 @@ async fn forty_hosts_under_one_domain_are_still_one_domain() {
 }
 
 #[tokio::test]
+async fn a_tick_reports_how_full_its_fetch_window_actually_was() {
+    // Doc 14.3's progress line said "in flight" and printed the batch size,
+    // which is the same number every tick and is not a measurement. The
+    // question it looks like it is answering is the one that matters for gate
+    // 3.1: a crawl configured for 256 that is running 30 is not fetching
+    // slowly, it is not fetching, and nothing else on the line says so.
+    //
+    // Sixteen urls on sixteen hosts with room for four at a time, and a fetcher
+    // that takes real time so that there is a window to be full of anything.
+    // Four is the answer. The answer that must not come back is sixteen, which
+    // is what counting the tick's fetch tasks gives: the loop takes one out and
+    // puts one in on every pass, so that count is pinned to the window size and
+    // reads full for a crawl that has stopped fetching.
+    let urls: Vec<String> = (0..16).map(|n| format!("https://h{n}.example/p")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let fetch = Slow {
+        inner: urls.iter().fold(Canned::new(), |f, url| {
+            let origin = url.trim_end_matches("/p");
+            f.robots(origin, "User-agent: *\nAllow: /\n")
+                .html(url, &page("P", &[]))
+        }),
+        per_request: Duration::from_millis(20),
+    };
+    let crawler = Crawler::new(
+        fetch,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.fetched, 16, "{report:?}");
+    // Loosely, because the tick also has a store in it and the last four leases
+    // are not replaced. The bug this catches is off by a factor of four, so a
+    // band this wide still catches it.
+    let mean = report.window_mean();
+    assert!(
+        (2.0..=4.5).contains(&mean),
+        "a window of four averaged {mean} over {} leases in {} ms",
+        report.leased,
+        report.elapsed_ms
+    );
+}
+
+#[tokio::test]
 async fn a_lease_that_is_ready_now_does_not_wait_behind_one_that_is_not() {
     // The other half. Honouring `not_before_ms` costs nothing if a slow host
     // can park the window while it waits, so the batch goes out earliest first
@@ -1231,7 +1306,17 @@ async fn an_empty_frontier_is_idle_and_not_an_error() {
     let state = seeded(&[]).await;
     let crawler = crawler(Canned::new(), state);
     let report = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(report, TickReport::default());
+    assert_eq!(
+        TickReport {
+            // The one ask it took to find that out, which is the report saying
+            // it went and looked rather than that it never went.
+            asks: 0,
+            asks_empty: 0,
+            ..report
+        },
+        TickReport::default()
+    );
+    assert_eq!((report.asks, report.asks_empty), (1, 1));
     assert!(report.idle());
 }
 

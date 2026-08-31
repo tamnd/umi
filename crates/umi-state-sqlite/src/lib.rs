@@ -533,6 +533,11 @@ struct Picks {
     rows: Vec<Chosen>,
     /// How much of the batch each host has, for `max_per_host`.
     per_host: HashMap<HostId, u32>,
+    /// The same per domain, for `max_per_pld`. Doc 09.3's rate limit belongs
+    /// to the scheduler and this is only how the scheduler spends it, but it
+    /// has to be counted here: a call that covers five hundred domains cannot
+    /// keep one of them from taking the whole batch any other way.
+    per_pld: HashMap<PldId, u32>,
     /// Ledger rows read so far, over every class, against
     /// [`LEASE_SCAN_LIMIT`].
     examined: usize,
@@ -574,11 +579,20 @@ fn pull(
             continue;
         }
 
-        let held = picks.per_host.entry(key.host).or_default();
-        if *held >= req.max_per_host {
+        // Both caps read before either is charged. A url that clears the
+        // domain and then fails on the host has not been issued, so charging
+        // the domain for it would spend doc 09.3's allowance on a request
+        // nobody sent, and one busy host would quietly close its whole domain.
+        let spent = picks.per_pld.get(&key.pld).copied().unwrap_or(0);
+        if req.max_per_pld > 0 && spent >= req.max_per_pld {
             continue;
         }
-        *held += 1;
+        let held = picks.per_host.get(&key.host).copied().unwrap_or(0);
+        if held >= req.max_per_host {
+            continue;
+        }
+        picks.per_pld.insert(key.pld, spent + 1);
+        picks.per_host.insert(key.host, held + 1);
         taken += 1;
 
         let adaptive: i64 = r.get("adaptive_delay_ms").state()?;
@@ -762,6 +776,7 @@ impl State for SqliteState {
             let mut picks = Picks {
                 rows: Vec::new(),
                 per_host: HashMap::new(),
+                per_pld: HashMap::new(),
                 examined: 0,
             };
 

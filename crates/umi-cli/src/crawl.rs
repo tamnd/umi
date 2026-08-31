@@ -2066,10 +2066,28 @@ impl Pressure {
 
 /// Doc 14.3's progress line.
 ///
-/// `in flight` is the tick's lease count rather than a live number, because a
-/// tick waits for its own fetches and by the time this prints they are all
-/// answered. It is still the field an operator wants next to `queued`: it is
-/// how much of the configured concurrency the frontier could actually use.
+/// `in flight` used to be the tick's lease count, which is the batch size and
+/// is the same number every tick. It is now the mean occupancy of the fetch
+/// window over the tick, which is the thing an operator is trying to read off
+/// this line: a crawl configured for 256 that is running 30 is not fetching
+/// slowly, it is not fetching, and no other field says so.
+///
+/// `ms per page` is what one lease cost the window from claim to answer. The
+/// window over that number is the rate, so those two fields next to each other
+/// are the whole of doc 16's gate 3.1 arithmetic, and the rest of the line is
+/// what the crawl has to show for it. The two figures in brackets are the parts
+/// of it that are not the page: the robots.txt the first lease on a host has to
+/// fetch before it may ask for anything, and doc 07.6's politeness delay, which
+/// a lease waits out twice on a host it has never seen.
+///
+/// `state` is the last piece of the arithmetic and it is the one that catches
+/// the case where the first two do not add up. The window and the lease cost
+/// are what the fetches did, and they are measured on the fetch tasks. This is
+/// measured on the loop task, and it is the seconds of the tick that the loop
+/// spent inside the store rather than putting the next lease on the wire. A
+/// tick whose window is full and whose leases are quick and whose rate is still
+/// nowhere near the window over the lease cost is a tick that spent its time
+/// here, and no amount of work on the fetch path will move it.
 fn progress(
     summary: &Summary,
     report: &TickReport,
@@ -2079,12 +2097,21 @@ fn progress(
 ) -> String {
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
-        "{} done  {} in flight  {} queued  {:.1} p/s  {} MB fetched  {} MB stored  \
-         {} failed  bottleneck: {}",
+        "{} done  {:.0} in flight  {} queued  {:.1} p/s  {} ms per page ({} robots, {} polite)  \
+         state {:.0}s ({:.0}s write, {:.0}s over {} asks, {} empty)  {} MB fetched  \
+         {} MB stored  {} failed  bottleneck: {}",
         summary.rows,
-        report.leased,
+        report.window_mean(),
         queued,
         summary.rows as f64 / elapsed,
+        report.lease_mean_ms(),
+        report.robots_mean_ms(),
+        report.waited_mean_ms(),
+        (report.store_ms + report.ask_ms) as f64 / 1000.0,
+        report.store_ms as f64 / 1000.0,
+        report.ask_ms as f64 / 1000.0,
+        report.asks,
+        report.asks_empty,
         summary.bytes_fetched / (1 << 20),
         summary.bytes_stored / (1 << 20),
         summary.failed,

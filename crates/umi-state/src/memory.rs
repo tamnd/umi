@@ -90,6 +90,16 @@ struct InFlight {
 }
 
 /// A row `lease` is willing to hand out, and the three things it decides in
+/// Whether `id` has already taken all a cap allows, with zero meaning no cap.
+///
+/// A free function so that both passes over the batch ask the question the same
+/// way, and so that the two caps are checked before either is charged. A url
+/// that clears the domain and then fails on the host was never issued, and
+/// charging the domain for it would let one busy host close a whole domain.
+fn full<K: std::hash::Hash + Eq>(counts: &HashMap<K, u32>, id: K, cap: u32) -> bool {
+    cap > 0 && counts.get(&id).is_some_and(|taken| *taken >= cap)
+}
+
 /// what order.
 #[derive(Clone, Copy, Debug)]
 struct Ready {
@@ -421,6 +431,10 @@ impl State for MemoryState {
         let max_urls = req.max_urls as usize;
         let mut quotas = Quotas::new(&req.budget, req.max_urls);
         let mut per_host: HashMap<HostId, u32> = HashMap::new();
+        // Doc 09.3's cap, which the scheduler spends but this call has to
+        // count. One call now covers every domain the scheduler is ready to
+        // ask about, so without this one domain could take the whole batch.
+        let mut per_pld: HashMap<PldId, u32> = HashMap::new();
         let mut chosen: Vec<Ready> = Vec::new();
         let mut spare: Vec<Ready> = Vec::new();
 
@@ -428,9 +442,8 @@ impl State for MemoryState {
             if chosen.len() >= max_urls {
                 break;
             }
-            if per_host
-                .get(&row.key.host)
-                .is_some_and(|n| *n >= req.max_per_host)
+            if full(&per_pld, row.key.pld, req.max_per_pld)
+                || full(&per_host, row.key.host, req.max_per_host)
             {
                 continue;
             }
@@ -440,6 +453,7 @@ impl State for MemoryState {
                 }
                 continue;
             }
+            *per_pld.entry(row.key.pld).or_default() += 1;
             *per_host.entry(row.key.host).or_default() += 1;
             chosen.push(row);
         }
@@ -449,11 +463,13 @@ impl State for MemoryState {
                 if chosen.len() >= max_urls {
                     break;
                 }
-                let held = per_host.entry(row.key.host).or_default();
-                if *held >= req.max_per_host {
+                if full(&per_pld, row.key.pld, req.max_per_pld)
+                    || full(&per_host, row.key.host, req.max_per_host)
+                {
                     continue;
                 }
-                *held += 1;
+                *per_pld.entry(row.key.pld).or_default() += 1;
+                *per_host.entry(row.key.host).or_default() += 1;
                 chosen.push(row);
             }
             // The top up broke the order the batch is promised in, and only

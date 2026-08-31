@@ -28,11 +28,18 @@
 //! # The loop
 //!
 //! [`Frontier::tick`] is doc 09.3's scheduler loop. It takes the domains whose
-//! rate limit has room, in most overdue order, and leases from each of them in
-//! turn. Leasing per domain rather than in one call is what makes the domain
-//! cap enforceable, and it is also the shape doc 09.3 asks for: a warm shard is
-//! expensive to get and worth draining, so the unit of work is a domain and not
-//! a URL.
+//! rate limit has room, in most overdue order, and asks the store for work from
+//! all of them at once.
+//!
+//! At once, and that is the second thing in here a measurement changed. It used
+//! to lease from each domain in turn, on the reasoning that per domain calls
+//! are what make the domain cap enforceable. They are not the only thing that
+//! makes it enforceable, and they are expensive: a lease call is a durable
+//! transaction, `max_domains` is 512, and on server3 that was 33 seconds an ask
+//! and 95 percent of a crawl tick, with the fetch window averaging 12 of its
+//! 256 slots because the task that refills it was in the store the whole time.
+//! The cap now travels with the ask as `max_per_pld` and the store counts it,
+//! which is the same guarantee for one round trip instead of five hundred.
 //!
 //! A tick costs what it schedules and not what is resident, which is the one
 //! thing in here the benchmark changed. It used to read the resident set and
@@ -49,11 +56,12 @@
 //! since a cold shard costs an object GET and doing that inside the loop would
 //! cap the whole crawl at twenty domains a second, so `tick` skips a domain
 //! that is not resident rather than waiting for it. A domain in the schedule
-//! that is not resident costs one lease call that comes back empty, which is
-//! why eviction goes through the frontier.
+//! that is not resident is simply a domain the ask finds nothing under, which
+//! is why eviction goes through the frontier.
 
 #![forbid(unsafe_code)]
 
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -78,8 +86,8 @@ pub struct Config {
     /// The per pay level domain cap from doc 09.3.
     pub rate: Rate,
     /// How many domains one [`tick`](Frontier::tick) will visit, which is doc
-    /// 09.3's `lease_batch`. Each one is a round trip to the state layer, so
-    /// this bounds the work an ask can do rather than the work it will do.
+    /// 09.3's `lease_batch`. They go to the store together, so this bounds how
+    /// wide the ask is rather than how many round trips it takes.
     ///
     /// Per ask and not per crawl tick. A crawl tick asks several times as its
     /// fetch window drains, and the rate a domain is charged at is [`rate`],
@@ -422,23 +430,52 @@ impl<S: State> Frontier<S> {
     /// been issued and the caller has lost track of them, so it waits for them
     /// to expire rather than retrying immediately.
     pub async fn tick(&self, ask: &Ask) -> Result<Vec<Lease>> {
-        let ready = self.gate().ready(ask.now_ms, self.config.max_domains);
+        // Grouped by allowance, and one call to the store per group rather than
+        // one per domain. This used to be a loop over the ready domains asking
+        // for each in turn, and on server3 that was 95 percent of a crawl tick:
+        // 512 domains an ask, a durable transaction each, 33 seconds an ask,
+        // and a fetch window that averaged 12 of its 256 slots because the one
+        // task that refills it was inside the store the whole time.
+        //
+        // A group and not one call for everything because doc 09.3's cap is per
+        // domain and the store takes one number for all the domains it is
+        // given. Domains with the same allowance can share a call, and in a
+        // broad crawl nearly all of them do: the allowance is a function of how
+        // far ahead a domain's schedule has run, and a domain that has been
+        // idle or has never been fetched is at the same place as every other
+        // one. So this is usually one call, occasionally two or three, and
+        // never more than the number of distinct allowances.
+        let mut groups: BTreeMap<u32, Vec<PldId>> = BTreeMap::new();
+        for (pld, allowance) in self.gate().ready(ask.now_ms, self.config.max_domains) {
+            groups.entry(allowance).or_default().push(pld);
+        }
 
         let mut out: Vec<Lease> = Vec::new();
-        for (pld, allowance) in ready {
+        // Largest allowance first, so that if the ask fills before the groups
+        // run out, what filled it came from the domains with the most room.
+        // Taking them in the other order would spend the batch on the domains
+        // closest to their limit and leave the ones that could take more.
+        for (allowance, plds) in groups.into_iter().rev() {
             let room = usize::try_from(ask.max_urls)
                 .unwrap_or(usize::MAX)
                 .saturating_sub(out.len());
             if room == 0 {
                 break;
             }
-            let take = room.min(usize::try_from(allowance).unwrap_or(usize::MAX));
-            let leases = self.lease_from(pld, ask, take).await?;
-            self.gate().charge(
-                pld,
-                u32::try_from(leases.len()).unwrap_or(u32::MAX),
-                ask.now_ms,
-            );
+            let leases = self.lease_from(&plds, ask, room, allowance).await?;
+            // Charged per domain off what each actually took, which is what the
+            // gate has always done. The store returns a flat batch, so the
+            // counting is here now rather than implied by one call per domain.
+            {
+                let mut taken: HashMap<PldId, u32> = HashMap::new();
+                for lease in &leases {
+                    *taken.entry(lease.key.pld).or_default() += 1;
+                }
+                let mut gate = self.gate();
+                for (pld, count) in taken {
+                    gate.charge(pld, count, ask.now_ms);
+                }
+            }
             out.extend(leases);
         }
         Ok(out)
@@ -523,16 +560,22 @@ impl<S: State> Frontier<S> {
         self.gate().len()
     }
 
-    async fn lease_from(&self, pld: PldId, ask: &Ask, take: usize) -> Result<Vec<Lease>> {
-        let plds = [pld];
+    async fn lease_from(
+        &self,
+        plds: &[PldId],
+        ask: &Ask,
+        take: usize,
+        allowance: u32,
+    ) -> Result<Vec<Lease>> {
         let req = LeaseRequest {
             fetcher: ask.fetcher,
             now_ms: ask.now_ms,
             max_urls: u32::try_from(take).unwrap_or(u32::MAX),
             max_per_host: self.config.max_per_host,
+            max_per_pld: allowance,
             max_tier: ask.max_tier,
             lease_for: self.config.lease_for,
-            plds: &plds,
+            plds,
             budget: ask.budget.unwrap_or(self.config.budget),
         };
         self.state.lease(&req).await

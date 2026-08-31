@@ -17,6 +17,7 @@ umi-state = { workspace = true }
 umi-types = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 tokio = { workspace = true }
 
 # Not criterion. The question doc 16 gate 1.1 asks is leases per second against

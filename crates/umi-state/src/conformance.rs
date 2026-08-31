@@ -28,6 +28,7 @@
 //! first failure, because when a new backend first runs it the useful output is
 //! the whole list.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::time::Duration;
@@ -171,6 +172,8 @@ where
     run!(only_admitted_urls_are_ever_leased);
     run!(lease_never_returns_more_than_was_asked_for);
     run!(lease_honours_the_per_host_cap);
+    run!(lease_honours_the_per_domain_cap);
+    run!(a_domain_cap_of_zero_is_not_a_cap_of_zero);
     run!(lease_of_an_empty_store_is_not_an_error);
     run!(a_leased_url_is_not_leased_again_while_the_lease_holds);
     run!(an_expired_lease_makes_the_url_leasable_again);
@@ -492,6 +495,64 @@ async fn lease_honours_the_per_host_cap(state: &dyn State) -> Outcome {
     ensure!(
         leases.len() <= 2,
         "ten urls on one host, cap of 2, got {}",
+        leases.len()
+    );
+    Ok(())
+}
+
+async fn lease_honours_the_per_domain_cap(state: &dyn State) -> Outcome {
+    // Doc 09.3's cap is the scheduler's, but the scheduler spends it in one
+    // call covering every domain it is ready to ask about, so the store is
+    // what has to count it. Ten hosts under one domain and ten under another,
+    // and a cap of three: without it the first domain takes the whole batch,
+    // because the order the trait promises has nothing to do with domains.
+    let mut urls: Vec<String> = (0..10).map(host_url).collect();
+    urls.extend((0..10).map(|n| format!("https://h{n}.other.example/")));
+    admit_all(state, &urls).await?;
+    let leases = state
+        .lease(&LeaseRequest {
+            max_per_pld: 3,
+            ..request(T0, 100)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut per_pld: BTreeMap<PldId, usize> = BTreeMap::new();
+    for lease in &leases {
+        *per_pld.entry(lease.key.pld).or_default() += 1;
+    }
+    for (pld, taken) in &per_pld {
+        ensure!(
+            *taken <= 3,
+            "domain {pld:?} took {taken} against a cap of 3"
+        );
+    }
+    // And the cap is a cap and not a batch size. Both domains had ten urls due
+    // and both should have been offered their three, or a scheduler that asks
+    // once for five hundred domains gets one domain's worth of work back.
+    ensure!(
+        per_pld.len() == 2,
+        "two domains were due and {} came back: {leases:?}",
+        per_pld.len()
+    );
+    Ok(())
+}
+
+/// A cap of zero is no cap, which is what a caller that does not care sends.
+async fn a_domain_cap_of_zero_is_not_a_cap_of_zero(state: &dyn State) -> Outcome {
+    let urls: Vec<String> = (0..10).map(host_url).collect();
+    admit_all(state, &urls).await?;
+    let leases = state
+        .lease(&LeaseRequest {
+            max_per_pld: 0,
+            max_per_host: 8,
+            ..request(T0, 100)
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    ensure!(
+        leases.len() == 10,
+        "ten urls on one domain with no domain cap returned {}",
         leases.len()
     );
     Ok(())
