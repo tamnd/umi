@@ -45,6 +45,7 @@
 //! free of any I/O that is not a fetch.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -729,6 +730,54 @@ pub struct Shared<F, C> {
     robots: RobotsCache,
     render: RenderBudget,
     config: CrawlConfig,
+    live: Arc<Live>,
+}
+
+/// What a tick has done so far, readable while it is still doing it.
+///
+/// A [`TickReport`] is the honest account and it arrives when the tick ends. A
+/// tick is a batch and a batch is thousands of pages, so on a slow crawl that
+/// is minutes of a command printing nothing, which doc 14.1 rightly calls
+/// indistinguishable from a hung one. These four numbers are what a caller
+/// needs to say something true in the meantime, and they are atomics rather
+/// than a channel because nothing depends on catching every update: a watcher
+/// reads them when it feels like it and a torn read is a number that was right
+/// a microsecond ago.
+///
+/// They count the run and not the tick, so a caller can print them without
+/// keeping a running total of its own.
+#[derive(Debug, Default)]
+pub struct Live {
+    rows: AtomicU64,
+    failed: AtomicU64,
+    bytes_fetched: AtomicU64,
+    in_flight: AtomicU32,
+}
+
+impl Live {
+    /// Rows the crawl has produced.
+    #[must_use]
+    pub fn rows(&self) -> u64 {
+        self.rows.load(Ordering::Relaxed)
+    }
+
+    /// Fetches that came back as something other than a page.
+    #[must_use]
+    pub fn failed(&self) -> u64 {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    /// Body bytes off the wire.
+    #[must_use]
+    pub fn bytes_fetched(&self) -> u64 {
+        self.bytes_fetched.load(Ordering::Relaxed)
+    }
+
+    /// Fetches on the wire right now.
+    #[must_use]
+    pub fn in_flight(&self) -> u32 {
+        self.in_flight.load(Ordering::Relaxed)
+    }
 }
 
 impl<F, C> std::ops::Deref for Crawler<F, C> {
@@ -753,6 +802,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 robots: RobotsCache::new(),
                 render,
                 config,
+                live: Arc::new(Live::default()),
             }),
             restraint: Mutex::new(Allowance::default()),
         }
@@ -785,6 +835,15 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
 }
 
 impl<F: Fetch, C: Clock> Shared<F, C> {
+    /// What the tick in progress has done so far.
+    ///
+    /// A handle rather than a snapshot, so a caller can park it on a task that
+    /// reports on its own clock instead of the tick's. See [`Live`].
+    #[must_use]
+    pub fn live(&self) -> Arc<Live> {
+        Arc::clone(&self.live)
+    }
+
     /// Doc 05.9's render budget, so a caller can report what it is doing.
     #[must_use]
     pub const fn render(&self) -> &RenderBudget {
@@ -1001,6 +1060,10 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             };
             pending.push(self.start(lease, at, &floors));
         }
+        self.live.in_flight.store(
+            u32::try_from(pending.len()).unwrap_or(u32::MAX),
+            Ordering::Relaxed,
+        );
         if report.leased == 0 {
             // Nothing was ready, so there is nothing to commit and no reason to
             // spend a round trip saying so.
@@ -1034,6 +1097,12 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             {
                 pending.push(self.start(lease, at, &floors));
             }
+            // After the replacement rather than before, so the number a watcher
+            // reads is the window as it stands and not the hole in it.
+            self.live.in_flight.store(
+                u32::try_from(pending.len()).unwrap_or(u32::MAX),
+                Ordering::Relaxed,
+            );
             let Fetched {
                 row,
                 outcome,
@@ -1092,13 +1161,20 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             // less work than it did.
             if row.is_none() && matches!(outcome.result, umi_state::FetchResult::Failed { .. }) {
                 report.failed += 1;
+                self.live.failed.fetch_add(1, Ordering::Relaxed);
             }
             if let Some(row) = row {
                 match row.outcome {
                     umi_types::OutcomeCode::Ok => report.fetched += 1,
-                    _ => report.failed += 1,
+                    _ => {
+                        report.failed += 1;
+                        self.live.failed.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 report.bytes_fetched += u64::from(row.content_length);
+                self.live
+                    .bytes_fetched
+                    .fetch_add(u64::from(row.content_length), Ordering::Relaxed);
                 report.links_seen += links_seen;
                 held.candidates.extend(links);
                 // The bytes and the links are counted either way, because we
@@ -1108,6 +1184,12 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                     report.unchanged += 1;
                 } else {
                     held.rows.push(row);
+                    // Counted here and not where the store takes them, because
+                    // the store runs a window behind and a watcher asking every
+                    // few seconds would see the count sit still and then jump.
+                    // The row exists, it is simply not on disk yet, and that is
+                    // the same thing every other number on this line means.
+                    self.live.rows.fetch_add(1, Ordering::Relaxed);
                 }
             }
             held.outcomes.push(outcome);

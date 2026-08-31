@@ -1183,6 +1183,45 @@ async fn the_loop_keeps_fetching_while_the_next_ask_is_on_its_way() {
 }
 
 #[tokio::test]
+async fn the_running_count_agrees_with_the_report_the_tick_ends_with() {
+    // The counters a caller reads mid tick and the report it gets at the end
+    // are two accounts of the same work, and the whole value of the first one
+    // is that it can be believed. So they have to agree once the tick is over.
+    //
+    // Sixteen pages through a window of four, so the count is read after four
+    // separate stores rather than one, and the last of them is the one on the
+    // loop's own task.
+    let (urls, canned) = a_page_each(16);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let crawler = Crawler::new(
+        canned,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            in_flight: 4,
+            ..config()
+        },
+    );
+    let live = crawler.live();
+    assert_eq!(live.rows(), 0, "nothing has been fetched yet");
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    assert_eq!(report.rows, 16, "{report:?}");
+    assert_eq!(live.rows(), 16, "{report:?}");
+    assert_eq!(live.failed(), report.failed as u64, "{report:?}");
+    assert_eq!(live.bytes_fetched(), report.bytes_fetched, "{report:?}");
+    assert_eq!(
+        live.in_flight(),
+        0,
+        "a tick that has returned has nothing on the wire"
+    );
+}
+
+#[tokio::test]
 async fn a_write_that_fails_off_the_loop_still_fails_the_tick() {
     // The store runs on a task of its own, and a task of its own is a place
     // for an error to go missing. A tick whose rows were not written must not
