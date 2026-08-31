@@ -35,12 +35,13 @@ pub(crate) const T0: u64 = 1_760_000_000_000;
 /// the sleeping.
 const TICK_STEP_MS: u64 = 2000;
 
-/// When the tick after [`robots_tick`] runs.
+/// When the first page of a crawl is fetched.
 ///
-/// A host's first lease goes on its robots.txt, so the page a test is about is
-/// fetched one clock step later than [`T0`] and every timestamp it produces is
-/// measured from here.
-const T1: u64 = T0 + TICK_STEP_MS;
+/// A host's first lease fetches its robots.txt and then waits out one
+/// politeness delay before it sends the page, so the page a test is about goes
+/// out [`umi_state::HostRow::INITIAL_DELAY_MS`] after [`T0`] and every
+/// timestamp it produces is measured from here.
+const T1: u64 = T0 + umi_state::HostRow::INITIAL_DELAY_MS as u64;
 
 /// Long enough that a url is due again whatever doc 09 made of its history.
 ///
@@ -482,26 +483,6 @@ fn with_scope(
     )
 }
 
-/// Spend the tick that pays for a host's robots.txt.
-///
-/// Doc 07.6 counts robots.txt as a request to the same origin as the page, so
-/// the lease that finds the file missing spends its slot on it and puts its url
-/// back for the next tick. A test that is about anything else wants the world
-/// after that has happened, and this is the line that gets it there.
-///
-/// It takes the test's own sink rather than a throwaway, because a batch
-/// covering several urls on one host loses only the one lease and the rest of
-/// that tick is real work whose rows the test still wants.
-///
-/// The clock moves on afterwards for the reason [`drain`] moves it: the host
-/// owes a second of politeness after the robots.txt request and a stopped
-/// clock never gets there. Two seconds, the same step, so a test that ticks
-/// twice sees the same times whichever helper it went through.
-pub(crate) async fn robots_tick<F: Fetch>(crawler: &Crawler<F, Arc<FixedClock>>, sink: &dyn Sink) {
-    crawler.tick(sink).await.expect("tick");
-    crawler.clock().advance(TICK_STEP_MS);
-}
-
 /// Tick until the frontier runs dry, moving the clock on between ticks.
 ///
 /// A crawl of more than one page needs this and it is not a test artefact.
@@ -558,7 +539,6 @@ async fn a_tick_leases_fetches_and_completes() {
     let crawler = crawler(fetch, Arc::clone(&state));
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 1);
     assert_eq!(report.rows, 1);
@@ -592,12 +572,8 @@ async fn robots_is_fetched_before_the_page_and_only_once_per_host() {
         .html("https://example.com/c", &page("C", &[]));
     let crawler = crawler(fetch, state);
 
-    // Two ticks, because the first spends a lease on robots.txt and gives its
-    // url back. Which tick a page lands in is not the point here.
     let first = crawler.tick(&Collected::default()).await.expect("tick");
-    crawler.clock().advance(TICK_STEP_MS);
-    let second = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(first.fetched + second.fetched, 3);
+    assert_eq!(first.fetched, 3);
 
     // Three pages on one host is one robots.txt. A cache that let every task
     // discover the miss would send three, and at 250 pages a second on a big
@@ -609,6 +585,50 @@ async fn robots_is_fetched_before_the_page_and_only_once_per_host() {
         .filter(|u| u.ends_with("/robots.txt"))
         .count();
     assert_eq!(robots, 1, "asked for robots.txt {robots} times");
+}
+
+#[tokio::test]
+async fn the_lease_that_fetches_robots_goes_on_to_fetch_its_page() {
+    // The lease used to stop at the file and put its url back for the next
+    // tick to offer, on the reasoning that this costs a tick per host per day.
+    // It costs far more than that. The frontier visits `max_domains` domains a
+    // tick, so a host that gives its lease back is not offered again until the
+    // rotation comes round, and on a broad crawl that is most of the frontier.
+    //
+    // Measured on server3 against a seed of twenty thousand distinct hosts:
+    // twelve minutes of crawling fetched 2,074 robots.txt files and not one
+    // page, because every lease in every tick was the first lease its host had
+    // ever had. Doc 16's gate 3.1 wants 250 pages a second out of that same
+    // box.
+    let url = "https://example.com/a";
+    let state = seeded(&[url]).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Timed::new(&clock, |f| {
+        f.robots("https://example.com", "User-agent: *\nAllow: /\n")
+            .html(url, &page("A", &[]))
+    }));
+    let crawler = Crawler::new(Arc::clone(&fetch), state, Arc::clone(&clock), config());
+    let sink = Collected::default();
+
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.leased, 1, "{report:?}");
+    assert_eq!(report.fetched, 1, "the page waited for another tick");
+    assert_eq!(report.deferred, 0, "{report:?}");
+    assert_eq!(sink.rows().len(), 1);
+
+    // And the two requests are a delay apart, because doc 07.6 counts
+    // robots.txt as a request to the same host. One lease, two requests, and
+    // the origin sees exactly what it would have seen across two ticks.
+    let mut sent = fetch.sent();
+    sent.sort_by_key(|(_, at)| *at);
+    let at: Vec<u64> = sent.iter().map(|(_, at)| *at).collect();
+    assert!(sent[0].0.ends_with("/robots.txt"), "{sent:?}");
+    assert_eq!(sent[1].0, url, "{sent:?}");
+    assert_eq!(
+        at,
+        vec![T0, T0 + u64::from(umi_state::HostRow::INITIAL_DELAY_MS)],
+        "{sent:?}"
+    );
 }
 
 #[tokio::test]
@@ -647,21 +667,17 @@ async fn a_batch_covering_one_host_is_spread_out_rather_than_sent_at_once() {
         },
     );
 
-    // Two ticks, because the first spends a lease on this host's robots.txt
-    // and puts that url back. The four page requests are what this is about
-    // and they are spread across both.
     let first = crawler.tick(&Collected::default()).await.expect("tick");
-    clock.advance(TICK_STEP_MS);
-    let second = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(first.fetched + second.fetched, 4, "{first:?} {second:?}");
+    assert_eq!(first.fetched, 4, "{first:?}");
 
-    let sent: Vec<u64> = fetch
-        .sent()
-        .into_iter()
-        .filter(|(url, _)| !url.ends_with("/robots.txt"))
-        .map(|(_, at)| at)
-        .collect();
-    assert_eq!(sent.len(), 4, "{sent:?}");
+    // robots.txt is in the list rather than filtered out of it. Doc 07.6
+    // counts that file as a request to the same origin as the page, so five
+    // requests went to this host and the spacing has to hold across all five.
+    // Filtered out, this test passed while the lease that fetched the file
+    // sent its page in the same millisecond as the next lease's.
+    let mut sent: Vec<u64> = fetch.sent().into_iter().map(|(_, at)| at).collect();
+    sent.sort_unstable();
+    assert_eq!(sent.len(), 5, "{sent:?}");
 
     let delay = u64::from(umi_state::HostRow::INITIAL_DELAY_MS);
     for pair in sent.windows(2) {
@@ -698,25 +714,27 @@ async fn forty_hosts_under_one_domain_are_still_one_domain() {
     let clock = Arc::new(FixedClock::at(T0));
     let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
 
-    // The cap is 20 a second and the burst is a second's worth, so the first
-    // tick spends the lot and the second gets nothing until time moves.
-    let first = crawler.tick(&Collected::default()).await.expect("tick");
+    // The cap is 20 a second and the burst is a second's worth, so forty urls
+    // that are all due take two ticks whatever the window is. Without the
+    // frontier on the path the first tick would have handed out all forty.
     let cap = umi_frontier::Rate::DEFAULT_PER_SECOND as usize;
+    let first = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(first.leased, cap, "{first:?}");
 
+    // No `advance` between the two, because the first tick moved the clock on
+    // its own: every host in it was fetching its robots.txt for the first
+    // time, and doc 07.6 makes the page that follows wait out a delay. A
+    // second of crawling is a second of the domain's allowance whether it was
+    // spent waiting or fetching.
     let second = crawler.tick(&Collected::default()).await.expect("tick");
-    assert!(
-        second.idle(),
-        "the domain was over its cap and got {} more urls anyway",
-        second.leased
-    );
+    assert_eq!(second.leased, urls.len() - cap, "{second:?}");
 
-    // A second later it may go again, and the twenty urls left are the twenty
-    // it takes. Without the frontier on the path both of these ticks would have
-    // handed out all forty at once.
-    clock.advance(1000);
     let third = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(third.leased, urls.len() - cap, "{third:?}");
+    assert!(
+        third.idle(),
+        "the frontier was empty and handed out {} anyway",
+        third.leased
+    );
 }
 
 #[tokio::test]
@@ -755,15 +773,13 @@ async fn a_lease_that_is_ready_now_does_not_wait_behind_one_that_is_not() {
     );
 
     let report = crawler.tick(&Collected::default()).await.expect("tick");
-    // Six rather than eight, and the two missing ones are the leases that
-    // fetched each host's robots.txt and put their urls back. Doc 07.6 counts
-    // that file as a request to the same host, so the slot is spent either
-    // way and the interleaving is what this is about.
-    assert_eq!(report.fetched, 6, "{report:?}");
-    assert_eq!(report.deferred, 2, "{report:?}");
+    assert_eq!(report.fetched, 8, "{report:?}");
+    assert_eq!(report.deferred, 0, "{report:?}");
 
-    // Three delays covers the fourth request on either host. If the two hosts
-    // were being served one after the other it would take seven.
+    // Four delays and not three, because each host took five requests and not
+    // four: its robots.txt went first and the page of the lease that fetched
+    // it took the slot at the back. If the two hosts were being served one
+    // after the other it would take nine.
     let delay = u64::from(umi_state::HostRow::INITIAL_DELAY_MS);
     let last = fetch
         .sent()
@@ -773,10 +789,10 @@ async fn a_lease_that_is_ready_now_does_not_wait_behind_one_that_is_not() {
         .expect("something was sent");
     assert_eq!(
         last - T0,
-        3 * delay,
+        4 * delay,
         "eight urls over two hosts took {} ms, and one host's worth is {} ms",
         last - T0,
-        3 * delay
+        4 * delay
     );
 }
 
@@ -794,7 +810,6 @@ async fn a_disallowed_url_is_never_fetched() {
     let crawler = crawler(fetch, state);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 1);
     assert_eq!(report.disallowed, 1);
@@ -833,7 +848,6 @@ async fn aipref_reaches_the_row_from_both_sources_at_once() {
     let crawler = crawler(fetch, state);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     crawler.tick(&sink).await.expect("tick");
     let rows = sink.rows();
     assert_eq!(rows.len(), 1);
@@ -864,7 +878,6 @@ async fn a_pattern_scoped_aipref_line_reaches_only_the_pages_it_names() {
     let crawler = crawler(fetch, state);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     crawler.tick(&sink).await.expect("tick");
     let rows = sink.rows();
     assert_eq!(rows.len(), 2);
@@ -894,7 +907,6 @@ async fn an_unreadable_aipref_value_is_recorded_rather_than_dropped() {
     let crawler = crawler(fetch, state);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     crawler.tick(&sink).await.expect("tick");
     assert_eq!(
         sink.rows()[0].content_usage.as_deref(),
@@ -912,7 +924,6 @@ async fn a_missing_robots_allows_the_host() {
     let fetch = Canned::new().html("https://example.com/a", &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.disallowed, 0);
     assert_eq!(report.fetched, 1);
@@ -935,7 +946,6 @@ async fn links_found_on_a_page_go_into_the_frontier() {
     let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let first = crawler.tick(&sink).await.expect("tick");
     assert_eq!(first.links_seen, 3);
     assert_eq!(first.links_admitted, 3);
@@ -946,9 +956,7 @@ async fn links_found_on_a_page_go_into_the_frontier() {
     // 07.6 only allows one of those at a time.
     clock.advance(TICK_STEP_MS);
     let rest = drain(&crawler, &clock, &sink).await;
-    // Four leases for three pages, because elsewhere.example is a host we have
-    // not spoken to and one of them goes on its robots.txt.
-    assert_eq!(rest.leased, 4, "the admitted links were not handed back");
+    assert_eq!(rest.leased, 3, "the admitted links were not handed back");
     assert_eq!(rest.fetched, 3);
 
     let mut urls: Vec<String> = sink.rows().into_iter().map(|r| r.url).collect();
@@ -978,7 +986,6 @@ async fn a_nofollow_page_keeps_its_row_and_gives_up_its_links() {
     let crawler = crawler(fetch, state);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.rows, 1);
     assert_eq!(report.links_seen, 0, "a nofollow page contributed links");
@@ -1000,7 +1007,6 @@ async fn a_rel_nofollow_link_is_followed_and_is_still_in_the_row() {
     let crawler = crawler(fetch, state);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.links_seen, 2);
     assert_eq!(report.links_admitted, 2);
@@ -1030,7 +1036,6 @@ async fn the_head_puts_its_pages_in_the_frontier_and_keeps_its_assets_out() {
     let crawler = Crawler::new(Arc::new(fetch), state, Arc::clone(&clock), config());
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.links_seen, 1, "an asset was offered to the frontier");
     assert_eq!(report.links_admitted, 1);
@@ -1092,7 +1097,6 @@ async fn a_failed_fetch_still_produces_a_row() {
     let crawler = crawler(fetch, state);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.rows, 1);
     assert_eq!(report.failed, 1);
@@ -1115,7 +1119,6 @@ async fn a_sink_that_fails_leaves_the_url_uncompleted() {
         .html("https://example.com/a", &page("A", &[]));
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    robots_tick(&crawler, &Broken).await;
     let failed = crawler.tick(&Broken).await;
     assert!(matches!(failed, Err(CrawlError::Sink(_))), "{failed:?}");
 
@@ -1152,7 +1155,6 @@ async fn two_runs_over_the_same_pages_produce_the_same_rows() {
             .html("https://example.com/b", &page("B", &["/a"]));
         let crawler = crawler(fetch, state);
         let sink = Collected::default();
-        robots_tick(&crawler, &sink).await;
         crawler.tick(&sink).await.expect("tick");
         let mut rows = sink.rows();
         rows.sort_by(|a, b| a.url.cmp(&b.url));
@@ -1336,9 +1338,7 @@ async fn a_filtered_content_type_costs_the_fetch_and_produces_no_row() {
     let sink = Collected::default();
     let report = drain(&crawler, &clock, &sink).await;
 
-    // Three, because the first lease on a host pays for its robots.txt and
-    // comes back with the page still to do.
-    assert_eq!(report.leased, 3, "both were leased and both were fetched");
+    assert_eq!(report.leased, 2, "both were leased and both were fetched");
     assert!(crawler.fetcher().asked_for("https://example.com/paper.pdf"));
     assert_eq!(report.rows, 1, "only the html got a row");
     assert_eq!(sink.rows()[0].url, "https://example.com/a");
@@ -1381,7 +1381,6 @@ async fn rows_are_stamped_with_the_scope_that_admitted_them() {
     assert_ne!(id, 0);
     let crawler = with_scope(fetch, Arc::clone(&state), scope);
     let sink = Collected::default();
-    robots_tick(&crawler, &sink).await;
     crawler.tick(&sink).await.expect("tick");
 
     assert_eq!(sink.rows()[0].crawl_profile, id);
@@ -1405,7 +1404,6 @@ async fn what_the_origin_said_about_its_rate_reaches_the_scheduler() {
         );
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.failed, 1);
 
@@ -1456,7 +1454,6 @@ async fn a_retry_after_moves_the_leases_the_tick_is_still_holding() {
     // One url through the robots tick and the other two admitted after it, so
     // that the tick under test leases all three as one batch. A test that
     // seeded three would spend two of them paying for the robots.txt.
-    robots_tick(&crawler, &sink).await;
     let mut rest = Vec::new();
     for url in ["https://example.com/b", "https://example.com/c"] {
         let mut seed = Candidate::new(url, T0).expect("a crawlable url");
@@ -1487,7 +1484,6 @@ async fn a_page_that_came_back_quickly_counts_towards_the_fast_floor() {
         .html("https://example.com/a", &page("A", &[]));
     let crawler = crawler(fetch, Arc::clone(&state));
 
-    robots_tick(&crawler, &Collected::default()).await;
     crawler.tick(&Collected::default()).await.expect("tick");
 
     let host = umi_types::RowKey::for_url("https://example.com/a", None)
@@ -1517,7 +1513,6 @@ async fn a_challenge_page_is_not_counted_as_a_fetch() {
     let crawler = crawler(fetch, Arc::clone(&state));
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.challenged, 1);
     assert_eq!(report.fetched, 0, "a wall is not a page");
@@ -1556,7 +1551,6 @@ async fn an_origin_that_stops_blocking_is_probed_back_down() {
     );
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.failed, 1);
     assert_eq!(report.learned, 1);
@@ -1566,9 +1560,12 @@ async fn an_origin_that_stops_blocking_is_probed_back_down() {
         .host;
     let row = state.host(host).await.expect("host").expect("a record");
     assert_eq!(row.tier.preferred, Tier::Emulated);
+    // From `T0` and not from [`T1`], because the backoff is measured off the
+    // tick's own clock reading and a tick takes its reading once, at the top,
+    // before any of its leases have waited for anything.
     assert_eq!(
         row.next_allowed_ms,
-        T1 + umi_state::TierPolicy::BACKOFF_MS[0],
+        T0 + umi_state::TierPolicy::BACKOFF_MS[0],
         "a block backs the host off, not just the url"
     );
 
@@ -1582,12 +1579,10 @@ async fn an_origin_that_stops_blocking_is_probed_back_down() {
     // A week later the origin has stopped blocking and the probe finds out.
     fetch.relent();
     clock.advance(umi_state::TierPolicy::PROBE_EVERY_MS);
-    // A week is well past the day robots.txt is good for, so the probe waits
-    // one more tick while a lease goes on the file again. The clock moves on
-    // by the ceiling on the delay rather than by the usual step, because this
-    // host was blocked and owes more than a second.
-    crawler.tick(&sink).await.expect("tick");
-    clock.advance(u64::from(umi_state::HostRow::MAX_DELAY_MS));
+    // A week is well past the day robots.txt is good for, so the probe reads
+    // the file again on its way out. That costs the lease a delay and not a
+    // tick, and this host was blocked so the delay it owes is the ceiling
+    // rather than the usual second.
     let probe = crawler.tick(&sink).await.expect("tick");
     assert_eq!(probe.leased, 1, "the weekly probe never came");
     assert_eq!(probe.fetched, 1);
@@ -1629,7 +1624,6 @@ async fn a_learned_tier_outlives_the_process() {
             .robots("https://example.com", "User-agent: *\nAllow: /\n")
             .outcome(url, blocked());
         let crawler = crawler(fetch, Arc::clone(&state));
-        robots_tick(&crawler, &Collected::default()).await;
         let report = crawler.tick(&Collected::default()).await.expect("tick");
         assert_eq!(report.learned, 1);
     }
@@ -1683,7 +1677,6 @@ async fn a_304_moves_the_schedule_and_writes_no_row() {
     );
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let first = crawler.tick(&sink).await.expect("tick");
     assert_eq!(first.fetched, 1);
     assert_eq!(first.rows, 1);
@@ -1692,7 +1685,6 @@ async fn a_304_moves_the_schedule_and_writes_no_row() {
     // in front of the scheduler at all. It is also past the day robots.txt is
     // good for, so the file is due again and a lease pays for it again.
     clock.advance(PAST_MAX_REFRESH);
-    robots_tick(&crawler, &sink).await;
     let second = crawler.tick(&sink).await.expect("tick");
     assert_eq!(second.leased, 1);
     assert_eq!(second.not_modified, 1, "the second fetch was not a 304");
@@ -1747,7 +1739,6 @@ async fn three_full_bodies_for_a_conditional_request_drop_t0() {
     // The first fetch has nothing to revalidate against, so it teaches
     // nothing. The three after it are the three doc 05.3 counts.
     for round in 0..4 {
-        robots_tick(&crawler, &sink).await;
         crawler.tick(&sink).await.expect("tick");
         clock.advance(PAST_MAX_REFRESH);
 
@@ -1773,7 +1764,6 @@ async fn three_full_bodies_for_a_conditional_request_drop_t0() {
     // Every request so far carried a validator except the first, and the next
     // one does not, which is the whole saving.
     assert_eq!(fetch.conditional(), vec![false, true, true, true]);
-    robots_tick(&crawler, &sink).await;
     crawler.tick(&sink).await.expect("tick");
     assert_eq!(fetch.conditional().len(), 5);
     assert!(!fetch.conditional()[4], "T0 was dropped and sent anyway");
@@ -1820,7 +1810,6 @@ async fn a_refresh_holding_a_validator_is_leased_at_t0() {
     );
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     crawler.tick(&sink).await.expect("tick");
     let rows = sink.rows();
     assert_eq!(
@@ -1881,13 +1870,11 @@ async fn a_full_body_that_has_not_changed_writes_no_second_row() {
     );
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let first = crawler.tick(&sink).await.expect("tick");
     assert_eq!(first.rows, 1);
     assert_eq!(first.unchanged, 0, "a first fetch has nothing to match");
 
     clock.advance(PAST_MAX_REFRESH);
-    robots_tick(&crawler, &sink).await;
     let second = crawler.tick(&sink).await.expect("tick");
     assert_eq!(second.fetched, 1, "the body arrived and was paid for");
     assert_eq!(second.unchanged, 1, "the body was the one we already had");
@@ -1936,12 +1923,10 @@ async fn a_304_contradicted_by_the_body_disables_t0_for_the_host() {
         .expect("a crawlable url")
         .host;
 
-    robots_tick(&crawler, &sink).await;
     crawler.tick(&sink).await.expect("tick");
     // Far enough on that robots.txt has expired too, so a lease goes on the
     // file again before one goes on the page.
     clock.advance(PAST_MAX_REFRESH);
-    robots_tick(&crawler, &sink).await;
 
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.learned, 1);
@@ -1967,7 +1952,6 @@ async fn a_304_contradicted_by_the_body_disables_t0_for_the_host() {
     // And from here the host is never asked conditionally again, so it cannot
     // answer 304 again and the page cannot freeze.
     clock.advance(PAST_MAX_REFRESH);
-    robots_tick(&crawler, &sink).await;
     let last = crawler.tick(&sink).await.expect("tick");
     assert_eq!(fetch.conditional(), vec![false, true, false, false]);
     // That last fetch came back with the body the audit already stored, so it
@@ -2014,7 +1998,6 @@ async fn a_validator_outlives_the_process() {
             Arc::new(FixedClock::at(T0)),
             config(),
         );
-        robots_tick(&crawler, &Collected::default()).await;
         assert_eq!(
             crawler
                 .tick(&Collected::default())
@@ -2037,7 +2020,6 @@ async fn a_validator_outlives_the_process() {
     ));
     let crawler = Crawler::new(Arc::clone(&fetch), Arc::clone(&state), clock, config());
 
-    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.not_modified, 1, "the etag did not survive the store");
     assert_eq!(report.rows, 0);
@@ -2108,7 +2090,6 @@ async fn rendering_past_the_budget_is_deferred_and_not_fetched() {
     let crawler = with_browser(fetch, Arc::clone(&state), &clock);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 8);
     assert_eq!(
@@ -2120,31 +2101,19 @@ async fn rendering_past_the_budget_is_deferred_and_not_fetched() {
     assert_eq!(report.rows, 6, "a deferred page produced a row");
     assert_eq!(sink.rows().len(), 6);
     assert_eq!(crawler.render().granted(), 6);
-    // Four and not two, because this counter runs for the life of the process
-    // and the tick that paid for the robots.txt files ran the same budget and
-    // turned the same two pages away. What that tick granted it gave back,
-    // which is why `granted` is not doubled the same way: no browser ran.
-    assert_eq!(crawler.render().deferred(), 4);
+    assert_eq!(crawler.render().deferred(), 2);
 
     // And the two are still there, at the due time they always had, rather
     // than waiting out a lease or a failure backoff. That is the deferred
     // queue: the frontier already orders by priority and already survives a
     // restart, so it is a better queue than one held here would be.
-    // The two that were turned away are the two hosts nothing has read a
-    // robots.txt for, since the pages that would have read it are the pages
-    // the budget stopped. So their next lease goes on the file and the one
-    // after that goes on the page.
-    let first = crawler.tick(&sink).await.expect("tick");
-    assert_eq!(first.leased, 2, "the deferred pages did not come back");
-    assert_eq!(
-        first.deferred, 2,
-        "a lease went somewhere other than robots"
-    );
-    assert_eq!(first.fetched, 0);
-    clock.advance(TICK_STEP_MS);
-
+    //
+    // No `advance` before this one. The tick above spent a second waiting out
+    // the politeness delay after eight robots.txt files, and doc 05.9's budget
+    // refills over time, so the two slots it was short are there by the time
+    // it returns.
     let again = crawler.tick(&sink).await.expect("tick");
-    assert_eq!(again.leased, 2);
+    assert_eq!(again.leased, 2, "the deferred pages did not come back");
     assert_eq!(again.rendered, 2);
     assert_eq!(again.deferred, 0);
     assert_eq!(again.fetched, 2);
@@ -2172,7 +2141,6 @@ async fn a_fleet_with_no_browser_at_all_fetches_the_page_anyway() {
     let crawler = with_browser(fetch, Arc::clone(&state), &clock);
     let sink = Collected::default();
 
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.leased, 1);
     assert_eq!(report.deferred, 0, "there is no queue worth waiting in");
@@ -2258,7 +2226,6 @@ async fn a_row_records_the_rungs_that_ran_and_not_the_rung_it_asked_for() {
     );
 
     let sink = Collected::default();
-    robots_tick(&crawler, &sink).await;
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.rows, 1);
 
@@ -2306,7 +2273,6 @@ async fn the_budget_only_holds_back_the_tier_it_is_for() {
 
     let clock = Arc::new(FixedClock::at(T0));
     let crawler = with_browser(fetch, Arc::clone(&state), &clock);
-    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.fetched, 4);
     assert_eq!(report.deferred, 0);
