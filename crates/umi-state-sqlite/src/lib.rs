@@ -154,6 +154,27 @@ impl Default for SqliteConfig {
     }
 }
 
+/// The smallest page cache worth asking for, and the largest.
+///
+/// The floor is the old fixed default and is what a box that will not say how
+/// much memory it has gets. The ceiling is there because a page cache larger
+/// than the working set buys nothing and a crawl has other things to spend
+/// memory on: the fetch window, the open segment, and doc 15.3's ladder, which
+/// starts restraining the crawl when the box runs short.
+const CACHE_FLOOR: u64 = 64 * 1024 * 1024;
+const CACHE_CEILING: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The share of what the machine has free that a crawl's page cache may take.
+///
+/// An eighth. The frontier is the biggest thing a crawl touches and the page
+/// cache is what keeps it out of the disk, so this wants to be generous, and
+/// the reason it is not more generous is that the same box is holding a fetch
+/// window of a few hundred sockets, an open segment, and whatever the operator
+/// is also running. Doc 15.3's ladder is the backstop and it is a slow one:
+/// it reads RSS between ticks, so a crawl that took half the box at startup
+/// would be restrained after it had already caused the problem.
+const CACHE_SHARE: u64 = 8;
+
 impl SqliteConfig {
     /// A configuration for a store at `path`, with the default sizing.
     #[must_use]
@@ -161,6 +182,29 @@ impl SqliteConfig {
         Self {
             path: Some(path.into()),
             ..Self::default()
+        }
+    }
+
+    /// A configuration for a crawl's state file, sized for the machine.
+    ///
+    /// The difference from [`at`](Self::at) is the page cache, and it is the
+    /// difference between a frontier that is in memory and one that is on the
+    /// disk. Every part of the write path that touches the ledger is a b tree
+    /// lookup into a table that grows for as long as the crawl runs, and
+    /// measured on server3 over eight minutes at depth two, writing completions
+    /// for a window of pages went from 16 seconds to 55 while the number of
+    /// pages stayed the same and the frontier went from 573,000 rows to
+    /// 891,000. That is a 264 MB database against a 64 MB cache.
+    ///
+    /// The other tools that open a state file keep the fixed default, because
+    /// `umi block` and `umi supervise` read a handful of rows and exit, and a
+    /// page cache sized for a crawl would be memory a one shot command asks for
+    /// and never touches.
+    #[must_use]
+    pub fn for_crawl(path: impl Into<PathBuf>) -> Self {
+        Self {
+            cache_bytes: cache_for_machine(),
+            ..Self::at(path)
         }
     }
 
@@ -348,6 +392,37 @@ fn blocking<T>(f: impl FnOnce() -> T) -> T {
         }
         _ => f(),
     }
+}
+
+/// An eighth of what the machine says it has free, inside the two bounds.
+///
+/// `MemAvailable` and not `MemFree`, because `MemFree` on a box that has been
+/// up for two months reads near zero and means nothing: the rest is page cache
+/// the kernel will hand back the moment anybody asks. A machine that will not
+/// answer gets the floor, which is what every machine got before this existed,
+/// so the failure mode is the old behaviour rather than a guess.
+fn cache_for_machine() -> u64 {
+    let Some(available) = available_bytes() else {
+        return CACHE_FLOOR;
+    };
+    (available / CACHE_SHARE).clamp(CACHE_FLOOR, CACHE_CEILING)
+}
+
+/// What the machine says it has free, or `None` if it will not say.
+///
+/// Linux only, deliberately. This is a number that decides how a crawl is sized
+/// and crawls run on Linux, and the alternative on macOS is shelling out to
+/// `vm_stat` and parsing it, which is a lot of machinery to size a page cache on
+/// a laptop that is running the tests rather than a crawl.
+fn available_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }
 
 /// The pragmas from doc 08.5, plus the sizing from the config.

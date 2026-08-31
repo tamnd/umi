@@ -19,7 +19,10 @@ use umi_state::{
 };
 use umi_types::{Digest, FetcherId, RowKey, Tier, Ulid};
 
-use super::{APPLICATION_ID, SCHEMA_VERSION, SqliteConfig, SqliteState, schema, sql};
+use super::{
+    APPLICATION_ID, CACHE_CEILING, CACHE_FLOOR, SCHEMA_VERSION, SqliteConfig, SqliteState, schema,
+    sql,
+};
 
 /// The same fixed instant the conformance suite runs from.
 const T0: u64 = 1_700_000_000_000;
@@ -959,4 +962,33 @@ async fn a_hand_edited_file_is_caught_by_the_recount() {
 
     let disagreements = state.recount().expect("recount");
     assert_eq!(disagreements, vec![("pending", 8, 1)]);
+}
+
+#[test]
+fn a_crawl_asks_for_a_page_cache_sized_to_the_machine() {
+    // Two bounds and a share, and the part worth a test is the bounds. The
+    // floor is what a machine that will not say gets, so it is also what this
+    // asserts on a machine with no `/proc/meminfo`, and the ceiling is what
+    // stops a box with a terabyte from asking for a page cache the crawl has
+    // no other use for.
+    let sized = SqliteConfig::for_crawl("state.sqlite");
+    assert!(
+        sized.cache_bytes >= CACHE_FLOOR,
+        "{} bytes is under the floor",
+        sized.cache_bytes
+    );
+    assert!(
+        sized.cache_bytes <= CACHE_CEILING,
+        "{} bytes is over the ceiling",
+        sized.cache_bytes
+    );
+    // Everything else is the plain configuration, because the page cache is the
+    // only thing a crawl wants differently from a one shot command.
+    assert_eq!(
+        SqliteConfig {
+            cache_bytes: SqliteConfig::default().cache_bytes,
+            ..sized
+        },
+        SqliteConfig::at("state.sqlite")
+    );
 }

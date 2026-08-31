@@ -85,7 +85,7 @@ use umi_publish::manifest::{FileEntry, Manifest, Verification};
 use umi_publish::repo::Corpus;
 use umi_publish::{BlockEntry, Hub, PublishConfig, Published, Publisher, Role, SigningKey};
 use umi_state::{Candidate, SegmentQuery, SegmentRow, State, StateStats, Stream};
-use umi_state_sqlite::SqliteState;
+use umi_state_sqlite::{SqliteConfig, SqliteState};
 use umi_types::{Digest, FetcherId, Tier, Ulid};
 
 use crate::Error;
@@ -1040,8 +1040,13 @@ fn run(
     settings: &Settings,
     options: &Options,
 ) -> Result<Summary, Error> {
-    let state: Arc<dyn State> =
-        Arc::new(SqliteState::open(&layout.state).map_err(|e| Error::State(e.to_string()))?);
+    // Sized for the machine and not the fixed default, because this is the one
+    // command that keeps the file open for hours and writes into a table that
+    // grows the whole time. See `SqliteConfig::for_crawl`.
+    let state: Arc<dyn State> = Arc::new(
+        SqliteState::open_with(SqliteConfig::for_crawl(&layout.state))
+            .map_err(|e| Error::State(e.to_string()))?,
+    );
     // Every rung this binary was built with. `--tier` is already on
     // `CrawlConfig` and the loop honours it as a ceiling, so a crawl asking
     // for a tier above the top of the ladder gets the top of the ladder rather
