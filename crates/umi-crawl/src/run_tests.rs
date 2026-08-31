@@ -832,6 +832,45 @@ async fn forty_hosts_under_one_domain_are_still_one_domain() {
 }
 
 #[tokio::test]
+async fn a_tick_reports_how_full_its_fetch_window_actually_was() {
+    // Doc 14.3's progress line said "in flight" and printed the batch size,
+    // which is the same number every tick and is not a measurement. The
+    // question it looks like it is answering is the one that matters for gate
+    // 3.1: a crawl configured for 256 that is running 30 is not fetching
+    // slowly, it is not fetching, and nothing else on the line says so.
+    //
+    // Sixteen urls on sixteen hosts with room for four at a time. Nothing here
+    // waits on anything, so the window should be full for most of the tick,
+    // and the one thing that must not happen is the old answer of sixteen.
+    let urls: Vec<String> = (0..16).map(|n| format!("https://h{n}.example/p")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let fetch = urls.iter().fold(Canned::new(), |f, url| {
+        let origin = url.trim_end_matches("/p");
+        f.robots(origin, "User-agent: *\nAllow: /\n")
+            .html(url, &page("P", &[]))
+    });
+    let crawler = Crawler::new(
+        fetch,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let report = crawler.tick(&Collected::default()).await.expect("tick");
+    assert_eq!(report.fetched, 16, "{report:?}");
+    let mean = report.window_mean();
+    assert!(
+        mean > 1.0 && mean <= 4.0,
+        "a window of four averaged {mean} over {} leases",
+        report.leased
+    );
+}
+
+#[tokio::test]
 async fn a_lease_that_is_ready_now_does_not_wait_behind_one_that_is_not() {
     // The other half. Honouring `not_before_ms` costs nothing if a slow host
     // can park the window while it waits, so the batch goes out earliest first

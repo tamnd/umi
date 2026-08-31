@@ -46,7 +46,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -447,6 +447,51 @@ pub struct TickReport {
     /// is full, and the two want opposite responses: the first one means the
     /// crawl is over and the second one means wait.
     pub restrained: bool,
+    /// The fetch window's occupancy, sampled once per completion and summed.
+    ///
+    /// Over [`completed`](TickReport::completed) it is the mean, and that is
+    /// the number that says whether the crawl is limited by the window or by
+    /// what is in it. A tick configured for 256 that averages 30 is not
+    /// fetching slowly, it is not fetching, and the two have completely
+    /// different fixes. Doc 16's gate 3.1 is a rate on one box, and there is
+    /// no reading of a rate that is useful without this next to it.
+    ///
+    /// A sum rather than the mean because reports add up: a caller that wants
+    /// the mean over a run of ticks cannot get it from a list of means.
+    pub window_sum: u64,
+    /// Lease milliseconds spent waiting out doc 07.6's politeness delay.
+    ///
+    /// Summed across the tick's leases, so it is many times longer than the
+    /// tick. Against `lease_ms` it is the share of the window that was asleep
+    /// on purpose.
+    pub waited_ms: u64,
+    /// Lease milliseconds spent fetching and parsing robots.txt.
+    ///
+    /// The one request a lease makes that is not the page it was leased for,
+    /// and on a broad crawl of hosts we have never seen it is every lease.
+    pub robots_ms: u64,
+    /// Lease milliseconds from claim to answer, summed across the tick.
+    ///
+    /// Divided by the completions it is what one lease costs the window, and
+    /// the window over that number is the rate. Everything else in this block
+    /// is here to say which part of it to go and fix.
+    pub lease_ms: u64,
+}
+
+/// Where a lease's wall clock went.
+///
+/// Not the clock trait, because these are durations rather than timestamps and
+/// nothing published depends on them. Doc 11.1's rule is about what goes in a
+/// row.
+#[derive(Clone, Copy, Debug, Default)]
+struct Spent {
+    /// Waiting out politeness, before robots.txt and again before the page.
+    waiting_ms: u32,
+    /// Deciding what robots.txt says, which for the first lease on a host
+    /// includes fetching it.
+    robots_ms: u32,
+    /// Claim to answer, which is the other two plus the fetch and the parse.
+    total_ms: u32,
 }
 
 impl TickReport {
@@ -455,6 +500,52 @@ impl TickReport {
     #[must_use]
     pub const fn idle(&self) -> bool {
         self.leased == 0
+    }
+
+    /// Leases that came back with an answer, which is what the sums are over.
+    ///
+    /// Not `leased`. A tick ends holding nothing, but a lease that was deferred
+    /// never went out and never spent any of the window, so counting it here
+    /// would make every mean below look better than it was.
+    #[must_use]
+    pub const fn completed(&self) -> usize {
+        self.leased.saturating_sub(self.deferred)
+    }
+
+    /// How full the fetch window was on average.
+    #[must_use]
+    pub fn window_mean(&self) -> f32 {
+        let over = self.completed();
+        if over == 0 {
+            return 0.0;
+        }
+        self.window_sum as f32 / over as f32
+    }
+
+    /// What one lease cost the window, in milliseconds.
+    ///
+    /// The window over this number is the rate, so it is the one figure that
+    /// says how far a box is from doc 16's gate 3.1 and which way to go. A
+    /// window of 256 at a lease cost of one second is 256 pages a second.
+    #[must_use]
+    pub fn lease_mean_ms(&self) -> u64 {
+        self.mean(self.lease_ms)
+    }
+
+    /// The part of that a lease spent on robots.txt.
+    #[must_use]
+    pub fn robots_mean_ms(&self) -> u64 {
+        self.mean(self.robots_ms)
+    }
+
+    /// The part of that a lease spent waiting out doc 07.6's delay.
+    #[must_use]
+    pub fn waited_mean_ms(&self) -> u64 {
+        self.mean(self.waited_ms)
+    }
+
+    fn mean(&self, total: u64) -> u64 {
+        total.checked_div(self.completed() as u64).unwrap_or(0)
     }
 }
 
@@ -802,7 +893,16 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 unchanged,
                 give_back,
                 signal,
+                spent,
             } = done;
+            // Sampled after this lease left the window and its replacement
+            // went in, so it is how full the window is right now. Doc 14.3's
+            // progress line has been reporting the batch size under the name
+            // "in flight", which is not a measurement of anything.
+            report.window_sum += pending.len() as u64;
+            report.waited_ms += u64::from(spent.waiting_ms);
+            report.robots_ms += u64::from(spent.robots_ms);
+            report.lease_ms += u64::from(spent.total_ms);
 
             if disallowed {
                 report.disallowed += 1;
@@ -1251,22 +1351,47 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         }
     }
 
+    /// One lease, timed.
+    ///
+    /// A wrapper rather than a line at the end of [`one`](Self::one), because
+    /// `one` returns from a dozen places and the interesting leases are the
+    /// ones that return early. A lease that spent thirty seconds on a
+    /// robots.txt that never arrived is exactly the lease a rate measurement
+    /// needs to see, and it leaves through one of those returns.
+    async fn one(&self, lease: umi_state::Lease, start_ms: u64, floors: &HostFloors) -> Fetched {
+        let began = Instant::now();
+        let mut spent = Spent::default();
+        let mut out = self.run_one(lease, start_ms, floors, &mut spent).await;
+        spent.total_ms = ms(began);
+        out.spent = spent;
+        out
+    }
+
     /// One lease, from robots check to row.
     ///
     /// `start_ms` is when it may go out, which is its politeness time and, for
     /// a rendered page, the render slot doc 05.9's budget gave it.
-    async fn one(&self, lease: umi_state::Lease, start_ms: u64, floors: &HostFloors) -> Fetched {
+    async fn run_one(
+        &self,
+        lease: umi_state::Lease,
+        start_ms: u64,
+        floors: &HostFloors,
+        spent: &mut Spent,
+    ) -> Fetched {
         // Before the robots check rather than after, since robots.txt is a
         // request to the same host and counts the same way.
+        let waited = Instant::now();
         let slot = self
             .wait_for(lease.key.host, start_ms, lease.delay_ms, floors)
             .await;
+        spent.waiting_ms += ms(waited);
 
         let now = || self.clock.now_ms();
         let Some(origin) = origin_of(&lease.url) else {
             return Fetched::malformed(&lease, now());
         };
 
+        let asked = Instant::now();
         let (decision, entry, robots_fetched) = self
             .robots
             .decide(
@@ -1278,6 +1403,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                 now(),
             )
             .await;
+        spent.robots_ms = ms(asked);
         // Only the lease that paid for the fetch writes anything down. Every
         // other lease on this host today read the same entry out of the cache
         // and has nothing to say the host record does not already hold.
@@ -1337,6 +1463,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                 }
                 return Fetched::robots_cost(&lease, now()).taught(&lease, robots);
             }
+            let again = Instant::now();
             self.wait_for(
                 lease.key.host,
                 slot + u64::from(lease.delay_ms),
@@ -1344,6 +1471,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                 floors,
             )
             .await;
+            spent.waiting_ms += ms(again);
         }
 
         let robots_checked_ms = entry.fetched_ms;
@@ -1591,6 +1719,9 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             unchanged,
             give_back: false,
             signal: learned,
+            // Filled in by [`Shared::one`], which is the only caller that
+            // knows when this lease started.
+            spent: Spent::default(),
         }
         .taught(&lease, robots)
     }
@@ -1742,6 +1873,16 @@ struct Fetched {
     /// anything. A robots exclusion and a malformed URL say nothing, because
     /// no request was sent.
     signal: Option<Learned>,
+    /// Where this lease's wall clock went, for [`TickReport`].
+    spent: Spent,
+}
+
+/// Milliseconds since `began`, capped rather than wrapped.
+///
+/// A lease that took longer than seven weeks is not a number anybody is going
+/// to act on, and neither is one that came back negative.
+fn ms(began: Instant) -> u32 {
+    u32::try_from(began.elapsed().as_millis()).unwrap_or(u32::MAX)
 }
 
 /// What one tick learned about one host's ladder.
@@ -2058,6 +2199,9 @@ impl Fetched {
             unchanged: false,
             give_back: false,
             signal: None,
+            // Filled in by [`Shared::one`], which is the only caller that
+            // knows when this lease started.
+            spent: Spent::default(),
         }
     }
 
