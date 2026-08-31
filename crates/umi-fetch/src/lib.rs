@@ -80,6 +80,7 @@ mod engine;
 pub mod headers;
 pub mod outcome;
 mod plain;
+pub mod resolver;
 pub mod sniff;
 pub mod webbotauth;
 

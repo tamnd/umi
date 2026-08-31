@@ -33,6 +33,10 @@ impl Plain {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .connect_timeout(config.connect_timeout)
+            // Not the reqwest default, which is getaddrinfo on a blocking
+            // pool and does not answer faster when more of the fetch window
+            // asks at once. See [`crate::resolver`].
+            .dns_resolver(crate::resolver::Resolver::shared())
             // Redirects are followed by hand, in the engine, because doc 04.7
             // stops at the first one that leaves the registrable domain and a
             // policy closure cannot report which URL it stopped at.

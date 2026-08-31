@@ -34,6 +34,7 @@ chromiumoxide = { workspace = true, optional = true }
 # manifests and doc 04 uses for receipts. One signature scheme in the tree.
 ed25519-dalek = { workspace = true }
 futures-util = { workspace = true }
+hickory-resolver = { workspace = true }
 http = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

@@ -88,6 +88,15 @@ unicode-normalization = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "gzip", "brotli", "zstd", "deflate", "stream", "charset", "http2"] }
 http = "1"
 bytes = "1"
+# Name resolution, because getaddrinfo cannot do this job. Measured on server3
+# against twenty thousand hosts: 75 lookups a second on sixteen threads and 122
+# on two hundred and fifty six, so it does not scale with concurrency, and
+# individual calls under load took upwards of twenty seconds. Raw UDP at the
+# same resolver on the same box in the same minutes answered 614 a second and
+# did scale. The reqwest default puts getaddrinfo on a blocking pool, which
+# turns that ceiling into the crawl's ceiling. This is the version reqwest
+# itself uses for its optional resolver, so it is one copy in the tree.
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
 
 # T2, doc 05.5. wreq links BoringSSL and exposes the TLS extensions and the
 # HTTP/2 settings a browser profile is actually made of, rather than trying to
