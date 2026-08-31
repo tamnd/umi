@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 8;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6, V7, V8];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -481,3 +481,46 @@ CREATE TABLE supervision (
     removed_reason TEXT    NOT NULL
 ) WITHOUT ROWID;
 ";
+
+/// Version 9: `lease_expires` and `state` move into `ledger_ready` so the scan
+/// can be answered out of the index alone.
+///
+/// Measured on server3 against a 1.2 GB frontier of 1.18 million rows: 28
+/// percent of the whole crawl process was `sqlite3BtreeIndexMoveto` under the
+/// lease scan, because every candidate the scan looked at cost a fresh descent
+/// into the ledger's primary key b-tree just to read `lease_expires`, and the
+/// scan walks the index in priority order, which is random with respect to the
+/// key order the ledger is stored in. The same seeks in key order, which is
+/// what `complete` does, cost 94 microseconds a url. Out of order they cost
+/// 2.7 milliseconds.
+///
+/// Both columns are payload and neither is a key. They change nothing about the
+/// order the index is walked in and everything about whether the walk has to
+/// leave it, and the lease clause is written with a `COALESCE` so a row nobody
+/// has leased reads as due rather than as null.
+///
+/// `state` is in the list even though the index is already partial on it, and
+/// this is the part that is easy to get wrong. A partial index does not let
+/// SQLite drop the term from the query: it keeps `state IN (0, 1, 2)` as a
+/// filter, and a filter on a column the index does not carry is a seek into the
+/// table for every candidate, which is exactly the seek this version is here to
+/// remove. Carrying the column answers the filter out of the index and the plan
+/// goes from `SEARCH ledger USING INDEX ledger_ready` to `SEARCH ledger USING
+/// COVERING INDEX ledger_ready`, which is what
+/// `the_lease_query_walks_the_index` asserts.
+///
+/// The cost is on the other side: `MARK_LEASED` now writes an indexed column,
+/// so a lease dirties an index entry per url as well as a row. That is one
+/// write against the seek it removes, and the seek was the expensive half.
+const V9: &str = concat!(
+    r"
+DROP INDEX ledger_ready;
+
+CREATE INDEX ledger_ready
+    ON ledger (refresh_class, priority DESC, next_due_ms, pld, host, url_key,
+               lease_expires, state)
+    WHERE ",
+    schedulable!(),
+    r";
+"
+);

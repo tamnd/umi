@@ -509,21 +509,27 @@ impl<T> SqlExt<T> for rusqlite::Result<T> {
 /// Choosing and writing are two passes because a `SELECT` that is being stepped
 /// while the same table is updated does not promise which rows it will still
 /// see, and the trait promises a deterministic order.
+///
+/// The fields below the line are not filled by the scan. They are the ones
+/// `ledger_ready` does not carry, and reading them where the scan is means
+/// reading them in priority order, which is a random walk of a b-tree the size
+/// of the frontier. [`payload`] fills them afterwards in key order instead.
 struct Chosen {
     key: RowKey,
-    url: String,
-    depth: u8,
     priority: Priority,
-    attempt: u32,
-    etag: Option<String>,
     next_due_ms: u64,
-    last_mod_ms: u64,
     delay_ms: u64,
     next_allowed_ms: u64,
     tier: Tier,
     probe: bool,
-    content_hash: [u8; 8],
     conditional: bool,
+
+    url: String,
+    depth: u8,
+    attempt: u32,
+    etag: Option<String>,
+    last_mod_ms: u64,
+    content_hash: [u8; 8],
 }
 
 /// What a lease call has settled on so far, across the class scans.
@@ -613,15 +619,10 @@ fn pull(
 
         picks.rows.push(Chosen {
             key,
-            url: r.get("url").state()?,
-            depth: u8::try_from(r.get::<_, i64>("depth").state()?).unwrap_or(u8::MAX),
             priority: Priority::from_raw(
                 u16::try_from(r.get::<_, i64>("priority").state()?).unwrap_or(0),
             ),
-            attempt: u32::try_from(r.get::<_, i64>("fetch_count").state()?).unwrap_or(u32::MAX),
-            etag: r.get("etag").state()?,
             next_due_ms: row::from_ms(r.get("next_due_ms").state()?),
-            last_mod_ms: row::from_ms(r.get("last_mod_ms").state()?),
             delay_ms: adaptive.max(crawl.unwrap_or(0)).max(0) as u64,
             next_allowed_ms: row::from_ms(r.get("next_allowed_ms").state()?),
             // Doc 05.7's allowlist is the only thing in the system that
@@ -635,11 +636,79 @@ fn pull(
                 policy.start_at(req.max_tier, req.now_ms)
             },
             probe: policy.probing(req.now_ms),
-            content_hash: row::bytes(r, "content_hash").state()?,
             conditional: policy.conditional(),
+
+            url: String::new(),
+            depth: 0,
+            attempt: 0,
+            etag: None,
+            last_mod_ms: 0,
+            content_hash: [0u8; 8],
         });
     }
 
+    Ok(())
+}
+
+/// Fill in what the scan left blank, in the order the ledger is stored in.
+///
+/// The batch arrives in whatever order the class scans produced, and that order
+/// comes from `ledger_ready`, which is priority first. The ledger is `WITHOUT
+/// ROWID` on `(pld, host, url_key)`, so reading these rows in the order they
+/// were chosen means a fresh descent from the root for each one, and reading
+/// them in key order means walking a page until it runs out. On server3 against
+/// a 1.18 million row frontier that is the difference between 2.7 milliseconds
+/// a url and 94 microseconds, and it is why `complete` sorts before it writes.
+///
+/// A row that has gone since the scan saw it is dropped rather than handed out.
+/// Nothing else writes between the two passes, since they share a transaction on
+/// one connection, so this is a guard rather than a case that happens.
+fn payload(tx: &rusqlite::Transaction<'_>, chosen: &mut Vec<Chosen>) -> Result<()> {
+    let mut order: Vec<usize> = (0..chosen.len()).collect();
+    order.sort_unstable_by_key(|index| chosen[*index].key);
+
+    let mut gone = vec![false; chosen.len()];
+    let mut read = tx.prepare_cached(sql::SELECT_LEASE_PAYLOAD).state()?;
+    for index in order {
+        let key = chosen[index].key;
+        let found = read
+            .query_row(
+                params![
+                    &key.pld.as_bytes()[..],
+                    &key.host.as_bytes()[..],
+                    &key.url.as_bytes()[..],
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, String>("url")?,
+                        u8::try_from(r.get::<_, i64>("depth")?).unwrap_or(u8::MAX),
+                        u32::try_from(r.get::<_, i64>("fetch_count")?).unwrap_or(u32::MAX),
+                        r.get::<_, Option<String>>("etag")?,
+                        row::from_ms(r.get("last_mod_ms")?),
+                        row::bytes(r, "content_hash")?,
+                    ))
+                },
+            )
+            .optional()
+            .state()?;
+
+        let Some((url, depth, attempt, etag, last_mod_ms, content_hash)) = found else {
+            gone[index] = true;
+            continue;
+        };
+        let row = &mut chosen[index];
+        row.url = url;
+        row.depth = depth;
+        row.attempt = attempt;
+        row.etag = etag;
+        row.last_mod_ms = last_mod_ms;
+        row.content_hash = content_hash;
+    }
+
+    if gone.iter().any(|missing| *missing) {
+        let mut alive = gone.iter();
+        chosen.retain(|_| alive.next().is_none_or(|missing| !missing));
+    }
     Ok(())
 }
 
@@ -843,10 +912,15 @@ impl State for SqliteState {
                 }
             }
 
+            // Everything the scan could not reach without leaving the index,
+            // read now that the batch is settled and in the order the ledger
+            // keeps rather than the order the scan produced.
+            let mut chosen = picks.rows;
+            payload(&tx, &mut chosen)?;
+
             // The scans went class by class, so the batch is in class order and
             // has to be put back into the order doc 08.4 promises before it
             // leaves. It is at most `max_urls` long, which is a thousand.
-            let mut chosen = picks.rows;
             chosen.sort_unstable_by(|a, b| {
                 b.priority
                     .cmp(&a.priority)

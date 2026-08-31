@@ -60,27 +60,35 @@ INSERT OR IGNORE INTO pen (
     fetcher, url_key, pld, host, url, depth, priority, discovered_ms
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 
-/// The columns the lease scan reads, and the joins behind them.
+/// The columns the lease scan reads, and the join behind them.
+///
+/// Every ledger column here is one `ledger_ready` carries, which is the whole
+/// point of the list. The scan walks the index in priority order, and priority
+/// order has nothing to do with the key order the ledger is stored in, so a
+/// column that is not in the index costs a random descent into a b-tree the
+/// size of the frontier for every candidate the scan considers. What the lease
+/// needs and the index does not have is fetched afterwards by
+/// [`SELECT_LEASE_PAYLOAD`], in key order, where the same seeks are cheap.
 ///
 /// A host with no record behind it has to behave exactly like `HostRow::new`,
 /// because a host nobody has fetched yet is the normal case at the start of a
 /// crawl and it would be absurd for it to be unleasable. That is what the
 /// `COALESCE` defaults are for, and `the_sql_host_defaults_are_the_rust_ones`
 /// in the tests asserts the literals here are still the constants in umi-state.
+///
+/// `hosts` stays in the scan rather than moving to the second pass, because it
+/// is where most of the clause below lives: a host in cooldown, or blocked, or
+/// out of tier reach, takes its rows out of the candidate set entirely, and a
+/// filter that runs after the batch is chosen is not a filter. It is also the
+/// one table doc 08.3 expects to sit in page cache whole.
 macro_rules! lease_columns {
     () => {
         "
 SELECT ledger.pld                              AS pld,
        ledger.host                             AS host,
        ledger.url_key                          AS url_key,
-       ledger.url                              AS url,
-       ledger.depth                            AS depth,
        ledger.priority                         AS priority,
-       ledger.fetch_count                      AS fetch_count,
        ledger.next_due_ms                      AS next_due_ms,
-       ledger.last_mod_ms                      AS last_mod_ms,
-       ledger.content_hash                     AS content_hash,
-       etags.etag                              AS etag,
        COALESCE(hosts.adaptive_delay_ms, 1000) AS adaptive_delay_ms,
        hosts.crawl_delay_ms                    AS crawl_delay_ms,
        COALESCE(hosts.next_allowed_ms, 0)      AS next_allowed_ms,
@@ -92,7 +100,6 @@ SELECT ledger.pld                              AS pld,
        COALESCE(hosts.lying_revalidator, 0)    AS lying_revalidator
   FROM ledger
   LEFT JOIN hosts ON hosts.host = ledger.host
-  LEFT JOIN etags ON etags.id = ledger.etag_ref
  WHERE "
     };
 }
@@ -103,7 +110,11 @@ SELECT ledger.pld                              AS pld,
 /// The lease clause is not `lease_id IS NULL`. An expired lease is work the
 /// fetcher holding it failed to return, and doc 08.4 says that goes back in the
 /// frontier without anybody having to call `release` for it, so the expiry is
-/// part of the test.
+/// what the test is written on. The two columns are always written together, so
+/// `COALESCE(lease_expires, 0)` says the same thing about the same rows as
+/// `lease_id IS NULL OR lease_expires <= ?1` did, and it says it about a column
+/// schema version 9 put in `ledger_ready`, which is what keeps the scan off the
+/// ledger's primary key b-tree.
 ///
 /// The tier clause is `MIN(preferred, max)` and not `preferred` alone, because
 /// a host whose preferred tier sits above its own ceiling is served at the
@@ -124,7 +135,7 @@ macro_rules! lease_conditions {
         "
    AND ledger.refresh_class = ?3
    AND ledger.next_due_ms <= ?1
-   AND (ledger.lease_id IS NULL OR ledger.lease_expires <= ?1)
+   AND COALESCE(ledger.lease_expires, 0) <= ?1
    AND COALESCE(hosts.blocked, 0) = 0
    AND COALESCE(hosts.refusing, 0) = 0
    AND COALESCE(hosts.next_allowed_ms, 0) <= ?1
@@ -190,6 +201,27 @@ DELETE FROM lease_plds;";
 
 /// One domain the caller will accept work from.
 pub const INSERT_LEASE_PLD: &str = "INSERT OR IGNORE INTO lease_plds (pld) VALUES (?1)";
+
+/// The rest of a chosen row, one key at a time.
+///
+/// This is the half of the old lease query that `ledger_ready` cannot answer:
+/// the url, what it costs to fetch it again, and the revalidators to send with
+/// it. It runs once per row in the batch rather than once per candidate, and the
+/// caller runs it in key order, which is the order `ledger` is stored in, so the
+/// batch is a walk of one b-tree rather than a thousand descents into it. That
+/// is the same thing `complete` does with the same reasoning, and `complete`
+/// measures at 94 microseconds a url on server3 against a frontier where the
+/// out of order version of this cost 2.7 milliseconds.
+pub const SELECT_LEASE_PAYLOAD: &str = "
+SELECT ledger.url          AS url,
+       ledger.depth        AS depth,
+       ledger.fetch_count  AS fetch_count,
+       ledger.last_mod_ms  AS last_mod_ms,
+       ledger.content_hash AS content_hash,
+       etags.etag          AS etag
+  FROM ledger
+  LEFT JOIN etags ON etags.id = ledger.etag_ref
+ WHERE ledger.pld = ?1 AND ledger.host = ?2 AND ledger.url_key = ?3";
 
 /// Mark a row in flight, in the same transaction as the lease it describes.
 pub const MARK_LEASED: &str = "
