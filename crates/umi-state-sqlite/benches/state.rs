@@ -537,7 +537,10 @@ async fn crowding(state: &Arc<SqliteState>, repeat: usize) {
             crowd.push(tokio::spawn(idling(Arc::clone(&stop))));
         }
         if rival {
-            crowd.push(tokio::spawn(admitting(Arc::clone(state), Arc::clone(&stop))));
+            crowd.push(tokio::spawn(admitting(
+                Arc::clone(state),
+                Arc::clone(&stop),
+            )));
         }
 
         let mut best = f64::MAX;
