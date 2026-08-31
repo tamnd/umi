@@ -101,11 +101,18 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             rate: Rate::default(),
-            // Enough domains that one tick can fill a fetcher's batch from
-            // sites that are mostly idle, which is the normal case: a domain
-            // offers one or two URLs a tick and the rest of its frontier is
-            // inside its own politeness windows.
-            max_domains: 64,
+            // One domain per URL in a fetcher's batch, because on a broad
+            // crawl that is the ratio. The old number here was 64, on the
+            // reasoning that a batch of 512 needs 64 domains offering 8 URLs
+            // each. That holds for a focused crawl of a few large sites and is
+            // wrong everywhere else: a broad crawl reaches millions of
+            // domains, almost all of which have one URL due and the rest of
+            // their frontier inside a politeness window, so 64 domains is a
+            // tick of 64 URLs however big the batch is. Doc 16's gate 3.1 asks
+            // for 250 pages a second and doc 07.6 holds a host to one request
+            // at a time, so a tick that visits 64 domains cannot reach the
+            // number by any amount of concurrency.
+            max_domains: 512,
             max_per_host: 8,
             lease_for: Duration::from_secs(60),
             max_depth: MAX_DEPTH,

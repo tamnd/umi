@@ -15,7 +15,7 @@ use std::time::Duration;
 use umi_state::{HostRow, State};
 use umi_types::RowKey;
 
-use crate::run_tests::{Canned, Collected, T0, crawler, page, robots_tick, seeded};
+use crate::run_tests::{Canned, Collected, T0, crawler, page, seeded};
 
 const ORIGIN: &str = "https://example.com";
 
@@ -69,7 +69,6 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
@@ -148,7 +147,6 @@ async fn a_robots_file_the_fetcher_would_not_finish_disallows_the_host() {
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
@@ -183,7 +181,6 @@ async fn a_robots_redirect_off_the_domain_is_followed() {
         .html(&format!("{ORIGIN}/a"), &page("A", &[]));
     let crawler = crawler(fetch, state);
 
-    robots_tick(&crawler, &Collected::default()).await;
     for _ in 0..2 {
         crawler.tick(&Collected::default()).await.expect("tick");
     }
@@ -239,7 +236,6 @@ async fn a_robots_redirect_that_never_lands_disallows_the_host() {
     let state = seeded(&[&format!("{ORIGIN}/a")]).await;
     let crawler = crawler(fetch, state);
 
-    robots_tick(&crawler, &Collected::default()).await;
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.disallowed, 1);
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
@@ -287,14 +283,19 @@ async fn a_crawl_delay_is_clamped_and_reaches_the_host_record() {
         Duration::from_millis(300_000),
         "the pacer is still on its own delay"
     );
-    // The timer this tick set is still the old one, because the completion
-    // owns doc 07.6's pacing columns and runs before the ladder is relearned.
-    // The published delay takes effect from the next request, which is the
-    // right place for it: the request that fetched robots.txt is the one that
-    // had no way of knowing.
+    // The lease that fetched robots.txt read the published delay straight off
+    // the parse and waited it out before sending the page, so the page went
+    // 300 seconds after the file rather than one. That is the whole point of
+    // reading the number here and not off the host record: the record learns
+    // it at the end of this tick and the request that would have broken the
+    // rule is inside the tick.
+    //
+    // The second addend is the old delay and not the clamped one, because the
+    // completion owns doc 07.6's pacing columns and runs before the ladder is
+    // relearned. From the tick after this one both numbers are 300 seconds.
     assert_eq!(
         host.next_allowed_ms,
-        T0 + u64::from(HostRow::INITIAL_DELAY_MS)
+        T0 + 300_000 + u64::from(HostRow::INITIAL_DELAY_MS)
     );
 }
 

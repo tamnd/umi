@@ -74,24 +74,60 @@ const ALERT_FLOOR: usize = 100;
 /// Doc 07.6's delay is applied when a batch is leased, so a batch of one
 /// host's urls comes out of the store already spaced. That is the right place
 /// for a rate, which is a running estimate and belongs to the next decision.
-/// It is the wrong place for one thing: `Retry-After` is not an estimate, it
-/// is an origin naming a time, and a batch that was spaced a second apart
-/// before the origin said "six seconds" has six requests already scheduled
-/// inside the window it just asked us to leave empty. Measured from the
-/// outside on gate 2.3's origin: a 429 asking for six seconds was followed by
-/// another request 960 ms later, from the same batch.
+/// It is the wrong place for two things.
 ///
-/// So the ask is written here as well, and every lease in flight checks it
-/// before it goes out. It lives for one tick because the next tick leases
-/// against a host record the state layer has already moved.
+/// `Retry-After` is not an estimate, it is an origin naming a time, and a
+/// batch that was spaced a second apart before the origin said "six seconds"
+/// has six requests already scheduled inside the window it just asked us to
+/// leave empty. Measured from the outside on gate 2.3's origin: a 429 asking
+/// for six seconds was followed by another request 960 ms later, from the same
+/// batch.
+///
+/// The other thing is that a lease is not always one request. The lease that
+/// finds a host's robots.txt missing fetches the file and then the page, and
+/// the leases behind it were spaced for one request each before any of them
+/// knew that. Two requests off one slot puts two on the origin at the same
+/// instant.
+///
+/// So a tick hands out a host's slots from here rather than trusting the
+/// spacing it was given, and the answer is never earlier than the spacing
+/// asked for. It lives for one tick because the next tick leases against a
+/// host record the state layer has already moved.
 #[derive(Debug, Default)]
 struct HostFloors(Mutex<HashMap<HostId, u64>>);
 
 impl HostFloors {
-    /// The floor for one host, or zero for a host nobody has asked us to wait
-    /// for, which is almost all of them.
-    fn get(&self, host: HostId) -> u64 {
-        self.lock().get(&host).copied().unwrap_or(0)
+    /// Take the next slot on a host and leave the one after it for whoever
+    /// asks next.
+    ///
+    /// `earliest_ms` is the time the state layer already picked for this
+    /// lease, and it is a floor rather than an answer: a host whose slots are
+    /// spoken for further out than that hands out the further one.
+    fn claim(&self, host: HostId, earliest_ms: u64, delay_ms: u32) -> u64 {
+        let mut floors = self.lock();
+        let slot = floors.entry(host).or_default();
+        let at = (*slot).max(earliest_ms);
+        *slot = at + u64::from(delay_ms);
+        at
+    }
+
+    /// A later slot for a lease whose slot went stale while it waited.
+    ///
+    /// [`None`] when it did not, which is the ordinary case. It goes stale
+    /// when [`push`](Self::push) moves the host past the slot this lease was
+    /// holding, and the only thing that does that is an origin naming a time.
+    fn reclaim(&self, host: HostId, held_ms: u64, delay_ms: u32) -> Option<u64> {
+        let mut floors = self.lock();
+        let slot = floors.entry(host).or_default();
+        // The claim left the host at `held_ms + delay_ms`, so anything past
+        // that is somebody else moving it and anything at or before it is this
+        // lease's own reservation looking back at itself.
+        if *slot <= held_ms + u64::from(delay_ms) {
+            return None;
+        }
+        let at = *slot;
+        *slot = at + u64::from(delay_ms);
+        Some(at)
     }
 
     /// Move a host's floor out, never in. Two origins behind one host name
@@ -310,19 +346,16 @@ pub struct TickReport {
     pub emulated: usize,
     /// Leases fetched at T3 or above.
     ///
-    /// Counted where doc 05.9's budget grants the slot, which is before the
-    /// lease finds out whether it has to spend itself on the host's
-    /// robots.txt. One that does gives the slot back and this number is a
-    /// render high for that tick, once per host per day.
+    /// Counted where doc 05.9's budget grants the slot, which is where the
+    /// lease is allowed to open a browser and not where it does.
     pub rendered: usize,
     /// Leases given back to the frontier without an answer.
     ///
-    /// Two things end up here. Doc 05.9's render budget turns some T3 leases
-    /// away, and the lease that has to fetch a host's robots.txt spends its
-    /// slot on that file instead of on its page. Both keep their due time and
-    /// their priority and the next tick offers the most important of them
-    /// again. They are not failures and no row exists for them, which is why
-    /// they are counted apart from everything else.
+    /// One thing ends up here: doc 05.9's render budget turns some T3 leases
+    /// away. They keep their due time and their priority and the next tick
+    /// offers the most important of them again. They are not failures and no
+    /// row exists for them, which is why they are counted apart from
+    /// everything else.
     pub deferred: usize,
     /// Whether doc 15.3's ladder is what kept this tick small.
     ///
@@ -655,7 +688,6 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 links_seen,
                 disallowed,
                 unchanged,
-                give_back,
                 signal,
             } = done;
 
@@ -679,15 +711,6 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 if learned.teaches() {
                     learn(&mut signals, learned);
                 }
-            }
-            // After the signal, because a lease that spent its slot on
-            // robots.txt still learned what the file said and that is the one
-            // lease a day that knows it. Before everything else, because there
-            // is no answer here to record: the url keeps its due time and the
-            // next tick offers it again.
-            if give_back {
-                deferred.push(outcome.lease);
-                continue;
             }
             // Counted off the completion rather than off the row, because a
             // 304 has no row. Everything else does.
@@ -916,35 +939,52 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         Ok(moved)
     }
 
+    /// Take a slot on a host and hold the lease until it comes round.
+    ///
+    /// Doc 07.6, and the whole reason `not_before_ms` exists. The state layer
+    /// already spaced the leases of a batch by each host's politeness delay,
+    /// and until this existed the loop threw that away and sent the batch as
+    /// fast as the window allowed. A crawl asking for one request a second put
+    /// four on blog.rust-lang.org inside 138 ms, which is the kind of mistake
+    /// the origin sees and we do not.
+    ///
+    /// A loop and not one sleep, because the wait can grow while it is being
+    /// served. An origin that answers one lease of a batch with `Retry-After`
+    /// is asking for the rest to move, and waking up to find the slot gone is
+    /// the ordinary case for that, not an error.
+    ///
+    /// The slot it settled on comes back, because a lease that makes a second
+    /// request measures the delay from the first one going out and not from
+    /// the clock it reads when the answer lands. The second of those includes
+    /// however long the origin took to answer, which would make a slow origin
+    /// wait longer than a fast one for no reason anybody asked for.
+    async fn wait_for(
+        &self,
+        host: HostId,
+        earliest_ms: u64,
+        delay_ms: u32,
+        floors: &HostFloors,
+    ) -> u64 {
+        let mut at = floors.claim(host, earliest_ms, delay_ms);
+        loop {
+            self.clock.sleep_until_ms(at).await;
+            let Some(again) = floors.reclaim(host, at, delay_ms) else {
+                return at;
+            };
+            at = again;
+        }
+    }
+
     /// One lease, from robots check to row.
     ///
     /// `start_ms` is when it may go out, which is its politeness time and, for
     /// a rendered page, the render slot doc 05.9's budget gave it.
     async fn one(&self, lease: umi_state::Lease, start_ms: u64, floors: &HostFloors) -> Fetched {
-        // Doc 07.6, and the whole reason `not_before_ms` exists. The state
-        // layer already spaced the leases of a batch by each host's politeness
-        // delay, and until this line the loop threw that away and sent the
-        // batch as fast as the window allowed. A crawl asking for one request a
-        // second put four on blog.rust-lang.org inside 138 ms, which is the
-        // kind of mistake the origin sees and we do not.
-        //
         // Before the robots check rather than after, since robots.txt is a
         // request to the same host and counts the same way.
-        //
-        // A loop and not one sleep, because the wait can grow while it is
-        // being served. This batch was spaced at lease time and an origin that
-        // answers one of it with `Retry-After` is asking for the rest to move,
-        // which is what [`HostFloors`] carries. Waking up to find the wait
-        // longer than it was is the ordinary case for that, not an error.
-        let mut until = start_ms;
-        loop {
-            self.clock.sleep_until_ms(until).await;
-            let floor = floors.get(lease.key.host);
-            if floor <= self.clock.now_ms() {
-                break;
-            }
-            until = floor;
-        }
+        let slot = self
+            .wait_for(lease.key.host, start_ms, lease.delay_ms, floors)
+            .await;
 
         let now = || self.clock.now_ms();
         let Some(origin) = origin_of(&lease.url) else {
@@ -966,32 +1006,42 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         // other lease on this host today read the same entry out of the cache
         // and has nothing to say the host record does not already hold.
         let robots = robots_fetched.then(|| RobotsFacts::of(&entry));
-        // Doc 07.6, and the reason the sleep above is before the robots check
-        // rather than after it: robots.txt is a request to the same host and
-        // counts the same way. The state layer spaced this lease out for one
-        // request, so the lease that fetched the file has spent its slot and
-        // the page waits for the next one. The url keeps its due time and the
-        // next tick offers it again, so this costs a tick per host per day and
-        // no extra request at all.
-        //
-        // Measured from the outside before it was written: gate 2.3's origin
-        // logged robots.txt and the front page six milliseconds apart.
-        if robots_fetched {
-            // A T3 lease was holding one of doc 05.9's render slots, taken
-            // before anything here knew there was a robots.txt to fetch. No
-            // browser ran, so the slot goes back. The guard is the tier and
-            // not whether a slot was granted, because the one case that
-            // reaches here without a grant is a process with no browser at
-            // all, and `refund` on that process does nothing.
-            if lease.tier >= Tier::Rendered {
-                self.render.refund();
-            }
-            return Fetched::robots_cost(&lease, now()).taught(&lease, robots);
-        }
         if !decision.is_allowed() {
             let mut out = Fetched::excluded(&lease, now(), umi_state::ExcludeReason::Robots);
             out.disallowed = true;
             return out.taught(&lease, robots);
+        }
+        // Doc 07.6 again, and the reason the wait above is before the robots
+        // check rather than after it: robots.txt is a request to the same host
+        // and counts the same way. The state layer spaced this lease out for
+        // one request and the lease has now made it, so the page waits out a
+        // second delay here before it goes.
+        //
+        // Waiting and not returning. The first shape of this gave the lease
+        // back to the frontier so that the next tick would offer the page, on
+        // the grounds that this costs a tick per host per day. It costs far
+        // more than a tick. The frontier visits `max_domains` domains a tick,
+        // so a host that spends its lease on robots.txt is not offered again
+        // until the whole rotation comes round, and on a broad crawl that is
+        // most of the frontier. Measured on server3 against a twenty thousand
+        // host seed: twelve minutes of crawling fetched 2,074 robots.txt files
+        // and zero pages, because every lease in every tick was the first
+        // lease its host had ever had and gave itself back. Waiting here makes
+        // the same two requests to the same host in the same order with the
+        // same spacing, and the second one is a page.
+        //
+        // The delay is the host's, or the file's own `Crawl-delay` when that
+        // is longer. The host record has not learned the file yet, since this
+        // is the lease that fetched it, so the number has to come off the
+        // parse rather than off the lease.
+        if robots_fetched {
+            let stated = entry
+                .robots
+                .crawl_delay()
+                .map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
+            let delay = stated.max(lease.delay_ms);
+            self.wait_for(lease.key.host, slot + u64::from(delay), delay, floors)
+                .await;
         }
 
         let robots_checked_ms = entry.fetched_ms;
@@ -1237,7 +1287,6 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             links_seen,
             disallowed: false,
             unchanged,
-            give_back: false,
             signal: learned,
         }
         .taught(&lease, robots)
@@ -1376,15 +1425,6 @@ struct Fetched {
     /// the completion goes back, and the host learns that its validators are
     /// worth nothing.
     unchanged: bool,
-    /// Whether this lease is going back on the queue with no answer.
-    ///
-    /// One case, and it is doc 07.6's rate rather than doc 05.9's budget: this
-    /// is the lease that found the host's robots.txt missing and fetched it.
-    /// That file is a request to the same origin as the page, and the state
-    /// layer spaced this lease out for one request, so sending the page as
-    /// well would put two on the origin at once. Giving the lease back costs a
-    /// tick and costs the origin nothing.
-    give_back: bool,
     /// What the answer said about the tier it came back on, when it said
     /// anything. A robots exclusion and a malformed URL say nothing, because
     /// no request was sent.
@@ -1613,23 +1653,6 @@ impl Fetched {
         Self::answered(lease, now_ms, FetchResult::Excluded { reason })
     }
 
-    /// A lease that spent its slot on robots.txt.
-    ///
-    /// The url is untouched and comes straight back, at the due time it
-    /// already had, which the state layer has already moved past this
-    /// request. Doc 08.3's `Refused` is what the release says, because that is
-    /// what happened: the loop declined this work now and the page has not
-    /// failed at anything.
-    fn robots_cost(lease: &umi_state::Lease, now_ms: u64) -> Self {
-        // The outcome is built and thrown away. `give_back` sends the lease
-        // down the release path instead, and building one anyway keeps this
-        // constructor the same shape as the others rather than making
-        // `outcome` an `Option` that only one caller ever leaves empty.
-        let mut out = Self::excluded(lease, now_ms, umi_state::ExcludeReason::Robots);
-        out.give_back = true;
-        out
-    }
-
     /// A lease whose URL this fetcher could not send at all.
     ///
     /// `Malformed` rather than `Excluded`, because exclusion is a decision
@@ -1666,7 +1689,6 @@ impl Fetched {
             links_seen: 0,
             disallowed: false,
             unchanged: false,
-            give_back: false,
             signal: None,
         }
     }
