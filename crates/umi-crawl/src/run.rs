@@ -277,6 +277,15 @@ pub struct TickReport {
     pub bytes_fetched: u64,
     /// Conditional requests that held.
     pub not_modified: usize,
+    /// Fetches that came back with a full body carrying the text we already
+    /// had, so no row was written.
+    ///
+    /// The expensive version of `not_modified`, and the ratio between the two
+    /// is what doc 05.3's first trap looks like from the outside. A number
+    /// that climbs means origins are ignoring the validators we send, which
+    /// costs bandwidth and nothing else: the pages are not lost, they are the
+    /// pages we already have.
+    pub unchanged: usize,
     /// Answers that were a failure of some kind.
     pub failed: usize,
     /// URLs robots.txt said no to, which are completed as excluded and never
@@ -645,6 +654,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 links,
                 links_seen,
                 disallowed,
+                unchanged,
                 give_back,
                 signal,
             } = done;
@@ -692,7 +702,14 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
                 report.bytes_fetched += u64::from(row.content_length);
                 report.links_seen += links_seen;
                 candidates.extend(links);
-                rows.push(row);
+                // The bytes and the links are counted either way, because we
+                // paid for both. Only the row is dropped, and only when it
+                // would be the second copy of one already published.
+                if unchanged {
+                    report.unchanged += 1;
+                } else {
+                    rows.push(row);
+                }
             }
             outcomes.push(outcome);
         }
@@ -1178,6 +1195,27 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             }
         };
 
+        // The row we would be publishing is the row we published last time,
+        // with a later timestamp on it. Doc 05.3 already refuses to write one
+        // of these when the origin says 304, and an origin that says it with a
+        // full body has not made it a different page. Gate 2.1's segments
+        // carry 1,778 of them in 79,628 rows, which is a fifth of a percent of
+        // the corpus that is a byte for byte copy of something already in it.
+        //
+        // The completion still goes back carrying the content hash, so the
+        // freshness estimator counts an unchanged observation and the schedule
+        // moves exactly as a 304 would have moved it.
+        //
+        // Text and not bytes, and only where there is text. Two fetches of a
+        // PDF both extract to nothing, and treating that as evidence the file
+        // has not moved would quietly stop recording every non HTML url after
+        // its first visit. An audited fetch is left alone as well: that one
+        // asked without a validator on purpose and its body is the record.
+        let unchanged = !audited
+            && row.outcome == umi_types::OutcomeCode::Ok
+            && row.text_bytes > 0
+            && lease.content_hash == Some(content_hash(&row));
+
         let outcome = FetchOutcome {
             lease: lease.id,
             key: lease.key,
@@ -1198,6 +1236,7 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
             links,
             links_seen,
             disallowed: false,
+            unchanged,
             give_back: false,
             signal: learned,
         }
@@ -1227,7 +1266,12 @@ impl<F: Fetch, C: Clock> Crawler<F, C> {
         self.clock
             .sleep_until_ms(self.clock.now_ms().saturating_add(delay))
             .await;
-        match self.fetch.fetch(&lease.url, None, lease.tier).await {
+        // T1 and not the lease's tier, when the lease was T0. The whole point
+        // of the audit is that this request carries no validator, and a tier
+        // path saying T0 would put a conditional request in the published
+        // column for a request that deliberately was not one.
+        let tier = lease.tier.max(Tier::Plain);
+        match self.fetch.fetch(&lease.url, None, tier).await {
             Ok(fresh) if matches!(fresh.outcome, Outcome::Ok(_)) => (fresh.outcome, true),
             _ => (outcome, false),
         }
@@ -1322,6 +1366,16 @@ struct Fetched {
     links: Vec<(String, u8)>,
     links_seen: usize,
     disallowed: bool,
+    /// Whether the row is a copy of one we have already published.
+    ///
+    /// Doc 05.3 says a 304 writes no row, because a revalidation is an
+    /// observation and not a new version. An origin that ignored the validator
+    /// and spent a full body on text we already hold has said the same thing
+    /// the expensive way, and this is where the row it would have left behind
+    /// is dropped. Everything else the fetch produced is kept: the links go in,
+    /// the completion goes back, and the host learns that its validators are
+    /// worth nothing.
+    unchanged: bool,
     /// Whether this lease is going back on the queue with no answer.
     ///
     /// One case, and it is doc 07.6's rate rather than doc 05.9's budget: this
@@ -1611,6 +1665,7 @@ impl Fetched {
             links: Vec::new(),
             links_seen: 0,
             disallowed: false,
+            unchanged: false,
             give_back: false,
             signal: None,
         }

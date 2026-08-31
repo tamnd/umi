@@ -1787,6 +1787,120 @@ async fn three_full_bodies_for_a_conditional_request_drop_t0() {
         .expect("a record")
         .tier;
     assert_eq!(policy.weak_hits, umi_state::TierPolicy::WEAK_HITS_TO_DROP);
+
+    // And after five fetches of a page that has said the same thing every
+    // time, the corpus holds one copy of it. This is what the origin cost us
+    // and what it did not: four full bodies of bandwidth, and no duplicate
+    // rows.
+    assert_eq!(sink.rows().len(), 1, "the same page was published twice");
+}
+
+#[tokio::test]
+async fn a_refresh_holding_a_validator_is_leased_at_t0() {
+    // The rung the crawl was missing. Gate 2.1 fetched 79,628 pages and not
+    // one of them went out conditionally, because the tier on a lease came off
+    // the host ladder and the ladder has no way to know that this particular
+    // url has an etag sitting in the ledger. At 250 pages a second the
+    // difference is around 43 MB a second of bodies against a few hundred
+    // kilobytes of 304s.
+    let url = "https://example.com/a";
+    let state = seeded(&[url]).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Cache::new(
+        url,
+        Mode::Honest,
+        &page("A", &[]),
+        Canned::new().robots("https://example.com", "User-agent: *\nAllow: /\n"),
+    ));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        Arc::clone(&state),
+        Arc::clone(&clock),
+        config(),
+    );
+    let sink = Collected::default();
+
+    robots_tick(&crawler, &sink).await;
+    crawler.tick(&sink).await.expect("tick");
+    let rows = sink.rows();
+    assert_eq!(
+        rows[0].tier_used,
+        Tier::Plain.as_u8(),
+        "a first fetch is T1"
+    );
+
+    clock.advance(PAST_MAX_REFRESH);
+    let req = umi_state::LeaseRequest::new(FetcherId::LOCAL, clock.now_ms(), 4);
+    let leases = state.lease(&req).await.expect("lease");
+    let due = leases
+        .iter()
+        .find(|lease| lease.url == url)
+        .expect("the page is due again");
+    assert_eq!(
+        due.tier,
+        Tier::Revalidate,
+        "a refresh with an etag in hand was not leased at T0"
+    );
+    assert!(due.revalidate.is_some(), "the etag never left the ledger");
+
+    // And the host ladder is not dragged down with it. The next url on this
+    // host has nothing to revalidate and has to be leased at T1.
+    let host = umi_types::RowKey::for_url(url, None)
+        .expect("a crawlable url")
+        .host;
+    let policy = state
+        .host(host)
+        .await
+        .expect("host")
+        .expect("a record")
+        .tier;
+    assert_eq!(policy.preferred, Tier::Plain);
+}
+
+#[tokio::test]
+async fn a_full_body_that_has_not_changed_writes_no_second_row() {
+    // Doc 05.3 says a 304 writes no row. An origin that ignores the validator
+    // and answers with the body we already have has told us the same thing and
+    // charged us for it, and the row it would leave behind is a byte for byte
+    // copy of one already published. Gate 2.1's output has 1,778 of these in
+    // 79,628 rows.
+    let url = "https://example.com/a";
+    let state = seeded(&[url]).await;
+    let clock = Arc::new(FixedClock::at(T0));
+    let fetch = Arc::new(Cache::new(
+        url,
+        Mode::Weak,
+        &page("A", &[]),
+        Canned::new().robots("https://example.com", "User-agent: *\nAllow: /\n"),
+    ));
+    let crawler = Crawler::new(
+        Arc::clone(&fetch),
+        Arc::clone(&state),
+        Arc::clone(&clock),
+        config(),
+    );
+    let sink = Collected::default();
+
+    robots_tick(&crawler, &sink).await;
+    let first = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(first.rows, 1);
+    assert_eq!(first.unchanged, 0, "a first fetch has nothing to match");
+
+    clock.advance(PAST_MAX_REFRESH);
+    robots_tick(&crawler, &sink).await;
+    let second = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(second.fetched, 1, "the body arrived and was paid for");
+    assert_eq!(second.unchanged, 1, "the body was the one we already had");
+    assert_eq!(second.rows, 0, "a page that did not change wrote a row");
+    assert_eq!(sink.rows().len(), 1);
+
+    // The schedule still moved, exactly as a 304 would have moved it, so the
+    // url is not offered straight back.
+    let req = umi_state::LeaseRequest::new(FetcherId::LOCAL, clock.now_ms() + 60_000, 4);
+    assert!(
+        state.lease(&req).await.expect("lease").is_empty(),
+        "an unchanged page was left due again"
+    );
 }
 
 #[tokio::test]
@@ -1854,11 +1968,16 @@ async fn a_304_contradicted_by_the_body_disables_t0_for_the_host() {
     // answer 304 again and the page cannot freeze.
     clock.advance(PAST_MAX_REFRESH);
     robots_tick(&crawler, &sink).await;
-    crawler.tick(&sink).await.expect("tick");
+    let last = crawler.tick(&sink).await.expect("tick");
     assert_eq!(fetch.conditional(), vec![false, true, false, false]);
+    // That last fetch came back with the body the audit already stored, so it
+    // is an observation and not a version, and it keeps no row.
+    assert_eq!(last.fetched, 1);
+    assert_eq!(last.unchanged, 1);
+    assert_eq!(last.rows, 0);
 
     let rows = sink.rows();
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 2);
     assert!(
         rows[1].text_digest != rows[0].text_digest,
         "the audit stored the body the 304 was hiding"

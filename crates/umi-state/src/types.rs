@@ -1049,6 +1049,34 @@ impl TierPolicy {
         self.wants(now_ms).min(fetcher_max)
     }
 
+    /// The rung a lease finally runs on, once it is known whether there is a
+    /// validator to send with it.
+    ///
+    /// Doc 05.3's T0 is the one rung that is not a property of the host. The
+    /// ladder is per host and a validator is per url, so
+    /// [`start_at`](Self::start_at) cannot produce a T0 lease on its own, and
+    /// before this nothing else produced one either. Gate 2.1 fetched 79,628
+    /// pages without a single conditional request among them, which is how
+    /// 3,579 of those rows came to be second copies of a page that had not
+    /// changed.
+    ///
+    /// Only T1 becomes T0. T0 is the plain client with `If-None-Match` on it,
+    /// so a host that needs a browser keeps the rung it needs and sends its
+    /// validators from up there, and a host that needs nothing gets the cheap
+    /// request. At steady state most of a crawl is a refresh, and the
+    /// difference between those two is a 304 of about 500 bytes against a page
+    /// of about 170 KB.
+    #[must_use]
+    pub const fn rung(start: Tier, conditional: bool) -> Tier {
+        // By byte rather than by `==`, which is not something a const fn can
+        // call on an enum on 1.98.
+        if conditional && start.as_u8() == Tier::Plain.as_u8() {
+            Tier::Revalidate
+        } else {
+            start
+        }
+    }
+
     /// Whether this host is worth offering to a fetcher limited to
     /// `fetcher_max`. A host that only answers above what the fetcher can do
     /// is a wasted lease.
@@ -1091,6 +1119,13 @@ impl TierPolicy {
     /// false, and is never written back, so the ladder costs a healthy crawl
     /// nothing at all.
     pub fn observe(&mut self, signal: TierSignal, tier_used: Tier, now_ms: u64) -> bool {
+        // T0 is not a rung the ladder can rest on. It is T1 carrying a
+        // validator, so what a 304 proves is that T1 works, and letting it
+        // through as itself would pin `preferred` at T0 for the host. The next
+        // url on that host with nothing to revalidate would then be leased at a
+        // tier it cannot use, and the published column would say a conditional
+        // request was made when none was.
+        let tier_used = tier_used.max(Tier::Plain);
         let before = *self;
         match signal {
             TierSignal::Success => {
