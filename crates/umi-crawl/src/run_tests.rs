@@ -423,7 +423,7 @@ impl Sink for Broken {
     }
 }
 
-fn config() -> CrawlConfig {
+pub(crate) fn config() -> CrawlConfig {
     CrawlConfig {
         fetcher: FetcherId::LOCAL,
         batch: 64,
