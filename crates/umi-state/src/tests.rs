@@ -541,6 +541,36 @@ fn a_shell_asks_for_a_browser_and_the_weekly_probe_takes_it_back() {
 }
 
 #[test]
+fn a_validator_turns_the_plain_rung_into_the_conditional_one() {
+    // T0 is the only rung that depends on the url rather than on the host, so
+    // it is the only one `start_at` cannot decide on its own.
+    assert_eq!(TierPolicy::rung(Tier::Plain, true), Tier::Revalidate);
+    assert_eq!(TierPolicy::rung(Tier::Plain, false), Tier::Plain);
+    // Everything above T1 keeps the rung it needs. A browser sends the
+    // validators too, and calling that T0 would say a plain client fetched a
+    // page it never saw.
+    for tier in [Tier::Emulated, Tier::Rendered, Tier::Supervised] {
+        assert_eq!(TierPolicy::rung(tier, true), tier);
+    }
+}
+
+#[test]
+fn a_conditional_success_does_not_pin_the_host_below_t1() {
+    // A 304 proves T1 works, because T0 is T1 carrying a validator. Reading it
+    // as a rung of its own would de-escalate the host to T0 and then lease the
+    // next url on it at a tier that url has nothing to send at.
+    let mut policy = TierPolicy::new();
+    assert!(!policy.observe(TierSignal::Success, Tier::Revalidate, T0));
+    assert_eq!(policy.preferred, Tier::Plain);
+    assert_eq!(policy.last_success, Tier::Plain);
+
+    // A block at T0 still climbs, because a host refusing a conditional GET is
+    // a host refusing a GET.
+    assert!(policy.observe(TierSignal::Blocked, Tier::Revalidate, T0 + HOUR));
+    assert_eq!(policy.preferred, Tier::Emulated);
+}
+
+#[test]
 fn a_healthy_host_learns_nothing_and_is_never_written_back() {
     // The return value is what keeps the ladder off the hot path, so it is
     // worth a test of its own: an ordinary page from an ordinary host must

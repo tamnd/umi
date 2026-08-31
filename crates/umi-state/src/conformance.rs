@@ -37,7 +37,7 @@ use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 use crate::{
     BlockRow, Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow,
     LeaseRequest, NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow,
-    State, Stream, SupervisionRow, retry_after_ms,
+    State, Stream, SupervisionRow, TierPolicy, retry_after_ms,
 };
 
 /// A fixed instant to run every case from, so nothing in here depends on when
@@ -182,6 +182,8 @@ where
     run!(an_excluded_url_is_never_leased_again);
     run!(a_failed_url_comes_back_only_after_its_backoff);
     run!(a_revalidator_comes_back_on_the_next_lease);
+    run!(a_url_with_a_validator_is_leased_at_t0);
+    run!(a_host_that_ignores_validators_is_leased_at_t1_again);
     run!(a_page_that_changed_comes_back_sooner_than_one_that_did_not);
     run!(discovery_cannot_take_the_whole_batch_from_refresh);
     run!(a_higher_priority_url_is_leased_first);
@@ -728,6 +730,101 @@ async fn a_revalidator_comes_back_on_the_next_lease(state: &dyn State) -> Outcom
         revalidate.etag.as_deref(),
         Some("\"abc\""),
         "the etag came back changed"
+    );
+    Ok(())
+}
+
+async fn a_url_with_a_validator_is_leased_at_t0(state: &dyn State) -> Outcome {
+    // Doc 05.3's rung, and the one the crawl was missing. A first fetch has
+    // nothing to revalidate against and runs at T1, and the refresh after it
+    // has an etag and runs at T0, which is the same client with
+    // `If-None-Match` on it. Without this the refresh spends a full body to
+    // find out the page has not changed, and the segment gets a second copy of
+    // a row it already published.
+    admit_all(state, &[host_url(1)]).await?;
+    let first = lease_one(state, T0).await?;
+    ensure_eq!(first.len(), 1, "nothing was leased");
+    ensure_eq!(
+        first[0].tier,
+        Tier::Plain,
+        "a url with nothing to revalidate should be leased at T1"
+    );
+
+    state
+        .complete(&[FetchOutcome {
+            lease: first[0].id,
+            key: first[0].key,
+            finished_ms: T0 + 500,
+            tier_used: Tier::Plain,
+            pace: Pace::default(),
+            result: FetchResult::Fetched {
+                status: 200,
+                content_hash: crate::memory::content_hash("hello"),
+                revalidate: Revalidator {
+                    etag: Some("\"abc\"".to_owned()),
+                    last_modified_ms: None,
+                },
+            },
+        }])
+        .await
+        .map_err(|e| format!("complete failed: {e}"))?;
+
+    let refresh = lease_one(state, T0 + 90 * DAY).await?;
+    ensure_eq!(refresh.len(), 1, "the url never came due for refresh");
+    ensure_eq!(
+        refresh[0].tier,
+        Tier::Revalidate,
+        "a refresh holding an etag should be leased at T0"
+    );
+    Ok(())
+}
+
+async fn a_host_that_ignores_validators_is_leased_at_t1_again(state: &dyn State) -> Outcome {
+    // The other half of doc 05.3. A host that has ignored our validators
+    // enough times to be believed gets no conditional request, and a lease
+    // with nothing to send is not a T0 lease. The two have to move together:
+    // a T0 lease with no `If-None-Match` on it is a plain GET wearing the
+    // wrong label, and the label is published.
+    let url = host_url(1);
+    admit_all(state, std::slice::from_ref(&url)).await?;
+    let first = lease_one(state, T0).await?;
+    ensure_eq!(first.len(), 1, "nothing was leased");
+    state
+        .complete(&[FetchOutcome {
+            lease: first[0].id,
+            key: first[0].key,
+            finished_ms: T0 + 500,
+            tier_used: Tier::Plain,
+            pace: Pace::default(),
+            result: FetchResult::Fetched {
+                status: 200,
+                content_hash: crate::memory::content_hash("hello"),
+                revalidate: Revalidator {
+                    etag: Some("\"abc\"".to_owned()),
+                    last_modified_ms: None,
+                },
+            },
+        }])
+        .await
+        .map_err(|e| format!("complete failed: {e}"))?;
+
+    let mut host = HostRow::new(key(&url).host, key(&url).pld);
+    host.tier.weak_hits = TierPolicy::WEAK_HITS_TO_DROP;
+    state
+        .put_host(&[host])
+        .await
+        .map_err(|e| format!("put_host failed: {e}"))?;
+
+    let refresh = lease_one(state, T0 + 90 * DAY).await?;
+    ensure_eq!(refresh.len(), 1, "the url never came due for refresh");
+    ensure!(
+        refresh[0].revalidate.is_none(),
+        "a host that ignores validators was still sent one"
+    );
+    ensure_eq!(
+        refresh[0].tier,
+        Tier::Plain,
+        "a lease with no validator to send should not be at T0"
     );
     Ok(())
 }

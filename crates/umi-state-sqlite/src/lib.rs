@@ -872,6 +872,12 @@ impl State for SqliteState {
                         etag: row.etag.clone(),
                         last_modified_ms: (row.last_mod_ms != 0).then_some(row.last_mod_ms),
                     };
+                    // A host that lies about its revalidators, or ignores
+                    // them, gets unconditional requests, per doc 05.3. Sending
+                    // one it will not honour costs a round trip and saves
+                    // nothing.
+                    let revalidate =
+                        (!revalidate.is_empty() && row.conditional).then_some(revalidate);
                     leases.push(Lease {
                         id,
                         key: row.key,
@@ -879,17 +885,12 @@ impl State for SqliteState {
                         depth: row.depth,
                         priority: row.priority,
                         attempt: row.attempt,
-                        tier: row.tier,
+                        tier: TierPolicy::rung(row.tier, revalidate.is_some()),
                         probe: row.probe,
                         not_before_ms,
                         delay_ms: u32::try_from(row.delay_ms).unwrap_or(u32::MAX),
                         expires_ms,
-                        // A host that lies about its revalidators, or ignores
-                        // them, gets unconditional requests, per doc 05.3.
-                        // Sending one it will not honour costs a round trip
-                        // and saves nothing.
-                        revalidate: (!revalidate.is_empty() && row.conditional)
-                            .then_some(revalidate),
+                        revalidate,
                         content_hash: (row.content_hash != [0u8; 8]).then_some(row.content_hash),
                     });
                 }

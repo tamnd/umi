@@ -28,7 +28,7 @@ use crate::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,
     Priority, Quotas, RefreshClass, Result, Revalidator, SegmentQuery, SegmentRow, State,
-    StateStats, SupervisionRow, UrlState, next_due_dated, retry_after_ms,
+    StateStats, SupervisionRow, TierPolicy, UrlState, next_due_dated, retry_after_ms,
 };
 
 /// A [`State`] that lives entirely in memory.
@@ -489,6 +489,29 @@ impl State for MemoryState {
                 etag: inner.etag(row.etag_ref),
                 last_modified_ms: (row.last_mod_ms != 0).then_some(row.last_mod_ms),
             };
+            // A host that lies about its revalidators, or ignores them, gets
+            // unconditional requests, per doc 05.3. Sending one it will not
+            // honour costs a round trip and saves nothing.
+            let revalidate =
+                (!revalidate.is_empty() && host.tier.conditional()).then_some(revalidate);
+            // Doc 05.7's allowlist is the only thing in the system that
+            // produces a T4 lease. It is checked here rather than when the
+            // entry is written, for the same reason a block is checked here: a
+            // URL that arrived after the entry did would otherwise never see
+            // it. A fetcher that has not opted in to supervised work never gets
+            // one, because `max_tier` is what it said it would run and this
+            // cannot exceed it.
+            let start = if req.max_tier >= Tier::Supervised
+                && inner
+                    .supervision
+                    .get(&key.pld)
+                    .is_some_and(SupervisionRow::in_force)
+            {
+                Tier::Supervised
+            } else {
+                host.tier.start_at(req.max_tier, req.now_ms)
+            };
+            let tier = TierPolicy::rung(start, revalidate.is_some());
 
             let entry = inner.ledger.get_mut(&key).expect("chosen from this map");
             entry.lease = Some(InFlight { id, expires_ms });
@@ -501,32 +524,12 @@ impl State for MemoryState {
                 depth: row.depth,
                 priority: row.priority,
                 attempt: row.fetch_count,
-                // Doc 05.7's allowlist is the only thing in the system that
-                // produces a T4 lease. It is checked here rather than when the
-                // entry is written, for the same reason a block is checked
-                // here: a URL that arrived after the entry did would otherwise
-                // never see it. A fetcher that has not opted in to supervised
-                // work never gets one, because `max_tier` is what it said it
-                // would run and this cannot exceed it.
-                tier: if req.max_tier >= Tier::Supervised
-                    && inner
-                        .supervision
-                        .get(&key.pld)
-                        .is_some_and(SupervisionRow::in_force)
-                {
-                    Tier::Supervised
-                } else {
-                    host.tier.start_at(req.max_tier, req.now_ms)
-                },
+                tier,
                 probe: host.tier.probing(req.now_ms),
                 not_before_ms,
                 delay_ms: u32::try_from(delay).unwrap_or(u32::MAX),
                 expires_ms,
-                // A host that lies about its revalidators, or ignores them,
-                // gets unconditional requests, per doc 05.3. Sending one it
-                // will not honour costs a round trip and saves nothing.
-                revalidate: (!revalidate.is_empty() && host.tier.conditional())
-                    .then_some(revalidate),
+                revalidate,
                 content_hash: (row.content_hash != [0u8; 8]).then_some(row.content_hash),
             });
         }
