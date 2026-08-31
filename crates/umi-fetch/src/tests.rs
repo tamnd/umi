@@ -593,6 +593,58 @@ async fn an_origin_that_trickles_forever_hits_the_total_timeout() {
     );
 }
 
+#[tokio::test]
+async fn a_robots_txt_gives_up_on_its_own_budget_and_not_the_page_one() {
+    // One origin, two budgets. It answers in about half a second, which is
+    // inside the page budget and well outside the robots one, so the only thing
+    // that decides the answer is which of the two leashes the fetch was given.
+    // That is the whole point of the split: the file that gates every host on
+    // the web is not worth a page's patience when the median one arrives in
+    // well under a second and the tail never arrives at all.
+    //
+    // Trickled rather than delayed in one piece, because the harness has no
+    // "wait and then answer" reply and because a gap under the read timeout is
+    // a closer model of the hosts this is aimed at than a dead socket is.
+    let origin = Origin::start(|_| Reply::Trickle {
+        bytes: b"HTTP/1.1 200 X\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_vec(),
+        piece: 16,
+        gap: Duration::from_millis(150),
+    })
+    .await;
+
+    let config = FetchConfig {
+        connect_timeout: Duration::from_millis(500),
+        read_timeout: Duration::from_secs(1),
+        total_timeout: Duration::from_secs(5),
+        robots_timeout: Duration::from_millis(200),
+        ..FetchConfig::default()
+    };
+    let client = fetcher(config);
+
+    let page = client
+        .fetch(&origin.url("/"), None)
+        .await
+        .expect("the url parses");
+    assert!(
+        matches!(page, Outcome::Ok(_)),
+        "the page budget should have covered this: {page:?}"
+    );
+
+    let robots = client
+        .fetch_robots(&origin.url("/robots.txt"))
+        .await
+        .expect("the url parses");
+    assert_eq!(
+        robots,
+        Outcome::Failed {
+            status: None,
+            failure: Failure::Timeout(Stage::Total),
+            retry_after: None,
+        },
+        "robots.txt was given the page budget"
+    );
+}
+
 /// One status, the headers that came with it, and what the pair should mean.
 struct Case {
     status: u16,

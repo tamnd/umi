@@ -132,6 +132,30 @@ pub struct FetchConfig {
     pub read_timeout: Duration,
     /// The whole fetch, connect to last byte. Doc 05.4 says 30 seconds.
     pub total_timeout: Duration,
+    /// The whole fetch of a robots.txt, which gets a shorter leash than a page.
+    ///
+    /// Doc 05.4's thirty seconds is a budget for a document somebody wants. A
+    /// robots.txt is not that. It is a toll gate every host charges once, it is
+    /// two kilobytes when it exists, and a host that has not answered for it in
+    /// six seconds is not about to hand us a page worth having either.
+    ///
+    /// Six seconds because of what the web actually does. Five hundred hosts
+    /// off the real seed list, sixty four at a time from server3, on the ten
+    /// and thirty second budget: median 695 ms, p90 10004 ms, p99 30000 ms,
+    /// mean 3749 ms. The p90 is the connect timeout to the millisecond, so more
+    /// than a tenth of hosts never complete a handshake and each one holds a
+    /// slot in the fetch window for the full ten seconds. Seventy three percent
+    /// of all the time the batch spent was the part of each fetch past three
+    /// seconds. The same five hundred hosts on six seconds: mean 1434 ms, and
+    /// the batch finished in 13.4 seconds instead of 28.3.
+    ///
+    /// It costs about one percent of the answers. Two hundreds and no 404s out
+    /// of a hundred and ninety nine useful replies fell off the end, and under
+    /// doc 07.4 those hosts are then disallowed for a day, which is a real cost
+    /// and is why the number is six and not two. The connect timeout is left
+    /// where doc 05.4 put it: it lives in the connector and is per client, and
+    /// a total deadline shorter than it makes it moot anyway.
+    pub robots_timeout: Duration,
     /// The body cap. Doc 05.4 says 512 KiB, which holds well over 99 percent
     /// of HTML and cuts off the video files that get served with an HTML
     /// content type.
@@ -153,6 +177,7 @@ impl Default for FetchConfig {
             connect_timeout: Duration::from_secs(10),
             read_timeout: Duration::from_secs(10),
             total_timeout: Duration::from_secs(30),
+            robots_timeout: Duration::from_secs(6),
             body_cap: 512 * 1024,
             max_redirects: 5,
             per_host: 2,
@@ -254,6 +279,19 @@ impl Fetcher {
     pub async fn fetch(&self, url: &str, revalidate: Option<&Revalidator>) -> Result<Outcome> {
         self.inner.fetch(url, revalidate).await
     }
+
+    /// Fetch a robots.txt, on [`FetchConfig::robots_timeout`].
+    ///
+    /// Never conditional, because the robots cache throws the file away rather
+    /// than keeping a copy to revalidate against, so there is nothing a 304
+    /// could confirm.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`fetch`](Self::fetch).
+    pub async fn fetch_robots(&self, url: &str) -> Result<Outcome> {
+        self.inner.fetch_robots(url).await
+    }
 }
 
 /// T2, the browser shaped client from doc 05.5.
@@ -323,6 +361,15 @@ impl Emulated {
     /// Nothing else.
     pub async fn fetch(&self, url: &str, revalidate: Option<&Revalidator>) -> Result<Outcome> {
         self.inner.fetch(url, revalidate).await
+    }
+
+    /// Fetch a robots.txt at T2, on [`FetchConfig::robots_timeout`].
+    ///
+    /// # Errors
+    ///
+    /// The same as [`fetch`](Self::fetch).
+    pub async fn fetch_robots(&self, url: &str) -> Result<Outcome> {
+        self.inner.fetch_robots(url).await
     }
 
     /// The JA4 an echo endpoint says we just presented.
@@ -589,6 +636,39 @@ impl Ladder {
             _ => Tier::Plain,
         };
         let outcome = self.plain.fetch(url, revalidate).await?;
+        Ok(Served::descended(tier, served, outcome))
+    }
+
+    /// Fetch a robots.txt at the tier the lease asked for, on
+    /// [`FetchConfig::robots_timeout`].
+    ///
+    /// The tier is honoured for the same reason [`fetch`](Self::fetch) honours
+    /// it. A host whose bot management refuses a plain client refuses it on
+    /// robots.txt too, and asking for that file at T1 on a host doc 05.8 has
+    /// already moved to T2 comes back unreachable and disallows the whole host.
+    ///
+    /// T3 is the one rung this skips. A browser handed a `text/plain` body
+    /// answers `NotDocument` and [`fetch`](Self::fetch) then asks T1 for the
+    /// same URL, so a robots.txt routed through the browser pool costs a tab, a
+    /// navigation and a second request to arrive exactly where it would have
+    /// arrived without them. Doc 05.6's tabs are the scarcest thing on the box
+    /// and no robots.txt has ever needed one.
+    ///
+    /// # Errors
+    ///
+    /// [`FetchError::Url`] when the URL does not parse or is not http(s).
+    /// Nothing else.
+    pub async fn fetch_robots(&self, url: &str, tier: Tier) -> Result<Served> {
+        #[cfg(feature = "emulation")]
+        if matches!(tier, Tier::Emulated | Tier::Rendered | Tier::Supervised) {
+            let outcome = self.emulated.fetch_robots(url).await?;
+            return Ok(Served::descended(tier, Tier::Emulated, outcome));
+        }
+        let served = match tier {
+            Tier::Revalidate | Tier::Plain => tier,
+            _ => Tier::Plain,
+        };
+        let outcome = self.plain.fetch_robots(url).await?;
         Ok(Served::descended(tier, served, outcome))
     }
 }
