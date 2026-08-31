@@ -2079,6 +2079,15 @@ impl Pressure {
 /// of it that are not the page: the robots.txt the first lease on a host has to
 /// fetch before it may ask for anything, and doc 07.6's politeness delay, which
 /// a lease waits out twice on a host it has never seen.
+///
+/// `state` is the last piece of the arithmetic and it is the one that catches
+/// the case where the first two do not add up. The window and the lease cost
+/// are what the fetches did, and they are measured on the fetch tasks. This is
+/// measured on the loop task, and it is the seconds of the tick that the loop
+/// spent inside the store rather than putting the next lease on the wire. A
+/// tick whose window is full and whose leases are quick and whose rate is still
+/// nowhere near the window over the lease cost is a tick that spent its time
+/// here, and no amount of work on the fetch path will move it.
 fn progress(
     summary: &Summary,
     report: &TickReport,
@@ -2089,7 +2098,8 @@ fn progress(
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  {} ms per page ({} robots, {} polite)  \
-         {} MB fetched  {} MB stored  {} failed  bottleneck: {}",
+         state {:.0}s ({:.0}s write, {:.0}s ask)  {} MB fetched  {} MB stored  {} failed  \
+         bottleneck: {}",
         summary.rows,
         report.window_mean(),
         queued,
@@ -2097,6 +2107,9 @@ fn progress(
         report.lease_mean_ms(),
         report.robots_mean_ms(),
         report.waited_mean_ms(),
+        (report.store_ms + report.ask_ms) as f64 / 1000.0,
+        report.store_ms as f64 / 1000.0,
+        report.ask_ms as f64 / 1000.0,
         summary.bytes_fetched / (1 << 20),
         summary.bytes_stored / (1 << 20),
         summary.failed,

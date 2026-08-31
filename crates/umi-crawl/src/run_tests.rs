@@ -173,6 +173,32 @@ impl Fetch for Timed {
     }
 }
 
+/// A fetcher that takes real time over every request.
+///
+/// Real time and not the fake clock, which is the only unusual thing about it
+/// and is the point. Everything else in this file wants a clock it controls so
+/// that a politeness delay costs nothing to test. A window's occupancy is the
+/// one measurement that cannot be taken that way: it is lease time over tick
+/// time, both read from `Instant`, and a fetcher that answers in the same poll
+/// it was asked leaves a tick with no time in it to divide by.
+struct Slow {
+    inner: Canned,
+    per_request: Duration,
+}
+
+#[async_trait::async_trait]
+impl Fetch for Slow {
+    async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+        tier: umi_types::Tier,
+    ) -> Result<Served, FetchError> {
+        tokio::time::sleep(self.per_request).await;
+        self.inner.fetch(url, revalidate, tier).await
+    }
+}
+
 /// A fetcher that blocks one URL until it is told to stop.
 ///
 /// Doc 05.8's de-escalation cannot be written against a map of canned answers,
@@ -839,17 +865,23 @@ async fn a_tick_reports_how_full_its_fetch_window_actually_was() {
     // 3.1: a crawl configured for 256 that is running 30 is not fetching
     // slowly, it is not fetching, and nothing else on the line says so.
     //
-    // Sixteen urls on sixteen hosts with room for four at a time. Nothing here
-    // waits on anything, so the window should be full for most of the tick,
-    // and the one thing that must not happen is the old answer of sixteen.
+    // Sixteen urls on sixteen hosts with room for four at a time, and a fetcher
+    // that takes real time so that there is a window to be full of anything.
+    // Four is the answer. The answer that must not come back is sixteen, which
+    // is what counting the tick's fetch tasks gives: the loop takes one out and
+    // puts one in on every pass, so that count is pinned to the window size and
+    // reads full for a crawl that has stopped fetching.
     let urls: Vec<String> = (0..16).map(|n| format!("https://h{n}.example/p")).collect();
     let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
     let state = seeded(&refs).await;
-    let fetch = urls.iter().fold(Canned::new(), |f, url| {
-        let origin = url.trim_end_matches("/p");
-        f.robots(origin, "User-agent: *\nAllow: /\n")
-            .html(url, &page("P", &[]))
-    });
+    let fetch = Slow {
+        inner: urls.iter().fold(Canned::new(), |f, url| {
+            let origin = url.trim_end_matches("/p");
+            f.robots(origin, "User-agent: *\nAllow: /\n")
+                .html(url, &page("P", &[]))
+        }),
+        per_request: Duration::from_millis(20),
+    };
     let crawler = Crawler::new(
         fetch,
         state,
@@ -862,11 +894,15 @@ async fn a_tick_reports_how_full_its_fetch_window_actually_was() {
 
     let report = crawler.tick(&Collected::default()).await.expect("tick");
     assert_eq!(report.fetched, 16, "{report:?}");
+    // Loosely, because the tick also has a store in it and the last four leases
+    // are not replaced. The bug this catches is off by a factor of four, so a
+    // band this wide still catches it.
     let mean = report.window_mean();
     assert!(
-        mean > 1.0 && mean <= 4.0,
-        "a window of four averaged {mean} over {} leases",
-        report.leased
+        (2.0..=4.5).contains(&mean),
+        "a window of four averaged {mean} over {} leases in {} ms",
+        report.leased,
+        report.elapsed_ms
     );
 }
 

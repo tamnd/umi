@@ -447,18 +447,12 @@ pub struct TickReport {
     /// is full, and the two want opposite responses: the first one means the
     /// crawl is over and the second one means wait.
     pub restrained: bool,
-    /// The fetch window's occupancy, sampled once per completion and summed.
+    /// How long the tick took, wall clock, from first lease to last store.
     ///
-    /// Over [`completed`](TickReport::completed) it is the mean, and that is
-    /// the number that says whether the crawl is limited by the window or by
-    /// what is in it. A tick configured for 256 that averages 30 is not
-    /// fetching slowly, it is not fetching, and the two have completely
-    /// different fixes. Doc 16's gate 3.1 is a rate on one box, and there is
-    /// no reading of a rate that is useful without this next to it.
-    ///
-    /// A sum rather than the mean because reports add up: a caller that wants
-    /// the mean over a run of ticks cannot get it from a list of means.
-    pub window_sum: u64,
+    /// Here rather than left to the caller because it is half of every rate in
+    /// this block, and a caller that timed the call itself would be timing the
+    /// same thing badly. Reports add up and so does this.
+    pub elapsed_ms: u64,
     /// Lease milliseconds spent waiting out doc 07.6's politeness delay.
     ///
     /// Summed across the tick's leases, so it is many times longer than the
@@ -476,6 +470,21 @@ pub struct TickReport {
     /// the window over that number is the rate. Everything else in this block
     /// is here to say which part of it to go and fix.
     pub lease_ms: u64,
+    /// Milliseconds the tick spent inside the state layer writing.
+    ///
+    /// Rows, completions, relearned hosts and admitted links, once per window.
+    /// Not divided by anything, because it is time on the one task that also
+    /// harvests fetches and starts their replacements, so it is time the window
+    /// was not being topped up. Against the tick's own length it is the share
+    /// of the crawl that was bookkeeping.
+    pub store_ms: u64,
+    /// Milliseconds the tick spent asking the scheduler for more work.
+    ///
+    /// The other half of what the loop task does that is not a fetch, and it is
+    /// counted apart because the fix is different: a slow store is a write
+    /// path and a slow ask is a query, and on a frontier of a hundred million
+    /// rows they go wrong for different reasons.
+    pub ask_ms: u64,
 }
 
 /// Where a lease's wall clock went.
@@ -513,13 +522,26 @@ impl TickReport {
     }
 
     /// How full the fetch window was on average.
+    ///
+    /// Lease time over tick time, which is Little's law and is exact. The
+    /// tempting alternative is to count the fetch tasks the tick is holding
+    /// and average that, and it is worthless: a task that has finished stays
+    /// in that set until the loop takes it out, and the loop takes one out and
+    /// puts one in on every pass, so the count sits at the window size whatever
+    /// the fetches are doing. It reports a full window for a crawl that has
+    /// stopped fetching, which is the exact case worth catching.
+    ///
+    /// This is the number that says whether the crawl is limited by the window
+    /// or by what is in it. A tick configured for 256 that averages 18 is not
+    /// fetching slowly, it is not fetching, and the two have completely
+    /// different fixes. Doc 16's gate 3.1 is a rate on one box, and there is no
+    /// reading of a rate that is useful without this next to it.
     #[must_use]
     pub fn window_mean(&self) -> f32 {
-        let over = self.completed();
-        if over == 0 {
+        if self.elapsed_ms == 0 {
             return 0.0;
         }
-        self.window_sum as f32 / over as f32
+        self.lease_ms as f32 / self.elapsed_ms as f32
     }
 
     /// What one lease cost the window, in milliseconds.
@@ -816,6 +838,10 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             ..TickReport::default()
         };
 
+        // From here and not from the top of the function, because everything
+        // above is arithmetic on the allowance and the interesting span is the
+        // one with fetches in it.
+        let began = Instant::now();
         // Shared rather than borrowed because every fetch is spawned, and a
         // spawned task cannot borrow the tick's stack frame.
         let floors = Arc::new(HostFloors::default());
@@ -895,11 +921,6 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 signal,
                 spent,
             } = done;
-            // Sampled after this lease left the window and its replacement
-            // went in, so it is how full the window is right now. Doc 14.3's
-            // progress line has been reporting the batch size under the name
-            // "in flight", which is not a measurement of anything.
-            report.window_sum += pending.len() as u64;
             report.waited_ms += u64::from(spent.waiting_ms);
             report.robots_ms += u64::from(spent.robots_ms);
             report.lease_ms += u64::from(spent.total_ms);
@@ -996,6 +1017,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         if !deferred.is_empty() {
             self.state().release(&deferred, NackReason::Refused).await?;
         }
+        report.elapsed_ms = u64::from(ms(began));
         self.alert(&report);
         Ok(report)
     }
@@ -1057,6 +1079,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         now_ms: u64,
         report: &mut TickReport,
     ) -> Result<(), CrawlError> {
+        let began = Instant::now();
         if !held.rows.is_empty() {
             sink.take(&held.rows).await?;
             report.rows += held.rows.len();
@@ -1074,6 +1097,11 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             report.links_admitted += self.admit(&held.candidates, now_ms).await?;
             held.candidates.clear();
         }
+        // At the end and not on each of the four, because the question this
+        // answers is how long the loop was in here rather than which call was
+        // the slow one. A `?` above skips it, and a tick that failed to store
+        // is not a tick anybody is reading a rate off.
+        report.store_ms += u64::from(ms(began));
         Ok(())
     }
 
@@ -1118,6 +1146,11 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                 return Ok(None);
             }
             let ask = u32::try_from(chunk).unwrap_or(u32::MAX).min(supply.left);
+            // Around the ask alone and not the whole function. Everything else
+            // in here is a pop off a queue this tick already holds, and putting
+            // that in the same number would bury the one call that goes to the
+            // store under a few thousand that do not.
+            let began = Instant::now();
             let mut leases = self
                 .frontier
                 .tick(&Ask {
@@ -1135,6 +1168,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                     budget: Some(allowance.budget(self.config.budget)),
                 })
                 .await?;
+            report.ask_ms += u64::from(ms(began));
             if leases.is_empty() {
                 supply.patience = (chunk / 2).max(1);
                 return Ok(None);
