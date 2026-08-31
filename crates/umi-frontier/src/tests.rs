@@ -11,11 +11,14 @@
 //! ten second crawl delay runs in microseconds.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use umi_state::{
-    Discovery, FetchOutcome, FetchResult, HostRow, Lease, MemoryState, Pace, Revalidator, State,
+    AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
+    FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, MemoryState, NackReason,
+    Pace, Result, Revalidator, SegmentQuery, SegmentRow, State, StateStats, SupervisionRow,
 };
-use umi_types::{HostId, PldId, RowKey, Tier};
+use umi_types::{HostId, PldId, RowKey, Tier, Ulid};
 
 use crate::{Ask, Config, Frontier, MAX_DEPTH, Rate, depth_score};
 
@@ -408,6 +411,122 @@ async fn a_tick_visits_at_most_the_configured_number_of_domains() {
     let leases = front.tick(&Ask::new(T0, 100)).await.expect("tick");
     let touched: BTreeSet<PldId> = leases.iter().map(|lease| lease.key.pld).collect();
     assert_eq!(touched.len(), 3);
+}
+
+/// A store that counts what the scheduler asks it.
+///
+/// Only [`lease`](State::lease) is counted, because that is the call the
+/// scheduler used to make in a loop and the only one whose count is a promise
+/// about performance rather than an implementation detail. Everything else
+/// forwards.
+struct Counted {
+    inner: MemoryState,
+    leases: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl State for Counted {
+    async fn admit(&self, batch: &[Candidate<'_>]) -> Result<AdmitReport> {
+        self.inner.admit(batch).await
+    }
+
+    async fn lease(&self, req: &LeaseRequest<'_>) -> Result<Vec<Lease>> {
+        self.leases.fetch_add(1, Ordering::Relaxed);
+        self.inner.lease(req).await
+    }
+
+    async fn complete(&self, outcomes: &[FetchOutcome]) -> Result<()> {
+        self.inner.complete(outcomes).await
+    }
+
+    async fn release(&self, lease_ids: &[LeaseId], reason: NackReason) -> Result<()> {
+        self.inner.release(lease_ids, reason).await
+    }
+
+    async fn host(&self, id: HostId) -> Result<Option<HostRow>> {
+        self.inner.host(id).await
+    }
+
+    async fn put_host(&self, rows: &[HostRow]) -> Result<()> {
+        self.inner.put_host(rows).await
+    }
+
+    async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {
+        self.inner.block(rows).await
+    }
+
+    async fn blocks(&self) -> Result<Vec<BlockRow>> {
+        self.inner.blocks().await
+    }
+
+    async fn supervise(&self, rows: &[SupervisionRow]) -> Result<usize> {
+        self.inner.supervise(rows).await
+    }
+
+    async fn supervision(&self) -> Result<Vec<SupervisionRow>> {
+        self.inner.supervision().await
+    }
+
+    async fn put_segment(&self, rows: &[SegmentRow]) -> Result<()> {
+        self.inner.put_segment(rows).await
+    }
+
+    async fn segment(&self, id: Ulid) -> Result<Option<SegmentRow>> {
+        self.inner.segment(id).await
+    }
+
+    async fn segments(&self, query: SegmentQuery) -> Result<Vec<SegmentRow>> {
+        self.inner.segments(query).await
+    }
+
+    async fn warm(&self, plds: &[PldId]) -> Result<()> {
+        self.inner.warm(plds).await
+    }
+
+    async fn evict(&self, plds: &[PldId]) -> Result<EvictReport> {
+        self.inner.evict(plds).await
+    }
+
+    async fn resident(&self) -> Result<Vec<PldId>> {
+        self.inner.resident().await
+    }
+
+    async fn checkpoint(&self, now_ms: u64) -> Result<Checkpoint> {
+        self.inner.checkpoint(now_ms).await
+    }
+
+    async fn stats(&self) -> Result<StateStats> {
+        self.inner.stats().await
+    }
+}
+
+#[tokio::test]
+async fn a_tick_asks_the_store_once_and_not_once_per_domain() {
+    // The measurement that put this test here: five hundred domains an ask,
+    // one durable transaction each, 33 seconds an ask, and 95 percent of a
+    // crawl tick spent inside the store while the fetch window sat at 12 of
+    // its 256 slots. Doc 09.3's domain cap travels with the ask now, so one
+    // call covers every domain the gate is ready to offer.
+    //
+    // Two hundred domains, all of them fresh, so all of them have the same
+    // allowance and share one call. A frontier whose allowances have spread
+    // out costs one call per distinct allowance, which is still not one per
+    // domain, and there is no shape of frontier where it is.
+    let front = Frontier::new(
+        Counted {
+            inner: MemoryState::new(),
+            leases: AtomicUsize::new(0),
+        },
+        Config::default(),
+    );
+    let urls: Vec<String> = (0..200).map(|n| format!("https://c{n}.example/")).collect();
+    let links: Vec<&str> = urls.iter().map(String::as_str).collect();
+    front.seed(&links, T0).await.expect("seed");
+
+    let leases = front.tick(&Ask::new(T0, 200)).await.expect("tick");
+    assert_eq!(leases.len(), 200, "two hundred domains were due");
+    let asked = front.state().leases.load(Ordering::Relaxed);
+    assert_eq!(asked, 1, "two hundred domains cost {asked} lease calls");
 }
 
 #[tokio::test]

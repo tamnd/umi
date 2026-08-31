@@ -269,6 +269,7 @@ async fn a_date_later_than_our_last_fetch_brings_a_known_url_forward() {
             now_ms: T0,
             max_urls: 4,
             max_per_host: 4,
+            max_per_pld: 0,
             max_tier: umi_types::Tier::Plain,
             lease_for: std::time::Duration::from_secs(60),
             plds: &[],

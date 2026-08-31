@@ -228,6 +228,16 @@ pub struct LeaseRequest<'a> {
     /// request in flight per host, so this bounds the queue a fetcher holds,
     /// not the concurrency it may use.
     pub max_per_host: u32,
+    /// Ceiling per pay level domain within this call, or zero for none.
+    ///
+    /// Doc 09.3's rate limit is the scheduler's and not the store's, and this
+    /// does not move it. It is here so that the scheduler can enforce it in one
+    /// call rather than one call per domain, which is the difference between a
+    /// tick that spends a second in the store and a tick that spends nine
+    /// minutes in it. A lease call is a durable transaction, and 512 of them
+    /// per ask is 512 fsyncs on the one task that also has to keep the fetch
+    /// window full.
+    pub max_per_pld: u32,
     /// The most expensive tier this fetcher will run. A URL whose host wants
     /// a more expensive tier is not offered.
     pub max_tier: Tier,
@@ -258,6 +268,7 @@ impl<'a> LeaseRequest<'a> {
             now_ms,
             max_urls,
             max_per_host: 8,
+            max_per_pld: 0,
             max_tier: Tier::Plain,
             lease_for: Duration::from_secs(60),
             plds: &[],

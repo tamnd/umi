@@ -3568,6 +3568,7 @@ dependencies = [
 name = "umi-frontier"
 version = "0.0.1"
 dependencies = [
+ "async-trait",
  "tokio",
  "umi-state",
  "umi-types",
