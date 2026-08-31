@@ -2099,12 +2099,14 @@ impl Pressure {
 /// near the window over the lease cost is a tick that spent its time here, and
 /// no amount of work on the fetch path will move it.
 ///
-/// The write is inside the brackets and outside the total, because writing
-/// happens on a task of its own and mostly costs the crawl nothing. `waited` is
-/// what it did cost: the seconds the loop sat waiting for the last window to be
-/// written before it could hand over the next one. A write figure much bigger
-/// than the wait is the write path keeping up, which is the ordinary case. The
-/// two converging is the store falling behind the fetches.
+/// The asking and the writing both happen on tasks of their own now, so what
+/// each of them cost is a wait and not a duration. The two costs are what the
+/// total is made of and the two durations are in brackets beside them, because
+/// the pair is what says which way to go: an ask that takes a long time and is
+/// waited on for none of it is a frontier keeping up with the fetches, and the
+/// two converging is one that has stopped. That is the number to watch as the
+/// frontier grows to doc 16's five hundred million rows, and it is the reason
+/// the durations are printed at all.
 fn progress(
     summary: &Summary,
     report: &TickReport,
@@ -2115,7 +2117,8 @@ fn progress(
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  {} ms per page ({} robots, {} polite)  \
-         state {:.0}s ({:.0}s over {} asks, {} empty, {:.0}s waited on a {:.0}s write)  \
+         state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
+         {:.0}s waited on writes costing {:.0}s)  \
          {} MB fetched  {} MB stored  {} failed  bottleneck: {}",
         summary.rows,
         report.window_mean(),
@@ -2124,9 +2127,10 @@ fn progress(
         report.lease_mean_ms(),
         report.robots_mean_ms(),
         report.waited_mean_ms(),
-        (report.store_waited_ms + report.ask_ms) as f64 / 1000.0,
-        report.ask_ms as f64 / 1000.0,
+        (report.store_waited_ms + report.ask_waited_ms) as f64 / 1000.0,
+        report.ask_waited_ms as f64 / 1000.0,
         report.asks,
+        report.ask_ms as f64 / 1000.0,
         report.asks_empty,
         report.store_waited_ms as f64 / 1000.0,
         report.store_ms as f64 / 1000.0,

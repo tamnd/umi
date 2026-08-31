@@ -205,6 +205,34 @@ struct Supply {
     /// wasted scans on a genuinely empty frontier at two before the window
     /// drains and the tick ends.
     patience: usize,
+    /// The ask already on its way back, if there is one.
+    asking: Option<Asking>,
+}
+
+/// One ask to the scheduler, in flight.
+///
+/// An ask is a scan of the store and it is the most expensive thing the loop
+/// task does: thirty seconds of a sixty second tick on server3 at eight hundred
+/// thousand rows, and it grows with the frontier. Sent when the queue is half
+/// empty rather than when it is empty, so that it lands while there is still
+/// work in hand and the window never sits idle waiting for one.
+#[derive(Debug)]
+struct Asking {
+    /// The task doing the asking, and how long the query itself took.
+    ///
+    /// Timed inside the task rather than around the join, because an ask that
+    /// comes back while the loop is still working through the queue then sits
+    /// there finished until the loop next needs it. Timed from out here that
+    /// idle stretch would be counted as query time, which is the one number
+    /// the whole change exists to watch.
+    handle: JoinHandle<Result<(Vec<umi_state::Lease>, u32), StateError>>,
+    /// How much of the tick's allowance this took before it knew what it would
+    /// find. The difference goes back when it lands.
+    ///
+    /// Reserved up front because the loop goes on handing out leases while this
+    /// is in flight, and an allowance that two asks both read before either
+    /// spent it is an allowance they would each spend in full.
+    reserved: u32,
 }
 
 impl HostFloors {
@@ -531,13 +559,23 @@ pub struct TickReport {
     /// `store_ms` means it is not keeping up and the answer is a deeper queue
     /// or a faster store rather than anything on the fetch path.
     pub store_waited_ms: u64,
-    /// Milliseconds the tick spent asking the scheduler for more work.
+    /// Milliseconds spent asking the scheduler for more work.
     ///
-    /// The other half of what the loop task does that is not a fetch, and it is
-    /// counted apart because the fix is different: a slow store is a write
+    /// The other half of what the loop used to do that is not a fetch, and it
+    /// is counted apart because the fix is different: a slow store is a write
     /// path and a slow ask is a query, and on a frontier of a hundred million
-    /// rows they go wrong for different reasons.
+    /// rows they go wrong for different reasons. Measured on the ask's own
+    /// task, so like `store_ms` it can add up to more than the tick.
     pub ask_ms: u64,
+    /// Milliseconds the loop spent waiting for an ask to come back.
+    ///
+    /// What the asking actually cost the crawl. The loop sends the next ask
+    /// when the queue is half empty and goes on fetching from what it has, so
+    /// this is zero for as long as an ask comes back inside the time it takes
+    /// the window to work through half a queue. It stops being zero when the
+    /// frontier gets slower than the fetches, which is the thing worth
+    /// watching as the frontier grows to doc 16's five hundred million.
+    pub ask_waited_ms: u64,
     /// How many times the tick went to the scheduler.
     ///
     /// Against `ask_ms` it says whether the time went on a few slow queries or
@@ -925,6 +963,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             queue: VecDeque::new(),
             left: batch,
             patience: 0,
+            asking: None,
         };
 
         // Fill the window, then top it up as each one lands, which is what
@@ -1164,6 +1203,150 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         let sink = Arc::clone(sink);
         tokio::spawn(async move { shared.store(&*sink, held, now_ms).await })
     }
+
+    /// The next lease to put on the wire, sending for more before what is in
+    /// hand runs out.
+    ///
+    /// Through the scheduler and not straight to the store. The store hands out
+    /// work per host; doc 09.3's cap is per pay level domain, and the two are
+    /// not the same thing. A site on fifty hosts under one domain is fifty
+    /// polite hosts and one operator wondering why fifty of our connections
+    /// turned up at once, and the frontier is where that is counted.
+    ///
+    /// A window's worth at a time, rather than the whole batch in one ask at
+    /// the top of the tick, and that is the difference between the gate 3.1
+    /// number and a tenth of it. A tick that leases everything up front tops
+    /// its window up only from what it already holds, so the window drains to
+    /// empty at the end of every tick and the rate is the batch over the
+    /// slowest lease in it. Asking as the window empties keeps every slot busy
+    /// until the batch is spent, and the rate is the window over the mean.
+    /// Leases also go on the wire soon after they are taken this way, which
+    /// matters because a lease is only good for [`CrawlConfig::lease_for`] and
+    /// the tail of a big batch can sit in hand for longer than that.
+    ///
+    /// Sent before the queue runs out, and on a task of its own, which is the
+    /// difference between that number and the one after it. An ask is a scan of
+    /// the store, and a loop that goes to fetch one when the queue runs dry has
+    /// nothing to hand out for as long as the scan takes. On server3 that was
+    /// thirty seconds of a sixty second tick with the window draining
+    /// throughout, and it grew with the frontier: nine seconds at ten thousand
+    /// rows and thirty at eight hundred thousand, against a gate that wants
+    /// five hundred million.
+    ///
+    /// [`None`] when the batch is spent or the scheduler has nothing ready.
+    ///
+    /// # Errors
+    ///
+    /// [`CrawlError::State`] if the leases could not be taken.
+    async fn next_lease(
+        &self,
+        supply: &mut Supply,
+        allowance: &Allowance,
+        chunk: usize,
+        deferred: &mut Vec<LeaseId>,
+        report: &mut TickReport,
+    ) -> Result<Option<(umi_state::Lease, u64)>, CrawlError> {
+        loop {
+            if let Some(next) = self.gate(&mut supply.queue, deferred, report) {
+                // Below one ask's worth, which in the steady state means there
+                // is always exactly one ask in flight. A queue holding a full
+                // ask is a window's worth of fetching in hand, which is the
+                // runway the next ask has to come back inside, and an ask that
+                // takes longer than that is one this tick has to wait for
+                // however early it was sent. Waiting until the queue is nearly
+                // empty is the old behaviour with extra steps: the runway is
+                // then whatever is left, which is nothing.
+                if supply.queue.len() < chunk {
+                    self.send_ask(supply, allowance, chunk);
+                }
+                return Ok(Some(next));
+            }
+            if supply.asking.is_none() {
+                if supply.patience > 0 || supply.left == 0 {
+                    return Ok(None);
+                }
+                self.send_ask(supply, allowance, chunk);
+                // `send_ask` declines for exactly the reasons ruled out above,
+                // so this cannot happen. It is one branch against an infinite
+                // loop if that ever stops being true.
+                if supply.asking.is_none() {
+                    return Ok(None);
+                }
+            }
+            if self.take_ask(supply, report).await? == 0 {
+                supply.patience = (chunk / 2).max(1);
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Send an ask, unless there is already one out or nothing to ask for.
+    ///
+    /// Takes its share of the tick's allowance now rather than when the answer
+    /// comes back. See [`Asking::reserved`].
+    fn send_ask(&self, supply: &mut Supply, allowance: &Allowance, chunk: usize) {
+        if supply.asking.is_some() || supply.patience > 0 || supply.left == 0 {
+            return;
+        }
+        let want = u32::try_from(chunk).unwrap_or(u32::MAX).min(supply.left);
+        supply.left -= want;
+        let shared = Arc::clone(&self.shared);
+        // The lower of the two, always. The config is the most this process
+        // will ever pay for and the allowance is the most it can afford today,
+        // and neither may raise the other.
+        let max_tier = self.config.max_tier.min(allowance.max_tier);
+        let budget = allowance.budget(self.config.budget);
+        supply.asking = Some(Asking {
+            handle: tokio::spawn(async move {
+                let began = Instant::now();
+                let leases = shared.ask(want, max_tier, budget).await?;
+                Ok((leases, ms(began)))
+            }),
+            reserved: want,
+        });
+    }
+
+    /// Wait for the ask in flight and put what it found in the queue.
+    ///
+    /// Returns how many leases came back, which is zero when there was nothing
+    /// outstanding and zero when the frontier had nothing ready. Both mean the
+    /// same thing to the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`CrawlError::State`] if the leases could not be taken.
+    async fn take_ask(
+        &self,
+        supply: &mut Supply,
+        report: &mut TickReport,
+    ) -> Result<usize, CrawlError> {
+        let Some(asking) = supply.asking.take() else {
+            return Ok(0);
+        };
+        let waited = Instant::now();
+        let (leases, took_ms) = match asking.handle.await {
+            Ok(asked) => asked?,
+            // An ask task can only end without an answer by panicking, and a
+            // tick that swallowed that would quietly stop leasing.
+            Err(joined) => std::panic::resume_unwind(joined.into_panic()),
+        };
+        report.ask_waited_ms += u64::from(ms(waited));
+        report.ask_ms += u64::from(took_ms);
+        report.asks += 1;
+        let took = u32::try_from(leases.len()).unwrap_or(u32::MAX);
+        // What it reserved and did not use. A frontier with less ready than we
+        // asked for must not cost the tick the difference, or a crawl with a
+        // thin frontier would end its ticks early for no reason.
+        supply.left += asking.reserved.saturating_sub(took);
+        if leases.is_empty() {
+            report.asks_empty += 1;
+            return Ok(0);
+        }
+        let count = leases.len();
+        report.leased += count;
+        supply.queue.extend(leases);
+        Ok(count)
+    }
 }
 
 /// Wait for a store to finish and fold what it wrote into the report.
@@ -1280,70 +1463,39 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// matters because a lease is only good for [`CrawlConfig::lease_for`] and
     /// the tail of a big batch can sit in hand for longer than that.
     ///
-    /// [`None`] when the batch is spent or the scheduler has nothing ready.
+    /// One ask, and nothing else, so it can be spawned.
     ///
-    /// # Errors
-    ///
-    /// [`CrawlError::State`] if the leases could not be taken.
-    async fn next_lease(
+    /// Sorted here rather than by the caller because the sort is a few hundred
+    /// microseconds that may as well happen on this task rather than the one
+    /// keeping the window full. Earliest first, because a lease that is not due
+    /// yet still occupies a slot in the window while it waits. Sorted, the only
+    /// time a slot holds a waiting lease is when everything ahead of it is
+    /// waiting too, so nothing that could have been fetched is sitting behind
+    /// something that could not. Unsorted, one host that owes a minute of
+    /// politeness can park the whole window while other hosts have work ready
+    /// to go.
+    async fn ask(
         &self,
-        supply: &mut Supply,
-        allowance: &Allowance,
-        chunk: usize,
-        deferred: &mut Vec<LeaseId>,
-        report: &mut TickReport,
-    ) -> Result<Option<(umi_state::Lease, u64)>, CrawlError> {
-        loop {
-            if let Some(next) = self.gate(&mut supply.queue, deferred, report) {
-                return Ok(Some(next));
-            }
-            if supply.patience > 0 || supply.left == 0 {
-                return Ok(None);
-            }
-            let ask = u32::try_from(chunk).unwrap_or(u32::MAX).min(supply.left);
-            // Around the ask alone and not the whole function. Everything else
-            // in here is a pop off a queue this tick already holds, and putting
-            // that in the same number would bury the one call that goes to the
-            // store under a few thousand that do not.
-            let began = Instant::now();
-            let mut leases = self
-                .frontier
-                .tick(&Ask {
-                    fetcher: self.config.fetcher,
-                    // Read again rather than carried down from the top of the
-                    // tick, because the tick no longer takes all its work in
-                    // one moment and a stale clock would ask for the domains
-                    // that were ready when it started.
-                    now_ms: self.clock.now_ms(),
-                    max_urls: ask,
-                    // The lower of the two, always. The config is the most this
-                    // process will ever pay for and the allowance is the most
-                    // it can afford today, and neither may raise the other.
-                    max_tier: self.config.max_tier.min(allowance.max_tier),
-                    budget: Some(allowance.budget(self.config.budget)),
-                })
-                .await?;
-            report.ask_ms += u64::from(ms(began));
-            report.asks += 1;
-            if leases.is_empty() {
-                report.asks_empty += 1;
-                supply.patience = (chunk / 2).max(1);
-                return Ok(None);
-            }
-            report.leased += leases.len();
-            supply.left = supply
-                .left
-                .saturating_sub(u32::try_from(leases.len()).unwrap_or(u32::MAX));
-            // Earliest first, because a lease that is not due yet still
-            // occupies a slot in the window while it waits. Sorted, the only
-            // time a slot holds a waiting lease is when everything ahead of it
-            // is waiting too, so nothing that could have been fetched is
-            // sitting behind something that could not. Unsorted, one host that
-            // owes a minute of politeness can park the whole window while other
-            // hosts have work ready to go.
-            leases.sort_by_key(|lease| lease.not_before_ms);
-            supply.queue.extend(leases);
-        }
+        max_urls: u32,
+        max_tier: Tier,
+        budget: Budget,
+    ) -> Result<Vec<umi_state::Lease>, StateError> {
+        let mut leases = self
+            .frontier
+            .tick(&Ask {
+                fetcher: self.config.fetcher,
+                // Read here rather than carried down from the top of the tick,
+                // because the tick no longer takes all its work in one moment
+                // and a stale clock would ask for the domains that were ready
+                // when it started.
+                now_ms: self.clock.now_ms(),
+                max_urls,
+                max_tier,
+                budget: Some(budget),
+            })
+            .await?;
+        leases.sort_by_key(|lease| lease.not_before_ms);
+        Ok(leases)
     }
 
     /// The next lease already in hand that this tick can actually run, and the
