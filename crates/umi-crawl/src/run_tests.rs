@@ -1306,7 +1306,17 @@ async fn an_empty_frontier_is_idle_and_not_an_error() {
     let state = seeded(&[]).await;
     let crawler = crawler(Canned::new(), state);
     let report = crawler.tick(&Collected::default()).await.expect("tick");
-    assert_eq!(report, TickReport::default());
+    assert_eq!(
+        TickReport {
+            // The one ask it took to find that out, which is the report saying
+            // it went and looked rather than that it never went.
+            asks: 0,
+            asks_empty: 0,
+            ..report
+        },
+        TickReport::default()
+    );
+    assert_eq!((report.asks, report.asks_empty), (1, 1));
     assert!(report.idle());
 }
 

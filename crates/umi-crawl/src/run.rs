@@ -485,6 +485,21 @@ pub struct TickReport {
     /// path and a slow ask is a query, and on a frontier of a hundred million
     /// rows they go wrong for different reasons.
     pub ask_ms: u64,
+    /// How many times the tick went to the scheduler.
+    ///
+    /// Against `ask_ms` it says whether the time went on a few slow queries or
+    /// a great many quick ones, and against `leased` it says how much work an
+    /// ask is worth. Those are different bugs. A tick that asks eight hundred
+    /// times for five leases each is paying the cost of the scan eight hundred
+    /// times over, and the fix for that is not a faster scan.
+    pub asks: usize,
+    /// How many of those came back with nothing.
+    ///
+    /// An ask that returns nothing still walks the frontier, and it is the one
+    /// the loop pays for twice: doc 09.4's scheduler has nothing to hand out,
+    /// so the window drains by however long the loop waits before trying
+    /// again.
+    pub asks_empty: usize,
 }
 
 /// Where a lease's wall clock went.
@@ -1169,7 +1184,9 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                 })
                 .await?;
             report.ask_ms += u64::from(ms(began));
+            report.asks += 1;
             if leases.is_empty() {
+                report.asks_empty += 1;
                 supply.patience = (chunk / 2).max(1);
                 return Ok(None);
             }

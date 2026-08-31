@@ -2098,8 +2098,8 @@ fn progress(
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  {} ms per page ({} robots, {} polite)  \
-         state {:.0}s ({:.0}s write, {:.0}s ask)  {} MB fetched  {} MB stored  {} failed  \
-         bottleneck: {}",
+         state {:.0}s ({:.0}s write, {:.0}s over {} asks, {} empty)  {} MB fetched  \
+         {} MB stored  {} failed  bottleneck: {}",
         summary.rows,
         report.window_mean(),
         queued,
@@ -2110,6 +2110,8 @@ fn progress(
         (report.store_ms + report.ask_ms) as f64 / 1000.0,
         report.store_ms as f64 / 1000.0,
         report.ask_ms as f64 / 1000.0,
+        report.asks,
+        report.asks_empty,
         summary.bytes_fetched / (1 << 20),
         summary.bytes_stored / (1 << 20),
         summary.failed,
