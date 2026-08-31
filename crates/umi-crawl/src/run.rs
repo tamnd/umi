@@ -78,6 +78,29 @@ use crate::scope::{LinkPolicy, Scope};
 /// of sites that have always wanted T2.
 const ALERT_FLOOR: usize = 100;
 
+/// The longest a lease may hold a slot in the fetch window doing nothing.
+///
+/// A window slot is the scarce thing in a tick. There are `--concurrency` of
+/// them and the rate the crawl runs at is how fast they turn over, so a lease
+/// asleep in one is a socket that could have been fetching somebody else. The
+/// wait has two sources and neither of them is bounded on its own. A host's
+/// slots are handed out one delay apart, so the tenth url of a host in the
+/// same batch waits ten delays. And `Retry-After` is honoured exactly, clamped
+/// only at the day `umi-fetch` will read, so one 429 can park every lease
+/// behind it for the rest of the run. Measured on server3: a crawl asked to
+/// stop sat at one lease in flight for over six minutes on an idle box, which
+/// is a window of 256 turned into a window of one.
+///
+/// Thirty seconds because that is what `FetchConfig::total_timeout` allows a
+/// lease that is actually working, and a slot held asleep should not outlast a
+/// slot held busy. Past it the lease goes back unfetched with its due time
+/// untouched, which costs nothing: the completion that named the time has
+/// already moved the host's `next_allowed_ms`, so the scheduler stops offering
+/// that host until the origin said it may, and a url parked behind ordinary
+/// spacing comes round on the next ask a slot sooner than it would have gone
+/// out anyway.
+const PARKED_MS: u64 = 30_000;
+
 /// The earliest a host may be asked again, for the leases a tick is still
 /// holding.
 ///
@@ -119,6 +142,18 @@ struct HostFloors(Mutex<HashMap<HostId, Floor>>);
 /// `asked` only moves when an origin names a time, which is the one thing that
 /// invalidates a slot somebody is already holding. So that is what a waiting
 /// lease reads.
+/// What [`HostFloors::reclaim`] found for a lease that woke up.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Reclaimed {
+    /// The slot it went to sleep on is still its slot.
+    Held,
+    /// A later slot, taken on its behalf.
+    Moved(u64),
+    /// Further out than a slot in the fetch window is worth holding open for,
+    /// and not taken. See [`PARKED_MS`].
+    Parked,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct Floor {
     /// The next free slot, moved on by every claim.
@@ -249,29 +284,44 @@ impl HostFloors {
     /// `earliest_ms` is the time the state layer already picked for this
     /// lease, and it is a floor rather than an answer: a host whose slots are
     /// spoken for further out than that hands out the further one.
-    fn claim(&self, host: HostId, earliest_ms: u64, delay_ms: u32) -> u64 {
+    ///
+    /// [`None`] when the slot lands past `ceiling_ms`, and nothing is taken in
+    /// that case. Not taking it is the point: the slot stays free for whoever
+    /// asks next, and the lease that turned it down is the one that goes back
+    /// rather than the ones behind it. See [`PARKED_MS`].
+    fn claim(&self, host: HostId, earliest_ms: u64, delay_ms: u32, ceiling_ms: u64) -> Option<u64> {
         let mut floors = self.lock();
         let floor = floors.entry(host).or_default();
         let at = floor.next.max(floor.asked).max(earliest_ms);
+        if at > ceiling_ms {
+            return None;
+        }
         floor.next = at + u64::from(delay_ms);
-        at
+        Some(at)
     }
 
-    /// A later slot for a lease whose slot went stale while it waited.
+    /// What a lease that woke up finds waiting for it.
     ///
-    /// [`None`] when it did not, which is the ordinary case and has to stay
-    /// the ordinary case. A slot goes stale when [`push`](Self::push) moves
-    /// the host past it, and the only thing that does that is an origin naming
-    /// a time.
-    fn reclaim(&self, host: HostId, held_ms: u64, delay_ms: u32) -> Option<u64> {
+    /// Three answers and not two, because the wait can grow past what the
+    /// caller is willing to hold a slot open for while the caller is asleep in
+    /// that slot, which is exactly the case a `Retry-After` on one lease of a
+    /// batch creates for the rest of it.
+    ///
+    /// [`Reclaimed::Held`] is the ordinary case and has to stay the ordinary
+    /// case. A slot goes stale when [`push`](Self::push) moves the host past
+    /// it, and the only thing that does that is an origin naming a time.
+    fn reclaim(&self, host: HostId, held_ms: u64, delay_ms: u32, ceiling_ms: u64) -> Reclaimed {
         let mut floors = self.lock();
         let floor = floors.entry(host).or_default();
         if floor.asked <= held_ms {
-            return None;
+            return Reclaimed::Held;
         }
         let at = floor.next.max(floor.asked);
+        if at > ceiling_ms {
+            return Reclaimed::Parked;
+        }
         floor.next = at + u64::from(delay_ms);
-        Some(at)
+        Reclaimed::Moved(at)
     }
 
     /// Move a host's floor out, never in. Two origins behind one host name
@@ -1799,20 +1849,26 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// the clock it reads when the answer lands. The second of those includes
     /// however long the origin took to answer, which would make a slow origin
     /// wait longer than a fast one for no reason anybody asked for.
+    ///
+    /// [`None`] when the slot is further out than `ceiling_ms`, which is the
+    /// caller's cue to hand the lease back rather than sleep on it. See
+    /// [`PARKED_MS`].
     async fn wait_for(
         &self,
         host: HostId,
         earliest_ms: u64,
         delay_ms: u32,
         floors: &HostFloors,
-    ) -> u64 {
-        let mut at = floors.claim(host, earliest_ms, delay_ms);
+        ceiling_ms: u64,
+    ) -> Option<u64> {
+        let mut at = floors.claim(host, earliest_ms, delay_ms, ceiling_ms)?;
         loop {
             self.clock.sleep_until_ms(at).await;
-            let Some(again) = floors.reclaim(host, at, delay_ms) else {
-                return at;
-            };
-            at = again;
+            match floors.reclaim(host, at, delay_ms, ceiling_ms) {
+                Reclaimed::Held => return Some(at),
+                Reclaimed::Moved(again) => at = again,
+                Reclaimed::Parked => return None,
+            }
         }
     }
 
@@ -1843,15 +1899,22 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         floors: &HostFloors,
         spent: &mut Spent,
     ) -> Fetched {
+        let now = || self.clock.now_ms();
+
         // Before the robots check rather than after, since robots.txt is a
-        // request to the same host and counts the same way.
+        // request to the same host and counts the same way. The ceiling is
+        // read from the clock here and not derived from `start_ms`, because
+        // what it bounds is how long this slot in the window is held, and that
+        // starts now whatever time the scheduler picked.
         let waited = Instant::now();
+        let ceiling = now().saturating_add(PARKED_MS);
         let slot = self
-            .wait_for(lease.key.host, start_ms, lease.delay_ms, floors)
+            .wait_for(lease.key.host, start_ms, lease.delay_ms, floors, ceiling)
             .await;
         spent.waiting_ms += ms(waited);
-
-        let now = || self.clock.now_ms();
+        let Some(slot) = slot else {
+            return Fetched::parked(&lease, now());
+        };
         let Some(origin) = origin_of(&lease.url) else {
             return Fetched::malformed(&lease, now());
         };
@@ -1929,14 +1992,26 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                 return Fetched::robots_cost(&lease, now()).taught(&lease, robots);
             }
             let again = Instant::now();
-            self.wait_for(
-                lease.key.host,
-                slot + u64::from(lease.delay_ms),
-                lease.delay_ms,
-                floors,
-            )
-            .await;
+            let ceiling = now().saturating_add(PARKED_MS);
+            let second = self
+                .wait_for(
+                    lease.key.host,
+                    slot + u64::from(lease.delay_ms),
+                    lease.delay_ms,
+                    floors,
+                    ceiling,
+                )
+                .await;
             spent.waiting_ms += ms(again);
+            // The same answer as the clamp above, reached the same way, and it
+            // costs the same nothing: the file is in the cache now, so the
+            // lease that comes back for this url does not fetch it twice.
+            if second.is_none() {
+                if lease.tier >= Tier::Rendered {
+                    self.render.refund();
+                }
+                return Fetched::parked(&lease, now()).taught(&lease, robots);
+            }
         }
 
         let robots_checked_ms = entry.fetched_ms;
@@ -2622,6 +2697,28 @@ impl Fetched {
         // constructor the same shape as the others rather than making
         // `outcome` an `Option` that only one caller ever leaves empty.
         let mut out = Self::excluded(lease, now_ms, umi_state::ExcludeReason::Robots);
+        out.give_back = true;
+        out
+    }
+
+    /// A lease whose turn on its host is further out than a slot in the fetch
+    /// window is worth holding open for.
+    ///
+    /// See [`PARKED_MS`]. Nothing was requested and nothing is known about the
+    /// url that was not known before, so like [`robots_cost`](Self::robots_cost)
+    /// the outcome here is built to keep the shape and then discarded, and
+    /// `give_back` is what actually happens to the lease. Doc 08.3's `Refused`
+    /// again, and for the same reason: the loop declined the work, the url did
+    /// not fail at anything, and its due time is left where it was.
+    fn parked(lease: &umi_state::Lease, now_ms: u64) -> Self {
+        let mut out = Self::answered(
+            lease,
+            now_ms,
+            FetchResult::Failed {
+                status: None,
+                kind: umi_state::FailureKind::Rejected,
+            },
+        );
         out.give_back = true;
         out
     }
