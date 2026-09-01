@@ -306,23 +306,39 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
                 url = target;
                 continue;
             }
+            // A 410 is a 404 that means it, so the rules are the same and only
+            // the published status differs.
+            Ok(umi_fetch::Outcome::Gone) => {
+                status = 410;
+                Robots::allow_all(Provenance::NotFound)
+            }
             // A 304 cannot happen because nothing above sends a conditional
             // request for robots.txt. It is the unreachable case rather than
             // the allow-all case: we asked and did not get an answer.
-            Ok(umi_fetch::Outcome::Gone) => Robots::allow_all(Provenance::NotFound),
             Ok(umi_fetch::Outcome::NotModified { .. }) => {
                 Robots::disallow_all(Provenance::Unreachable)
             }
-            Ok(umi_fetch::Outcome::Failed { failure, .. }) => match failure {
-                // A 4xx on robots.txt is the common case on the web: most sites
-                // do not have one. RFC 9309 2.3.1.3 says that means no
-                // restrictions.
-                umi_fetch::Failure::NotFound => Robots::allow_all(Provenance::NotFound),
-                umi_fetch::Failure::ServerError | umi_fetch::Failure::RateLimited => {
-                    Robots::disallow_all(Provenance::ServerError)
+            Ok(umi_fetch::Outcome::Failed {
+                failure,
+                status: got,
+                ..
+            }) => {
+                // A 404 is an answer and a timeout is not, and the published
+                // status is the only column that tells them apart. Leaving
+                // both at zero made the corpus say "we never heard back" about
+                // the most common robots.txt result on the web.
+                status = got.unwrap_or(0);
+                match failure {
+                    // A 4xx on robots.txt is the common case on the web: most
+                    // sites do not have one. RFC 9309 2.3.1.3 says that means
+                    // no restrictions.
+                    umi_fetch::Failure::NotFound => Robots::allow_all(Provenance::NotFound),
+                    umi_fetch::Failure::ServerError | umi_fetch::Failure::RateLimited => {
+                        Robots::disallow_all(Provenance::ServerError)
+                    }
+                    _ => Robots::disallow_all(Provenance::Unreachable),
                 }
-                _ => Robots::disallow_all(Provenance::Unreachable),
-            },
+            }
             // `Outcome` is non_exhaustive, so a variant added later lands here.
             // Disallow rather than allow: a fetch whose result this build
             // cannot name is a fetch that did not answer the question, and the

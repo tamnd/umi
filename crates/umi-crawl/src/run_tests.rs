@@ -3228,3 +3228,72 @@ async fn a_tick_publishes_one_robots_snapshot_per_host_it_fetched() {
         sink.robots().iter().map(|r| &r.host).collect::<Vec<_>>(),
     );
 }
+
+#[tokio::test]
+async fn a_host_with_no_robots_file_publishes_the_status_that_said_so() {
+    // The three ways a host ends up with no rules, and the reason the status
+    // column exists. A 404 is the most common robots.txt result on the web and
+    // it is an answer: the site is reachable and has nothing to say. A 503 is
+    // the site having a bad day, which RFC 9309 2.3.1.4 turns into disallow. A
+    // timeout is nothing at all.
+    //
+    // Publishing zero for all three, which is what this did before, makes the
+    // corpus say "we never heard back" about a host that answered promptly,
+    // and a reader who wanted to skip the fetch would go and ask anyway.
+    let state = seeded(&[
+        "https://gone.example/1",
+        "https://sick.example/1",
+        "https://dark.example/1",
+    ])
+    .await;
+    let fetch = Canned::new()
+        .outcome(
+            "https://gone.example/robots.txt",
+            umi_fetch::Outcome::Failed {
+                failure: umi_fetch::Failure::NotFound,
+                status: Some(404),
+                retry_after: None,
+            },
+        )
+        .outcome(
+            "https://sick.example/robots.txt",
+            umi_fetch::Outcome::Failed {
+                failure: umi_fetch::Failure::ServerError,
+                status: Some(503),
+                retry_after: None,
+            },
+        )
+        .outcome(
+            "https://dark.example/robots.txt",
+            umi_fetch::Outcome::Failed {
+                failure: umi_fetch::Failure::Timeout(umi_fetch::Stage::Connect),
+                status: None,
+                retry_after: None,
+            },
+        )
+        .html("https://gone.example/1", &page("G", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+    let sink = Arc::new(Collected::default());
+
+    crawler.tick(&sink).await.expect("tick");
+
+    let mut snapshots = sink.robots();
+    snapshots.sort_by(|l, r| l.host.cmp(&r.host));
+    let seen: Vec<_> = snapshots
+        .iter()
+        .map(|r| (r.host.as_str(), r.status, r.allows_us))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("dark.example", 0, 0),
+            ("gone.example", 404, 1),
+            ("sick.example", 503, 0),
+        ],
+        "the status a host gave is what gets published",
+    );
+    assert!(
+        snapshots.iter().all(|r| r.body.is_none()),
+        "none of these served a file, so none of them has one to publish",
+    );
+}
