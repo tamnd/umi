@@ -731,28 +731,61 @@ impl State for SqliteState {
             let tx = conn.transaction().state()?;
             let mut report = AdmitReport::default();
 
+            // A batch is the links off a page, so it arrives in the order a
+            // human wrote the anchors, and both tables it lands in are keyed on
+            // a blake3 hash. That makes every row a fresh root to leaf descent
+            // into a b-tree that is gigabytes wide, and admit was the largest
+            // write in a tick because of it. Sorting first turns the same
+            // inserts into a walk, which is the same fix the lease scan got.
+            //
+            // The sort has to happen twice because the two tables are keyed
+            // differently. `seen` is keyed on the url alone and the ledger is
+            // keyed on pld, host and url, so one order cannot be right for
+            // both, and doing them in separate passes is what lets each pass
+            // run in its own table's order.
+            let mut order: Vec<usize> = (0..batch.len()).collect();
+
+            // Stable, so that a url that appears twice in one batch still has
+            // its first occurrence first. That is what makes the second one
+            // `seen` rather than admitted, and a sort that reordered equal keys
+            // would change which of the two got written down.
+            order.sort_by_key(|index| batch[*index].key.url);
+            let mut fresh = vec![false; batch.len()];
+
             {
+                // The seen set decides first, so a url that is already known is
+                // `seen` whatever its ledger state is. That is what makes
+                // admitting the same batch twice idempotent.
                 let mut see = tx.prepare_cached(sql::INSERT_SEEN).state()?;
+                for &index in &order {
+                    let candidate = &batch[index];
+                    if see
+                        .execute(params![&candidate.key.url.as_bytes()[..]])
+                        .state()?
+                        == 0
+                    {
+                        report.seen += 1;
+                    } else {
+                        fresh[index] = true;
+                    }
+                }
+            }
+
+            order.sort_by_key(|index| batch[*index].key);
+
+            {
                 let mut into_ledger = tx.prepare_cached(sql::INSERT_LEDGER).state()?;
                 let mut into_pen = tx.prepare_cached(sql::INSERT_PEN).state()?;
                 // Prepared on the first dated candidate and not before. The
                 // connection keeps sixteen statements and the backend has more
-                // than that, so a fourth one held open here is one that gets
+                // than that, so a third one held open here is one that gets
                 // pushed out of the cache and prepared again elsewhere. Most
                 // batches are links off a page and carry no dates at all.
                 let mut refresh_due = None;
 
-                for candidate in batch {
-                    // The seen set decides first, so a url that is already
-                    // known is `seen` whatever its ledger state is. That is
-                    // what makes admitting the same batch twice idempotent,
-                    // and it is why a duplicate inside one batch is seen: the
-                    // first occurrence put it in the set.
-                    let fresh = see
-                        .execute(params![&candidate.key.url.as_bytes()[..]])
-                        .state()?;
-                    if fresh == 0 {
-                        report.seen += 1;
+                for &index in &order {
+                    let candidate = &batch[index];
+                    if !fresh[index] {
                         // Only a candidate carrying a publisher date can move
                         // anything, and most do not, so the ordinary link that
                         // we have seen before still costs one statement.
