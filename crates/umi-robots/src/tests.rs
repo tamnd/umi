@@ -486,6 +486,24 @@ fn an_absurd_crawl_delay_is_clamped_and_flagged() {
 }
 
 #[test]
+fn a_crawl_delay_too_big_for_a_duration_is_clamped_rather_than_a_panic() {
+    // A number can be finite and still be more seconds than a `Duration`
+    // holds, and the infallible conversion panics on exactly that. Two
+    // prefetch runs died here after a million hosts each. Every one of these
+    // is a value the parser accepts as an f64.
+    for value in ["1e30", "1e300", "99999999999999999999999999", "1.8e19"] {
+        let body = format!("User-agent: *\nCrawl-delay: {value}\n");
+        let robots = Robots::parse_str(&body);
+        assert_eq!(
+            robots.crawl_delay(),
+            Some(MAX_CRAWL_DELAY),
+            "value {value:?}"
+        );
+        assert!(robots.crawl_delay_was_clamped(), "value {value:?}");
+    }
+}
+
+#[test]
 fn a_tiny_crawl_delay_is_clamped_up() {
     let robots = Robots::parse_str("User-agent: *\nCrawl-delay: 0.001\n");
     assert_eq!(robots.crawl_delay(), Some(MIN_CRAWL_DELAY));

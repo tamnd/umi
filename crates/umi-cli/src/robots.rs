@@ -46,6 +46,7 @@ use std::time::Duration;
 use arrow::array::Array as _;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use umi_crawl::{Clock, RobotsBuilder, RobotsRow, SegmentInfo, SegmentSink, SystemClock};
 use umi_fetch::{FetchConfig, Ladder, Tier};
 use umi_file::{StreamKind, WriterConfig};
@@ -194,11 +195,13 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
     // Multi threaded, though nothing here extracts a page. The work is a few
     // hundred sockets and their TLS handshakes, and a single threaded runtime
     // would do every handshake on the thread that is also driving every read.
+    // The runtime only helps if the fetches are tasks, which is why the window
+    // below is a set of join handles and not a set of futures.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .map_err(Error::Io)?;
-    let fetcher = Ladder::with_signer(FetchConfig::default(), signer)?;
+    let fetcher = Arc::new(Ladder::with_signer(FetchConfig::default(), signer)?);
 
     let state: Arc<dyn State> =
         Arc::new(SqliteState::open(&layout.state).map_err(|e| Error::State(e.to_string()))?);
@@ -271,13 +274,13 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
             // back to collecting instead and asks again next time round.
             while !drained && inflight.len() < want {
                 match rx.try_recv() {
-                    Ok(host) => inflight.push(one(&fetcher, host, clock.now_ms())),
+                    Ok(host) => inflight.push(start(&fetcher, host, clock.now_ms())),
                     Err(mpsc::error::TryRecvError::Empty) => {
                         if !inflight.is_empty() {
                             break;
                         }
                         match rx.recv().await {
-                            Some(host) => inflight.push(one(&fetcher, host, clock.now_ms())),
+                            Some(host) => inflight.push(start(&fetcher, host, clock.now_ms())),
                             None => drained = true,
                         }
                     }
@@ -288,13 +291,25 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
                 break;
             }
 
-            if let Some(row) = inflight.next().await {
-                counts.add(&row);
-                summary.fetched += 1;
-                if row.status == 0 {
+            match inflight.next().await {
+                Some(Ok(row)) => {
+                    counts.add(&row);
+                    summary.fetched += 1;
+                    if row.status == 0 {
+                        summary.failed += 1;
+                    }
+                    rows.push(row);
+                }
+                // A fetch that panicked has no row to add. It is one host out
+                // of millions and there are hours of work behind it, so it is
+                // counted as a failure and the run carries on. The alternative
+                // is what used to happen, which is that one bad robots.txt
+                // takes the whole process down.
+                Some(Err(_)) => {
+                    summary.fetched += 1;
                     summary.failed += 1;
                 }
-                rows.push(row);
+                None => {}
             }
 
             if rows.len() >= FLUSH {
@@ -387,6 +402,19 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
 /// a guess. A host whose bot management refuses a plain client gets a row that
 /// says so, and the crawl that meets it later fetches its robots.txt at the
 /// tier it has by then earned.
+/// Set one host going as a task of its own.
+///
+/// A task and not a future, which is the whole difference between a window of
+/// a thousand on one core and a window of a thousand on all of them. A
+/// `FuturesUnordered` of plain futures is a single task however many futures
+/// are inside it, so every TLS handshake, every header parse and every body
+/// read in the window takes its turn on one thread. The two spellings look
+/// identical at the call site and one of them is eight times the machine.
+fn start(fetch: &Arc<Ladder>, host: String, now_ms: u64) -> JoinHandle<RobotsRow> {
+    let fetch = Arc::clone(fetch);
+    tokio::spawn(async move { one(&fetch, host, now_ms).await })
+}
+
 async fn one(fetch: &Ladder, host: String, now_ms: u64) -> RobotsRow {
     let entry = umi_crawl::fetch_entry(fetch, &origin(&host), Tier::Plain, now_ms).await;
     // A domain list holds registrable domains and plenty of sites only exist
