@@ -64,7 +64,7 @@ pub use fetch::Fetch;
 pub use ledger::{Recorded, SupervisedLedger};
 pub use page::{Crawled, PageBuilder, PageRow, Snippet, SnippetKind};
 pub use render::{RenderBudget, RenderPolicy, Slot};
-pub use robots::RobotsCache;
+pub use robots::{Entry as RobotsEntry, RobotsBuilder, RobotsCache, RobotsRow, fetch_entry};
 pub use run::{CrawlConfig, CrawlError, Crawler, Live, Sink, TickReport};
 pub use scope::{
     Budget, ContentFilter, Corpus, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,

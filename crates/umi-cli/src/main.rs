@@ -13,7 +13,7 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use umi_cli::{Error, block, config, crawl, doctor, get, inspect, supervise, verify};
+use umi_cli::{Error, block, config, crawl, doctor, get, inspect, robots, supervise, verify};
 use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
 
@@ -70,6 +70,8 @@ enum Command {
     },
     /// Contribute fetch capacity to a coordinator.
     Fetch(FetchArgs),
+    /// Fetch robots.txt for a list of hosts and publish doc 07.4's corpus.
+    Robots(RobotsArgs),
     /// Check that this machine can do the thing it is about to do.
     Doctor {
         /// Skip every check that touches the network.
@@ -362,6 +364,60 @@ impl CrawlArgs {
     }
 }
 
+/// Options for `umi robots`, from doc 14.5.
+#[derive(clap::Args)]
+struct RobotsArgs {
+    /// A file of hosts, `-` for standard input, or an `org/name` dataset on
+    /// the hub. The default is the published domain ranking.
+    #[arg(default_value = robots::DOMAINS)]
+    source: String,
+
+    /// The column to read when the source is a dataset.
+    #[arg(long, default_value = robots::DOMAIN_COLUMN)]
+    column: String,
+    /// Only files under this prefix, when the source is a dataset.
+    #[arg(long)]
+    prefix: Option<String>,
+
+    /// Simultaneous in flight fetches.
+    #[arg(long, default_value_t = robots::CONCURRENCY)]
+    concurrency: u16,
+    /// Stop after this many hosts.
+    #[arg(long)]
+    limit: Option<u64>,
+    /// Skip this many hosts from the front of the list, which is how one run
+    /// continues where the last one stopped.
+    #[arg(long, default_value_t = 0)]
+    skip: u64,
+    /// Stop after this long.
+    #[arg(long, value_name = "DURATION")]
+    r#for: Option<String>,
+
+    /// Output directory.
+    #[arg(long)]
+    out: Option<String>,
+    /// Publish to Hugging Face, and delete local copies once they verify.
+    #[arg(long)]
+    publish: bool,
+}
+
+impl RobotsArgs {
+    fn plan(&self, config: &config::Config) -> Result<robots::Options, Error> {
+        Ok(robots::Options {
+            source: self.source.clone(),
+            column: self.column.clone(),
+            prefix: self.prefix.clone(),
+            out: self.out.clone(),
+            concurrency: self.concurrency,
+            limit: self.limit,
+            skip: self.skip,
+            max_duration: self.r#for.clone(),
+            publish: crawl::Publishing::resolve(config, self.publish)?,
+            identity: crawl::Identity::resolve(config)?,
+        })
+    }
+}
+
 /// Options for `umi fetch`, from doc 14.4.
 #[derive(clap::Args)]
 struct FetchArgs {
@@ -406,6 +462,10 @@ impl Command {
                 tabs: if args.no_render { Some(0) } else { args.tabs },
                 out: args.out.clone(),
                 backend: args.state.clone(),
+                ..config::Flags::default()
+            },
+            Self::Robots(args) => config::Flags {
+                out: args.out.clone(),
                 ..config::Flags::default()
             },
             Self::Fetch(args) => config::Flags {
@@ -502,6 +562,18 @@ fn run(command: &Command) -> Result<(), Error> {
         Command::Crawl(args) => {
             let config = load(command)?;
             finish(crawl::crawl(&args.plan(&config)?))
+        }
+        Command::Robots(args) => {
+            let config = load(command)?;
+            let summary = robots::robots(&args.plan(&config)?)?;
+            println!(
+                "{} hosts asked, {} rows in {} files, {} published, {} never answered",
+                summary.fetched, summary.rows, summary.files, summary.published, summary.failed
+            );
+            match summary.stopped {
+                crawl::Stop::Budget => Err(Error::Budget),
+                crawl::Stop::Idle | crawl::Stop::Signal => Ok(()),
+            }
         }
         Command::Resume { dir, publish } => {
             let config = load(command)?;
