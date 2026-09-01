@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -447,11 +448,29 @@ impl Collected {
 struct Sleepy {
     inner: Collected,
     per_batch: Duration,
+    /// How many times the loop handed it a batch, for the tests that care
+    /// about the shape of the write path and not just its cost.
+    batches: AtomicUsize,
+}
+
+impl Sleepy {
+    fn new(per_batch: Duration) -> Self {
+        Self {
+            inner: Collected::default(),
+            per_batch,
+            batches: AtomicUsize::new(0),
+        }
+    }
+
+    fn batches(&self) -> usize {
+        self.batches.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait::async_trait]
 impl Sink for Sleepy {
     async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError> {
+        self.batches.fetch_add(1, Ordering::Relaxed);
         tokio::time::sleep(self.per_batch).await;
         self.inner.take(rows).await
     }
@@ -1084,10 +1103,7 @@ async fn the_loop_keeps_fetching_while_the_last_window_is_being_written() {
         },
     );
 
-    let sink = Arc::new(Sleepy {
-        inner: Collected::default(),
-        per_batch: Duration::from_millis(20),
-    });
+    let sink = Arc::new(Sleepy::new(Duration::from_millis(20)));
     let report = crawler.tick(&sink).await.expect("tick");
     assert_eq!(report.rows, 32, "{report:?}");
     assert_eq!(sink.inner.rows().len(), 32, "{report:?}");
@@ -1120,6 +1136,61 @@ async fn the_loop_keeps_fetching_while_the_last_window_is_being_written() {
     assert!(
         report.rows_ms + report.complete_ms + report.admit_ms <= report.store_ms,
         "the parts came to more than the whole: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_store_that_falls_behind_gets_a_wider_batch_rather_than_the_loop() {
+    // The store running beside the loop is only half of it. The other half is
+    // what happens when the store is slower than a window of fetching, which on
+    // server3 it was for most of a tick: 184 seconds of a 195 second tick spent
+    // at the barrier, with the window sitting at 97 of its 256 slots because
+    // the loop was not harvesting and not leasing.
+    //
+    // Sixty four urls through a window of four, five milliseconds a request and
+    // a hundred a batch, so the sink is twenty times slower than the fetching
+    // it is meant to hide behind. Sixteen windows. The loop that waits for each
+    // one writes sixteen times and spends the tick doing it. The loop that
+    // carries on writes five, because `SLACK` lets a batch reach four windows
+    // and then stops it.
+    let (urls, canned) = a_page_each(64);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let fetch = Slow {
+        inner: canned,
+        per_request: Duration::from_millis(5),
+    };
+    let crawler = Crawler::new(
+        fetch,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let sink = Arc::new(Sleepy::new(Duration::from_millis(100)));
+    let report = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(report.rows, 64, "{report:?}");
+    assert_eq!(sink.inner.rows().len(), 64, "{report:?}");
+    // Eight and not five, because a batch is handed over on the harvest that
+    // fills it and the loop does not get to choose when that lands. The failure
+    // this catches is sixteen, and that is a factor of two away from here.
+    assert!(
+        sink.batches() <= 8,
+        "the loop wrote {} batches of sixty four rows through a window of \
+         four, so it is still waiting for the store between windows",
+        sink.batches()
+    );
+    // The other side of it, and the reason `SLACK` exists. A loop that never
+    // waits holds the whole tick in memory and hands the sink one batch, which
+    // is the shape storing per window was there to avoid.
+    assert!(
+        sink.batches() >= 4,
+        "sixty four rows in {} batches means a batch grew past the four \
+         windows SLACK allows it",
+        sink.batches()
     );
 }
 

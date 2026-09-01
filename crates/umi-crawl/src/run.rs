@@ -101,6 +101,21 @@ const ALERT_FLOOR: usize = 100;
 /// out anyway.
 const PARKED_MS: u64 = 30_000;
 
+/// How many windows of answers a tick may hold while the store catches up.
+///
+/// One store runs at a time and the loop hands it a batch every window. When
+/// the store is keeping up the batch is exactly a window wide, which is what it
+/// has always been. When it is not, the loop keeps harvesting rather than
+/// standing still, and the next batch is however much piled up in the meantime.
+///
+/// Four is where that stops. Past it the loop waits, because a batch with no
+/// ceiling is the whole tick held in memory and the whole tick lost to a crash,
+/// which is what storing per window was there to avoid in the first place. A
+/// row in hand is on the order of 40 KB and a window is at most a few thousand,
+/// so four of them is a few hundred megabytes at the widest window we run, and
+/// a store that has fallen four windows behind has stalled rather than slipped.
+const SLACK: usize = 4;
+
 /// The earliest a host may be asked again, for the leases a tick is still
 /// holding.
 ///
@@ -1116,11 +1131,12 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         // still takes the whole write path off this task: store N runs while
         // the loop harvests the fetches that will make up store N plus one.
         //
-        // Deeper would buy nothing anyway. The loop only waits here if a
-        // window fills faster than the last one can be written, and a window
-        // takes seconds to fetch against a store measured in hundreds of
-        // milliseconds. `store_waited_ms` is what says if that stops being
-        // true.
+        // Deeper would buy nothing anyway, and it is not what the loop needed.
+        // A window fills faster than the last one can be written more often
+        // than the first shape of this assumed, and the answer to that is the
+        // loop carrying on into the batch it is already holding rather than a
+        // second store running beside the first. See `SLACK`.
+        // `store_waited_ms` is what says how often it still happens.
         let mut storing: Option<JoinHandle<Result<Stored, CrawlError>>> = None;
         let mut deferred: Vec<LeaseId> = Vec::new();
 
@@ -1271,10 +1287,36 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             // runs until its whole batch is spent, and holding every page of
             // that in memory until the last one lands is both a lot of memory
             // and a lot to lose if the process dies.
+            //
+            // A window's worth is when the batch is worth handing over, not
+            // when the loop has to stop and wait for room. Those were the same
+            // thing until they were measured, and then the wait turned out to
+            // be most of a tick: 184 seconds of a 195 second tick on server3,
+            // with the window sitting at 97 of its 256 slots because nothing
+            // was harvesting the finished fetches or asking for the leases that
+            // would replace them. The fetches were never the slow part.
+            //
+            // So the loop asks whether the last store is done rather than
+            // waiting for it, and if it is not, carries on harvesting into the
+            // same batch. The rule that one store runs at a time is untouched,
+            // and so is the order inside it. What changes is that the batch a
+            // store gets can be several windows wide when the store is behind,
+            // which is the shape that costs the fewest round trips anyway.
+            //
+            // `SLACK` is where waiting comes back. A batch that never blocked
+            // would hold the whole tick in memory again and lose the whole tick
+            // to a crash, which is exactly what storing per window was for.
+            // Four windows is the compromise: about 40 KB a row in hand against
+            // a segment write measured in hundreds of milliseconds, so the loop
+            // reaches it only if the store has stalled outright, and then
+            // waiting is the right answer.
             if held.outcomes.len() >= window {
-                collect(storing.take(), &mut report).await?;
-                let batch = std::mem::replace(&mut held, Held::new(window));
-                storing = Some(self.put(sink, batch, now_ms));
+                let waiting = storing.as_ref().is_some_and(|store| !store.is_finished());
+                if !waiting || held.outcomes.len() >= window.saturating_mul(SLACK) {
+                    collect(storing.take(), &mut report).await?;
+                    let batch = std::mem::replace(&mut held, Held::new(window));
+                    storing = Some(self.put(sink, batch, now_ms));
+                }
             }
         }
         // Both, in order. The one in flight has the earlier window in it and
