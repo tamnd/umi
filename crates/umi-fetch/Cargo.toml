@@ -16,6 +16,13 @@ workspace = true
 name = "sign"
 harness = false
 
+# The resolver's ceiling, which is the ladder's ceiling. It needs a list of
+# real hosts and it goes to the network, so it measures nothing at all unless
+# UMI_DNS_LIST names one.
+[[bench]]
+name = "dns"
+harness = false
+
 # Doc 05.6's per page cost, which needs a real browser and so cannot be part of
 # a default `cargo bench`. `required-features` is what keeps it out.
 [[bench]]
