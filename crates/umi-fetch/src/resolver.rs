@@ -24,12 +24,13 @@
 //! point and two clients on the same box crawl the same hosts, so a T1 client
 //! and a T2 client sharing it is a cache hit rather than a second lookup.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use hickory_resolver::TokioResolver;
-use hickory_resolver::config::LookupIpStrategy;
+use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 /// How many answers to keep. A broad crawl comes back to a host many times
@@ -52,6 +53,26 @@ const ACTIVE: usize = 4096;
 /// and a name that is slow to resolve is usually a name that will not resolve.
 const ATTEMPT: Duration = Duration::from_secs(2);
 
+/// The environment variable that names the resolvers to ask.
+///
+/// Comma separated addresses, and it overrides whatever the platform is
+/// configured with. It exists because of what the fleet found on its own
+/// boxes. Ubuntu points `/etc/resolv.conf` at `127.0.0.53`, the
+/// systemd-resolved stub, and the stub is a single process that answers one
+/// query at a time from a cache it sizes itself. Measured on server3 against
+/// two thousand cold names: 133 answers a second with 64 outstanding and 138
+/// with 512, and past 256 the failures climb because queries are waiting on
+/// the stub rather than on the network. Doc 16's gate 3.1 wants 250 pages a
+/// second and each cold page needs a name and its robots.txt needed another,
+/// so the stub alone is well under half the gate.
+///
+/// Naming the upstream resolvers directly takes the stub out. That is an
+/// operator's decision and not ours to make silently, because the stub is
+/// also what carries a box's VPN and split horizon configuration, and a
+/// crawler that quietly went around it would resolve differently from
+/// everything else on the machine.
+pub const SERVERS: &str = "UMI_DNS_SERVERS";
+
 /// The process resolver.
 ///
 /// Cheap to clone, and clones share the cache. Build it with
@@ -67,10 +88,11 @@ impl Resolver {
     /// The one for this process.
     ///
     /// The nameservers come from the platform, which on Unix means
-    /// `/etc/resolv.conf` and on Windows means the registry, so an operator
-    /// points the crawler at a different resolver the way they point
-    /// everything else at one. Both address families are asked for, because
-    /// the fleet has v6 and a v6 only host is a host nobody else is crawling.
+    /// `/etc/resolv.conf` and on Windows means the registry, unless the
+    /// environment names them instead. See the SERVERS constant for what that
+    /// is worth on a box whose platform answer is the systemd-resolved stub.
+    /// Both address families are asked for, because the fleet has v6 and a v6
+    /// only host is a host nobody else is crawling.
     #[must_use]
     pub fn shared() -> Self {
         static SHARED: OnceLock<Resolver> = OnceLock::new();
@@ -81,6 +103,20 @@ impl Resolver {
             .clone()
     }
 
+    /// A resolver of its own, with a cache nobody else is filling.
+    ///
+    /// Everything in the fleet wants [`shared`](Self::shared), because the
+    /// cache is the whole point and a second cache is a second set of
+    /// queries. This exists for the DNS benchmark, which measures what a cold
+    /// lookup costs and cannot measure that on a resolver the rest of the
+    /// process has spent the day warming.
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self {
+            inner: Arc::new(OnceLock::new()),
+        }
+    }
+
     /// The resolver, built if this is the first call.
     ///
     /// Returns `None` when the platform has no usable DNS configuration at
@@ -89,7 +125,12 @@ impl Resolver {
         if let Some(built) = self.inner.get() {
             return Some(built);
         }
-        let mut builder = TokioResolver::builder_tokio().ok()?;
+        let mut builder = match configured() {
+            Some(config) => {
+                TokioResolver::builder_with_config(config, TokioRuntimeProvider::default())
+            }
+            None => TokioResolver::builder_tokio().ok()?,
+        };
         let options = builder.options_mut();
         options.cache_size = CACHE;
         options.max_active_requests = ACTIVE;
@@ -100,6 +141,35 @@ impl Resolver {
         let _ = self.inner.set(built);
         self.inner.get()
     }
+}
+
+/// The resolvers named in the environment, if any are.
+///
+/// An address that will not parse is skipped rather than fatal, and a variable
+/// holding nothing usable falls back to the platform. A crawler that refused
+/// to start over a typo in a tuning knob would be trading a slow run for no
+/// run.
+fn configured() -> Option<ResolverConfig> {
+    let listed = std::env::var(SERVERS).ok()?;
+    let servers = addresses(&listed);
+    if servers.is_empty() {
+        return None;
+    }
+    // UDP and TCP both, because a large answer comes back truncated over UDP
+    // and the retry has to have somewhere to go.
+    let name_servers = servers
+        .into_iter()
+        .map(NameServerConfig::udp_and_tcp)
+        .collect();
+    Some(ResolverConfig::from_parts(None, Vec::new(), name_servers))
+}
+
+/// The addresses in a comma separated list, skipping anything that is not one.
+fn addresses(listed: &str) -> Vec<IpAddr> {
+    listed
+        .split(',')
+        .filter_map(|entry| entry.trim().parse().ok())
+        .collect()
 }
 
 impl Resolve for Resolver {
@@ -137,6 +207,27 @@ mod tests {
             addrs.iter().any(|a| a.ip().is_loopback()),
             "localhost resolved to {addrs:?}"
         );
+    }
+
+    #[test]
+    fn a_list_of_servers_reads_as_addresses_and_skips_what_is_not_one() {
+        assert_eq!(
+            addresses("127.0.0.1, 9.9.9.9,2606:4700:4700::1111"),
+            vec![
+                "127.0.0.1".parse::<IpAddr>().expect("v4"),
+                "9.9.9.9".parse().expect("v4"),
+                "2606:4700:4700::1111".parse().expect("v6"),
+            ],
+        );
+        // A typo in a tuning knob is worth ignoring rather than refusing to
+        // start over, and a variable holding nothing usable falls back to the
+        // platform.
+        assert_eq!(
+            addresses("1.1.1.1,not-an-address"),
+            vec!["1.1.1.1".parse::<IpAddr>().expect("v4")],
+        );
+        assert!(addresses("").is_empty());
+        assert!(addresses("localhost").is_empty());
     }
 
     #[tokio::test]
