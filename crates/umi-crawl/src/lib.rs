@@ -67,7 +67,7 @@ pub use render::{RenderBudget, RenderPolicy, Slot};
 pub use robots::RobotsCache;
 pub use run::{CrawlConfig, CrawlError, Crawler, Live, Sink, TickReport};
 pub use scope::{
-    Budget, ContentFilter, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,
+    Budget, ContentFilter, Corpus, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,
 };
 pub use sink::{Sealed, SegmentInfo, SegmentSink};
 pub use sitemap::{SitemapLimits, SitemapReport};

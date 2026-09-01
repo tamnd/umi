@@ -31,6 +31,7 @@ pub struct Scope {
     pub content:       ContentFilter,
     pub budget:        Budget,
     pub rate:          RateOverride,
+    pub corpus:        Corpus,         // which published repository, see 13.8
 }
 
 pub enum Matcher {
@@ -203,6 +204,10 @@ Default is local only. A focused crawl of someone's site is a thing the operator
 `--publish` sends it through doc 12 into `open-index/umi-focus-<name>`, a separate repository family from the general corpus, with the profile, the seed sources and the operator recorded in the dataset card. Focused crawls do not go into `umi-pages-*`, because the general corpus is supposed to be an unbiased sample of the web and a focused crawl is by definition not that. Mixing them would quietly poison every statistic anyone computes over the corpus.
 
 Everything in doc 12 otherwise applies unchanged: manifests, signatures, the exclusion list, the licence split, the takedown path.
+
+The general corpus has to have a producer, though, and `umi crawl` is the only thing that writes pages. So a profile can say `corpus = "general"` and its pages go to `umi-pages-<iso week>-<slice>` instead. The default is `"focus"` and every profile written before this key existed keeps the old behaviour, which is the direction where being wrong is cheap. A crawl that lands in its own repository by mistake costs somebody a repository name. A crawl that lands in the general corpus by mistake costs everybody the corpus.
+
+The key is a declaration by the operator and not a fact the code works out, because what makes a crawl an unbiased sample is the seed as much as the matchers, and nothing in the code can tell whether a list of ten thousand hostnames is representative of the web. What the code does check is the half it can see: a profile that carries any `include` or `exclude` matcher is a focused crawl whatever it calls itself, and asking for the general corpus alongside one is an error rather than a downgrade. An operator who wrote both lines meant one of them, and a crawl that publishes somewhere other than where its profile says is worse than a crawl that refuses to start.
 
 ## 13.9 Limits
 

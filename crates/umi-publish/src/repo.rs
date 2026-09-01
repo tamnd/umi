@@ -243,7 +243,7 @@ pub fn locate_in(org: &str, family: Family, first_ms: u64, slice: u16, segment: 
 ///
 /// Two things vary and neither of them is doc 12.4's layout. The organisation
 /// varies because doc 14.7 lets an operator set `publish.org`, and the focused
-/// crawl name varies because doc 13.7 sends a focused crawl somewhere else
+/// crawl name varies because doc 13.8 sends a focused crawl somewhere else
 /// entirely. Everything below the repository name is the same in all cases,
 /// which is why this is one struct with one method rather than two families of
 /// function.
@@ -280,7 +280,7 @@ impl Corpus {
 
     /// Where a segment of this family goes.
     ///
-    /// Only pages move when the crawl is focused. Doc 13.7's rule is about the
+    /// Only pages move when the crawl is focused. Doc 13.8's rule is about the
     /// corpus being an unbiased sample and a focused crawl not being one, and
     /// that argument is about pages: receipts are doc 04's audit trail and
     /// robots is doc 07.4's longitudinal record, neither of which anyone
@@ -427,7 +427,7 @@ mod tests {
 
     #[test]
     fn a_focused_crawl_never_lands_in_the_general_corpus() {
-        // Doc 13.7. The general corpus is supposed to be an unbiased sample of
+        // Doc 13.8. The general corpus is supposed to be an unbiased sample of
         // the web and a focused crawl is by definition not one, so mixing them
         // poisons every statistic anyone computes over the corpus. Nothing
         // else moves: receipts and robots are not the corpus.

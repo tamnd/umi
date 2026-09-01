@@ -1407,11 +1407,14 @@ fn meta_repo(org: &str) -> String {
 /// segments are named from, so a published file can be traced back to the crawl
 /// that produced it without anything else having to be recorded.
 ///
-/// The corpus is the focused one, named after the scope, because every crawl
-/// this file runs is a focused crawl. Doc 13.7 keeps those out of
-/// `umi-pages-*`: the general corpus is meant to be an unbiased sample of the
-/// web, a crawl of one domain is not, and mixing them poisons every statistic
-/// anyone computes over the corpus afterwards.
+/// The corpus is the focused one unless the profile says otherwise, and the
+/// default is the focused one because that is the direction where a mistake is
+/// cheap. Doc 13.8 keeps focused crawls out of `umi-pages-*`: the general
+/// corpus is meant to be an unbiased sample of the web, a crawl of one domain
+/// is not, and mixing them poisons every statistic anyone computes over the
+/// corpus afterwards. A crawl that lands in its own repository by mistake costs
+/// somebody a repository name. A crawl that lands in the general corpus by
+/// mistake costs everybody the corpus.
 fn publisher(publishing: &Publishing, scope: &Scope, layout: &Layout) -> Result<Publisher, Error> {
     let hub = Hub::new(publishing.token.clone())?;
     let key = SigningKey::from_hex(Role::Publishing, &publishing.key)?;
@@ -1420,7 +1423,14 @@ fn publisher(publishing: &Publishing, scope: &Scope, layout: &Layout) -> Result<
         key,
         PublishConfig {
             staging: layout.staging.clone(),
-            corpus: Corpus::focused(&publishing.org, &scope.name),
+            corpus: match scope.corpus {
+                umi_crawl::Corpus::General => Corpus::new(&publishing.org),
+                umi_crawl::Corpus::Focus => Corpus::focused(&publishing.org, &scope.name),
+                // `Corpus` is `non_exhaustive`, so a variant added later lands
+                // here. Publishing to the focused repository is the answer that
+                // cannot hurt anyone but the operator who asked for it.
+                _ => Corpus::focused(&publishing.org, &scope.name),
+            },
             slice: publishing.slice,
             coordinator: hex::encode(coordinator_key(&layout.dir)),
             ..PublishConfig::default()
