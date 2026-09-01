@@ -236,6 +236,36 @@ impl RobotsCache {
     }
 }
 
+/// Fetch one origin's robots.txt into an [`Entry`], with no cache in front of
+/// it.
+///
+/// The bulk prefetch is what this is for. It walks a list of hosts it has never
+/// met, asks each of them once, and writes the answer straight out to a
+/// segment, so there is nothing for a cache to save it and a map holding a
+/// hundred million entries would be the largest thing in the process. A crawl
+/// wants [`RobotsCache::entry`] instead, because a crawl asks the same question
+/// about the same host a few hundred times a minute.
+///
+/// `now_ms` is the fetch time and the base for the expiry, and it is passed in
+/// rather than read here for the reason the rest of the crate does not read a
+/// clock: two machines replaying the same run have to produce the same rows.
+pub async fn fetch_entry<F: Fetch + ?Sized>(
+    fetch: &F,
+    origin: &str,
+    tier: Tier,
+    now_ms: u64,
+) -> Entry {
+    let got = fetch_robots(fetch, origin, tier).await;
+    Entry {
+        robots: Arc::new(got.robots),
+        digest: got.digest,
+        fetched_ms: now_ms,
+        expires_ms: now_ms + TTL_MS,
+        status: got.status,
+        body: got.body,
+    }
+}
+
 /// Fetch and parse one origin's robots.txt.
 ///
 /// Every path here ends in a `Robots`, including the ones where the fetch

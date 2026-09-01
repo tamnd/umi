@@ -772,22 +772,22 @@ struct Settings {
 }
 
 /// Doc 13.5's directory, as paths.
-struct Layout {
-    dir: PathBuf,
-    profile: PathBuf,
-    state: PathBuf,
-    segments: PathBuf,
-    robots_segments: PathBuf,
-    robots_data: PathBuf,
-    data: PathBuf,
-    staging: PathBuf,
-    manifest: PathBuf,
-    published: PathBuf,
-    log: PathBuf,
+pub(crate) struct Layout {
+    pub(crate) dir: PathBuf,
+    pub(crate) profile: PathBuf,
+    pub(crate) state: PathBuf,
+    pub(crate) segments: PathBuf,
+    pub(crate) robots_segments: PathBuf,
+    pub(crate) robots_data: PathBuf,
+    pub(crate) data: PathBuf,
+    pub(crate) staging: PathBuf,
+    pub(crate) manifest: PathBuf,
+    pub(crate) published: PathBuf,
+    pub(crate) log: PathBuf,
 }
 
 impl Layout {
-    fn create(dir: &Path) -> Result<Self, Error> {
+    pub(crate) fn create(dir: &Path) -> Result<Self, Error> {
         let dir = dir.to_path_buf();
         std::fs::create_dir_all(dir.join(SEGMENTS)).map_err(Error::Io)?;
         std::fs::create_dir_all(dir.join(DATA)).map_err(Error::Io)?;
@@ -1473,7 +1473,7 @@ fn run(
 }
 
 /// Doc 12.4's registry, under whichever organisation is publishing.
-fn meta_repo(org: &str) -> String {
+pub(crate) fn meta_repo(org: &str) -> String {
     format!("{org}/umi-meta")
 }
 
@@ -1491,7 +1491,11 @@ fn meta_repo(org: &str) -> String {
 /// corpus afterwards. A crawl that lands in its own repository by mistake costs
 /// somebody a repository name. A crawl that lands in the general corpus by
 /// mistake costs everybody the corpus.
-fn publisher(publishing: &Publishing, scope: &Scope, layout: &Layout) -> Result<Publisher, Error> {
+pub(crate) fn publisher(
+    publishing: &Publishing,
+    scope: &Scope,
+    layout: &Layout,
+) -> Result<Publisher, Error> {
     let hub = Hub::new(publishing.token.clone())?;
     let key = SigningKey::from_hex(Role::Publishing, &publishing.key)?;
     let publisher = Publisher::new(
@@ -1619,7 +1623,7 @@ async fn harvest(
 /// file at all. It is what doc 12.8's reconciliation compares a recovered local
 /// file against, and computing it now costs about 50 ms per 128 MB segment
 /// against the 30 seconds doc 12.2 budgets for the conversion that follows.
-async fn record(
+pub(crate) async fn record(
     sealed: &[umi_crawl::Sealed],
     stream: Stream,
     state: &dyn State,
@@ -1651,7 +1655,7 @@ async fn record(
 }
 
 /// blake3 of a file, read in chunks rather than into memory.
-fn digest_of(path: &Path) -> Result<[u8; 32], Error> {
+pub(crate) fn digest_of(path: &Path) -> Result<[u8; 32], Error> {
     let mut file = std::fs::File::open(path).map_err(Error::Io)?;
     let mut hasher = blake3::Hasher::new();
     std::io::copy(&mut file, &mut hasher).map_err(Error::Io)?;
@@ -1663,7 +1667,7 @@ fn digest_of(path: &Path) -> Result<[u8; 32], Error> {
 /// Appended rather than rewritten, and one object per line rather than one
 /// array, so that a crawl killed halfway leaves a file that still parses up to
 /// the last complete line.
-fn receipt(path: &Path, published: &Published) -> Result<(), Error> {
+pub(crate) fn receipt(path: &Path, published: &Published) -> Result<(), Error> {
     use std::io::Write as _;
     let line = serde_json::json!({
         "segment": published.segment.to_text(),
@@ -1690,7 +1694,7 @@ fn receipt(path: &Path, published: &Published) -> Result<(), Error> {
 /// whose chunks do not decode stops the crawl here rather than turning into a
 /// Parquet file nobody notices is wrong. That is also why the delete is after
 /// the convert and not part of it.
-fn keep(
+pub(crate) fn keep(
     sealed: &[umi_crawl::Sealed],
     into: &Path,
     manifest: &mut Option<&mut Manifest>,
@@ -1938,7 +1942,7 @@ fn seed_url(target: &str) -> Option<String> {
 /// the same identifier stream rather than starting a new one, and so that two
 /// crawls in two directories on one machine never produce the same segment
 /// name.
-fn coordinator_key(dir: &Path) -> [u8; 32] {
+pub(crate) fn coordinator_key(dir: &Path) -> [u8; 32] {
     let absolute = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     *blake3::hash(absolute.as_os_str().as_encoded_bytes()).as_bytes()
 }
@@ -1948,7 +1952,7 @@ fn coordinator_key(dir: &Path) -> [u8; 32] {
 /// Days since the epoch turned into a date by the civil from days algorithm,
 /// which is about ten lines and has no dependency, against a date crate that
 /// would be a dependency for this one call.
-fn day(ms: u64) -> String {
+pub(crate) fn day(ms: u64) -> String {
     let days = i64::try_from(ms / 86_400_000).unwrap_or(0);
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -2471,10 +2475,10 @@ fn bottleneck(report: &TickReport) -> &'static str {
 /// Flushed rather than buffered because the reason this file exists is to be
 /// readable while the crawl is running, and a buffered log is empty for the
 /// first eight kilobytes of a crawl that has been going for an hour.
-struct Log(std::fs::File);
+pub(crate) struct Log(std::fs::File);
 
 impl Log {
-    fn open(path: &Path) -> Result<Self, Error> {
+    pub(crate) fn open(path: &Path) -> Result<Self, Error> {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -2483,7 +2487,7 @@ impl Log {
             .map_err(Error::Io)
     }
 
-    fn line(&mut self, text: &str) -> Result<(), Error> {
+    pub(crate) fn line(&mut self, text: &str) -> Result<(), Error> {
         use std::io::Write;
         writeln!(self.0, "{text}").map_err(Error::Io)?;
         eprintln!("umi: {text}");

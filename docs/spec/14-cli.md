@@ -22,6 +22,7 @@ umi resume <dir>              continue a crawl directory
 umi watch <dir>               continue and keep it fresh, doc 09
 
 umi fetch                     run as a community fetcher, doc 04
+umi robots                    prefetch robots.txt in bulk, doc 07.4
 umi doctor                    check this machine can do the thing it is about to do
 
 umi seed cc                   seed from Common Crawl via ccrawl-cli, doc 13.6
@@ -54,7 +55,7 @@ umi peers                     coordinator peering state
 umi fetchers                  connected fetchers, reputation, rates, doc 06
 ```
 
-Twenty six commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
+Twenty seven commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
 
 `--publish` is a flag on all three of `crawl`, `resume` and `watch`, and it means the same thing on each one. A crawl started with it and resumed without it keeps its next segments locally, which is deliberate: the flag is the operator saying what this run should do, not a property the directory remembers, because the two things it needs are secrets and secrets do not belong in a directory that gets moved around.
 
@@ -205,6 +206,36 @@ umi drain                        seal segments, publish, stop cleanly
 ```
 
 `umi drain` is the one to get right. It stops leasing, waits for outstanding leases to complete or expire, seals every open segment, runs the publish pipeline to completion, verifies, deletes, checkpoints state, and exits. A clean shutdown loses nothing. An unclean one loses at most the shoal in flight, per doc 10.7, and doc 09.8 covers frontier recovery.
+
+### `umi robots`
+
+```
+umi robots [<source>] [options]
+
+Source is a file of hosts, `-` for stdin, or an org/name dataset on the hub.
+  umi robots                             open-index/ccrawl-domains, the default
+  umi robots ./hosts.txt                 one host or URL per line
+  umi robots open-index/umi-frontier     a published backlog
+
+  --column <name>            the column to read from a dataset  [default: domain]
+  --prefix <path>            only files under this prefix in the dataset
+  --concurrency <n>          in flight fetches               [default: 256]
+  --limit <n>                stop after this many hosts
+  --skip <n>                 start this far into the list
+  --for <dur>                stop after this long
+  --out <dir>                where to write                  [default: ./umi-robots]
+  --publish                  push to open-index/umi-robots and delete local copies
+```
+
+A crawl already writes a robots row for every host it meets and that is where most of doc 07.4's corpus comes from. This command exists because of what the meeting costs. Measured on server3 over four hundred cold hosts, a page took 1865 ms of wall clock and 927 ms of that was the robots.txt in front of it, which is DNS, TLS and a round trip for a file that is the same file for every crawler on the web and does not change for a day. A fleet spreading across a frontier of five hundred million URLs meets tens of thousands of new hosts an hour and pays that on every one of them.
+
+So the command fetches robots.txt and nothing else, off a list of hosts, and publishes the rows. What that buys is the corpus itself, which nobody else publishes at this scale, and a cache the fleet starts from, so a coordinator meeting a host for the first time reads a row instead of opening a connection.
+
+The default source is the published domain ranking rather than anything this project owns, because the order is the useful part: a run that stops after a million hosts has the million hosts most likely to be worth having. A dataset is streamed one Parquet file at a time with the column projected before anything is decoded, so the machine doing the fetching never stores the list. That is the point of taking a repository name at all. The fleet's disks are a cache and not a library, and two gigabytes of hostnames sitting on every box is two gigabytes not holding pages.
+
+`--skip` and `--limit` carve one list into runs that do not overlap, counted over the hosts that would have been asked rather than the lines that were read, so the same two numbers mean the same thing on a second machine. Every run is T1 and only T1: doc 05.8 moves a host up the ladder from what a crawl learned about it, and a run that has never fetched a page from any of these hosts has learned nothing, so escalating here would spend a browser on a guess. A host whose bot management refuses a plain client gets a row saying so, and the crawl that meets it later asks again at the tier it has by then earned.
+
+Politeness is one request per host, which is the whole of it. There is no per host rate limit because there is no second request to space out, and the hosts arrive in an order that has nothing to do with which IP serves them. Doc 07.7's block list still applies: a domain somebody asked us to leave alone should not be getting requests for its robots.txt either.
 
 ### `umi block`
 

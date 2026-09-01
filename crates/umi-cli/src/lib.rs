@@ -21,6 +21,7 @@ pub mod exporter;
 pub mod get;
 pub mod inspect;
 pub mod rdns;
+pub mod robots;
 pub mod supervise;
 pub mod verify;
 
