@@ -145,6 +145,8 @@ pub struct Robots {
     /// True when the whole file is a blanket disallow, which lets the frontier
     /// skip a host without walking its rules.
     blanket_disallow: bool,
+    /// How many user agent groups the file had, ours and everybody else's.
+    groups: u32,
 }
 
 impl Robots {
@@ -159,6 +161,7 @@ impl Robots {
             content_usage: Vec::new(),
             provenance,
             blanket_disallow: false,
+            groups: 0,
         }
     }
 
@@ -176,6 +179,7 @@ impl Robots {
             content_usage: Vec::new(),
             provenance,
             blanket_disallow: true,
+            groups: 0,
         }
     }
 
@@ -269,6 +273,11 @@ impl Robots {
 
         let mut sitemaps = Vec::new();
         let mut content_usage = Vec::new();
+        // Every group in the file, not just the one that matched us. The
+        // published snapshot reports it so a reader can tell a file that named
+        // us specifically from one that gave everybody the same rules, and
+        // that comparison needs the count from the whole file.
+        let mut groups = 0u32;
 
         for line in text.lines() {
             let Some((field, value)) = split_line(line) else {
@@ -302,6 +311,10 @@ impl Robots {
                     let finished = std::mem::replace(&mut current, Group::new(&usable));
                     best = keep_better(best, finished);
                     in_agent_run = true;
+                    // The first user agent line in the file lands here too,
+                    // because nothing has started a run yet, so this counts
+                    // every group rather than every group after the first.
+                    groups = groups.saturating_add(1);
                 }
                 current.note_agent(value);
                 continue;
@@ -352,6 +365,7 @@ impl Robots {
             content_usage,
             provenance: Provenance::Parsed,
             blanket_disallow,
+            groups,
         }
     }
 
@@ -450,6 +464,18 @@ impl Robots {
     #[must_use]
     pub fn rule_count(&self) -> usize {
         self.rules.len()
+    }
+
+    /// How many user agent groups the file had, ours and everybody else's.
+    ///
+    /// Zero for rules that came from a status rather than a file, and zero for
+    /// a file with no `User-agent` line in it at all. The published snapshot
+    /// carries it next to [`rule_count`](Self::rule_count), where the pair
+    /// says whether a site wrote rules for us or we are reading somebody
+    /// else's wildcard group.
+    #[must_use]
+    pub const fn group_count(&self) -> u32 {
+        self.groups
     }
 }
 

@@ -516,6 +516,39 @@ Disallow: /x
 }
 
 #[test]
+fn group_count_covers_the_whole_file_and_not_just_our_group() {
+    // The published snapshot reports this next to the rule count, and the
+    // pair only says something if the group count is the file's rather than
+    // ours. Three groups here and we match the last one.
+    let body = "\
+User-agent: googlebot
+Disallow: /a
+
+User-agent: bingbot
+User-agent: yandex
+Disallow: /b
+
+User-agent: umi
+Disallow: /c
+";
+    let robots = Robots::parse_str(body);
+    assert_eq!(robots.group_count(), 3);
+    assert_eq!(robots.rule_count(), 1);
+}
+
+#[test]
+fn group_count_is_zero_without_a_file_behind_it() {
+    // A status is not a file, so there is nothing to count. This is the
+    // difference a reader needs between a site that published an empty group
+    // and a site that was down when we asked.
+    assert_eq!(Robots::for_status(503, b"").group_count(), 0);
+    assert_eq!(Robots::for_status(404, b"").group_count(), 0);
+    // A file with rules but no user agent line has no groups either, and the
+    // rules in it apply to nobody.
+    assert_eq!(Robots::parse_str("Disallow: /\n").group_count(), 0);
+}
+
+#[test]
 fn content_usage_is_recorded_and_not_acted_on() {
     // Doc 07.5. AIPREF expresses a preference about AI training, our purpose
     // is index building, and the honest thing is to carry the preference
