@@ -87,6 +87,45 @@ pub use types::{
 /// batches, and must not silently truncate one.
 pub const BATCH: usize = 4096;
 
+/// The batch size for admission, which is a different problem from the rest.
+///
+/// Every other method here works on a set of rows that is roughly the size of
+/// the fetch window. Admission works on the links off those pages, which is
+/// about forty of them per page, so it is the one call that arrives with
+/// millions of rows behind it and the one whose cost grows with the frontier it
+/// is writing into.
+///
+/// That cost is almost entirely write amplification. The ledger is keyed on a
+/// hash, so a batch of new urls lands all over a tree that is gigabytes wide,
+/// and a page touched once has to be written out whole however few bytes of it
+/// changed. Sorting the batch first fixes the order the pages are visited in
+/// but not how many of them there are, and that number only comes down when the
+/// batch is large enough that several rows share a page.
+///
+/// Measured on server3 against the 3.1 million row frontier a twelve minute
+/// crawl leaves behind, inserting 1.4 million new rows, which is what one tick
+/// admits:
+///
+/// ```text
+/// batch      4096    453.5 s    3,087 rows/s   27.63 GB written   21,191 bytes a row
+/// batch     65536     60.4 s    6,624 rows/s    2.40 GB written    6,455 bytes a row
+/// batch    400000     47.8 s    8,368 rows/s    0.68 GB written    1,831 bytes a row
+/// batch   1400000     46.3 s   30,210 rows/s    1.11 GB written      848 bytes a row
+/// ```
+///
+/// The row itself is about 170 bytes, so at [`BATCH`] the disk sees a hundred
+/// times what the frontier gained. A million is where the curve has flattened
+/// and is still one transaction the machine can hold: the sort indexes cost
+/// nine bytes a row, and the urls are already in memory because they are the
+/// links the tick just extracted.
+///
+/// This is a smaller constant than the problem deserves. Amplification is a
+/// function of the batch against the tree, so a fixed number stops working once
+/// the frontier is large enough, and doc 16's five hundred million rows are
+/// large enough. The frontier that holds at that size is `umi-nami`, which
+/// merges sorted runs instead of inserting into a tree at all.
+pub const ADMIT_BATCH: usize = 1 << 20;
+
 /// How much unflushed work a backend may hold, from doc 08.7.
 ///
 /// A crash loses at most this much admission. It never loses a completion and
