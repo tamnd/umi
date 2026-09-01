@@ -32,8 +32,8 @@
 //! is a description of what a box is doing and how much of it, and that is not
 //! something to put on a public interface by accident.
 //!
-//! Requests are capped at [`REQUEST_CAP`] bytes and connections that go quiet
-//! are dropped after [`IDLE`]. Both exist because this listens on a socket and
+//! Requests are capped at eight kilobytes and connections that go quiet are
+//! dropped after ten seconds. Both exist because this listens on a socket and
 //! a socket is reachable by things that are not a scraper.
 
 use std::net::SocketAddr;
