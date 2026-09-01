@@ -39,6 +39,15 @@ anyhow = "1"
 # but is not dyn compatible, so the boxing has to happen somewhere and this
 # crate does it in one place instead of in every signature.
 async-trait = "0.1"
+# The allocator the `umi` binary runs on. Profiled on server3 under a crawl at
+# a window of 1024, glibc malloc was 21 percent of the process on its own,
+# before the memmove that goes with it: `_int_malloc` at 8.8, `unlink_chunk` at
+# 3.5, `cfree` at 2.9, `malloc_consolidate` at 2.5 and the rest in ones. That
+# is the signature of a lot of threads allocating a lot of short lived buffers
+# of different sizes, which is what parsing html is, and glibc answers it out
+# of a small number of shared arenas. mimalloc gives every thread its own heap
+# and frees back to it, so most of that work stops happening.
+mimalloc = "0.1"
 # The hash the whole spec is written around: url keys, body digests,
 # chunk trees, block checksums and manifest digests are all blake3, so
 # there is one hash in the tree rather than four.

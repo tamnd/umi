@@ -40,6 +40,9 @@ umi-state.workspace = true
 umi-state-sqlite.workspace = true
 
 blake3.workspace = true
+# The global allocator for the `umi` binary. See the note in the workspace
+# manifest for what it is worth and why.
+mimalloc.workspace = true
 # The upload half of doc 16's gate 1.1 sends one shared buffer from every
 # stream, and `Bytes` is what makes that one allocation rather than eight.
 bytes.workspace = true

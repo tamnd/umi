@@ -17,6 +17,25 @@ use umi_cli::{Error, block, config, crawl, doctor, get, inspect, supervise, veri
 use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
 
+/// The allocator every command runs on.
+///
+/// Here and not in the library, because a `#[global_allocator]` is a choice
+/// about a process and a library has no business making it for anybody who
+/// links it. The binary is the process, so this is where the choice belongs.
+///
+/// It is worth having. Profiled on server3 under a crawl at a window of 1024,
+/// glibc malloc and free came to 21 percent of the process before counting the
+/// memmove that goes with them, spread across `_int_malloc`, `unlink_chunk`,
+/// `cfree`, `malloc_consolidate` and `_int_free_merge_chunk`. None of that is
+/// a page being parsed or a byte being fetched. It is the cost of a lot of
+/// threads asking a small number of shared arenas for a lot of short lived
+/// buffers of every size, which is the exact shape of html5ever tokenising a
+/// page into tendrils and dropping them again. mimalloc gives each thread its
+/// own heap, so most of the contention and most of the free list walking stops
+/// existing rather than getting faster.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// An internet scale web crawler that publishes what it finds.
 #[derive(Parser)]
 #[command(name = "umi", version, about, long_about = None)]
