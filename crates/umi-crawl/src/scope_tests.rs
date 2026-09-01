@@ -338,7 +338,6 @@ fn an_include_flag_cannot_smuggle_a_scope_into_the_general_corpus() {
     let mut scope = Scope::from_toml("name = \"wide\"\ncorpus = \"general\"").expect("parses");
     assert!(scope.add_include(&["example.com".to_owned()]).is_err());
 
-    let mut excluding =
-        Scope::from_toml("name = \"wide\"\ncorpus = \"general\"").expect("parses");
+    let mut excluding = Scope::from_toml("name = \"wide\"\ncorpus = \"general\"").expect("parses");
     assert!(excluding.add_exclude(&["example.com".to_owned()]).is_err());
 }
