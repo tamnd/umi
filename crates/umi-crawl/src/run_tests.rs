@@ -802,6 +802,80 @@ async fn the_lease_that_fetches_robots_goes_on_to_fetch_its_page() {
 }
 
 #[tokio::test]
+async fn robots_is_asked_for_when_the_lease_arrives_and_not_when_it_is_dispatched() {
+    // The point of the prefetch. Measured on server3 at a window of 1024
+    // against the real seed, a page cost 4309 ms of which 3597 ms was
+    // robots.txt, so five sixths of every slot in the window was a slot not
+    // fetching a page. A lease waits in the queue for about as long as the
+    // window takes to drain, and that wait is free runway for the file.
+    let urls: Vec<String> = (0..8).map(|n| format!("https://w{n}.example/a")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let mut fetch = Canned::new();
+    for (n, url) in urls.iter().enumerate() {
+        fetch = fetch
+            .robots(
+                &format!("https://w{n}.example"),
+                "User-agent: *\nAllow: /\n",
+            )
+            .html(url, &page("A", &[]));
+    }
+    let crawler = crawler(fetch, state);
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    assert_eq!(report.fetched, urls.len(), "{report:?}");
+    // One per host, and every one of them off the window rather than out of it.
+    assert_eq!(report.robots_warmed, urls.len(), "{report:?}");
+
+    // And the second tick warms nothing, because the cache holds all eight and
+    // a host we have the file for is a host the prefetch skips. This is the
+    // half that keeps the prefetch from being a second request per page.
+    let next = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    assert_eq!(next.robots_warmed, 0, "{next:?}");
+}
+
+#[tokio::test]
+async fn a_delay_the_prefetch_read_still_reaches_the_host_record() {
+    // The one thing the prefetch could quietly break. Doc 07.4 puts a published
+    // `Crawl-delay` in the host record, and the record used to learn it from
+    // the lease that fetched the file. Once a prefetch is doing the fetching no
+    // lease ever has that flag set, so a lease that finds it was spaced for
+    // less than the file asks for writes the number down itself.
+    //
+    // It goes back to the frontier at the same time and for the same reason it
+    // always did: this lease was spaced for one second and the site asked for
+    // two, so the request it was about to make is the request the file was
+    // written to stop.
+    let url = "https://slow.example/a";
+    let state = seeded(&[url]).await;
+    let fetch = Canned::new()
+        .robots("https://slow.example", "User-agent: *\nCrawl-delay: 2\n")
+        .html(url, &page("A", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    assert_eq!(report.fetched, 0, "the page went out anyway: {report:?}");
+    assert_eq!(report.deferred, 1, "{report:?}");
+
+    let key = umi_types::RowKey::for_url(url, None).expect("a crawlable url");
+    let host = state.host(key.host).await.expect("host").expect("a record");
+    assert_eq!(
+        host.crawl_delay_ms,
+        Some(2000),
+        "the record never learned what the file asked for"
+    );
+}
+
+#[tokio::test]
 async fn a_tick_asks_the_scheduler_again_rather_than_letting_its_window_drain() {
     // The gate 3.1 shape. A tick used to take its whole batch in one ask, put
     // as much of it on the wire as the window allowed, and top the window up

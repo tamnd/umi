@@ -2170,7 +2170,8 @@ fn progress(
 ) -> String {
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
-        "{} done  {:.0} in flight  {} queued  {:.1} p/s  {} ms per page ({} robots, {} polite)  \
+        "{} done  {:.0} in flight  {} queued  {:.1} p/s  \
+         {} ms per page ({} robots, {} polite, {} warmed)  \
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
          {:.0}s links)  \
@@ -2182,6 +2183,7 @@ fn progress(
         report.lease_mean_ms(),
         report.robots_mean_ms(),
         report.waited_mean_ms(),
+        report.robots_warmed,
         (report.store_waited_ms + report.ask_waited_ms) as f64 / 1000.0,
         report.ask_waited_ms as f64 / 1000.0,
         report.asks,
