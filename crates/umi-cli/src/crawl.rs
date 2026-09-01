@@ -100,6 +100,10 @@ mod tests;
 const PROFILE: &str = "profile.toml";
 pub(crate) const STATE: &str = "state.sqlite";
 const SEGMENTS: &str = "segments";
+/// Doc 07.4's robots snapshots, sealed and converted separately from the
+/// pages. A separate directory because doc 10.1 gives a segment one stream and
+/// because the two are published to different repositories.
+const ROBOTS: &str = "robots";
 const DATA: &str = "data";
 const MANIFEST: &str = "manifest.json";
 const LOG: &str = "crawl.log";
@@ -676,9 +680,10 @@ async fn adopt(layout: &Layout, state: &dyn State, log: &mut Log) -> Result<usiz
         }
         rows.push(SegmentRow {
             id,
-            // Every file a focused crawl writes is a page segment, because the
-            // sink in `run` is created with one stream and doc 13.5's directory
-            // has one place to put files.
+            // Page segments only. Doc 07.4's robots segments are in a
+            // subdirectory that the scan above does not descend into, so a
+            // resume republishes the pages and leaves the robots snapshots for
+            // the next crawl to seal over.
             stream: Stream::Pages,
             local_path: path.to_string_lossy().into_owned(),
             sealed_at_ms: id.timestamp_ms(),
@@ -772,6 +777,8 @@ struct Layout {
     profile: PathBuf,
     state: PathBuf,
     segments: PathBuf,
+    robots_segments: PathBuf,
+    robots_data: PathBuf,
     data: PathBuf,
     staging: PathBuf,
     manifest: PathBuf,
@@ -785,6 +792,8 @@ impl Layout {
         std::fs::create_dir_all(dir.join(SEGMENTS)).map_err(Error::Io)?;
         std::fs::create_dir_all(dir.join(DATA)).map_err(Error::Io)?;
         Ok(Self {
+            robots_segments: dir.join(SEGMENTS).join(ROBOTS),
+            robots_data: dir.join(DATA).join(ROBOTS),
             profile: dir.join(PROFILE),
             state: dir.join(STATE),
             segments: dir.join(SEGMENTS),
@@ -1111,9 +1120,30 @@ fn run(
     //
     // Wrapped once here rather than per tick, because the pair is the same
     // every time and the wrapper is what the loop hands to its store task.
+    // Doc 07.4's corpus, written as the crawl goes rather than by a second
+    // pass over the web. Every host the crawl checks robots.txt for is a row,
+    // and the crawl was going to fetch that file anyway.
+    let robots = Arc::new(
+        SegmentSink::create(
+            &layout.robots_segments,
+            SegmentInfo {
+                stream: StreamKind::Robots,
+                coordinator: coordinator_key(&layout.dir),
+                crawl_profile: scope.id,
+                ..SegmentInfo::default()
+            },
+            WriterConfig::default(),
+        )
+        .map_err(Error::Io)?,
+    );
+    let streams = Arc::new(umi_crawl::Streams {
+        pages: Arc::clone(&sink),
+        robots: Arc::clone(&robots),
+    });
+
     let recorded = Arc::new(Recorded::new(
         SupervisedLedger::in_dir(&layout.dir),
-        Arc::clone(&sink),
+        Arc::clone(&streams),
     ));
 
     let crawler = Crawler::new(
@@ -1282,6 +1312,7 @@ fn run(
                 // can leave.
                 if pressure.ladder.allowance().seal_open_segments {
                     sink.finish().map_err(|e| Error::Crawl(e.to_string()))?;
+                    robots.finish().map_err(|e| Error::Crawl(e.to_string()))?;
                 }
             }
 
@@ -1313,6 +1344,7 @@ fn run(
             }
             harvest(
                 &sink,
+                &robots,
                 layout,
                 &*state,
                 publisher.as_ref(),
@@ -1414,8 +1446,10 @@ fn run(
     // Parquet like every other row rather than in a `.umi` the operator has to
     // know about.
     sink.finish().map_err(|e| Error::Crawl(e.to_string()))?;
+    robots.finish().map_err(|e| Error::Crawl(e.to_string()))?;
     runtime.block_on(harvest(
         &sink,
+        &robots,
         layout,
         &*state,
         publisher.as_ref(),
@@ -1529,6 +1563,7 @@ fn spent(summary: &Summary, settings: &Settings, started_ms: u64, now_ms: u64) -
 )]
 async fn harvest(
     sink: &SegmentSink,
+    robots: &SegmentSink,
     layout: &Layout,
     state: &dyn State,
     publisher: Option<&Publisher>,
@@ -1538,15 +1573,22 @@ async fn harvest(
     now_ms: u64,
 ) -> Result<(), Error> {
     let sealed = sink.sealed();
+    let robots = robots.sealed();
     let Some(publisher) = publisher else {
-        keep(&sealed, layout, manifest, summary)?;
+        // Converted into their own directory and left out of the manifest.
+        // Doc 12's manifest describes one stream on one day, so a robots file
+        // listed among the pages would be a file no reader of that manifest
+        // could decode.
+        keep(&robots, &layout.robots_data, &mut None, summary)?;
+        keep(&sealed, &layout.data, &mut Some(&mut *manifest), summary)?;
         return write_manifest(&layout.manifest, manifest);
     };
-    if sealed.is_empty() {
+    if sealed.is_empty() && robots.is_empty() {
         return Ok(());
     }
 
-    record(&sealed, state, now_ms).await?;
+    record(&sealed, Stream::Pages, state, now_ms).await?;
+    record(&robots, Stream::Robots, state, now_ms).await?;
     let (done, failed) = publisher.drain(state, now_ms).await?;
     for published in &done {
         summary.files += 1;
@@ -1577,13 +1619,21 @@ async fn harvest(
 /// file at all. It is what doc 12.8's reconciliation compares a recovered local
 /// file against, and computing it now costs about 50 ms per 128 MB segment
 /// against the 30 seconds doc 12.2 budgets for the conversion that follows.
-async fn record(sealed: &[umi_crawl::Sealed], state: &dyn State, now_ms: u64) -> Result<(), Error> {
+async fn record(
+    sealed: &[umi_crawl::Sealed],
+    stream: Stream,
+    state: &dyn State,
+    now_ms: u64,
+) -> Result<(), Error> {
+    if sealed.is_empty() {
+        return Ok(());
+    }
     let mut rows = Vec::with_capacity(sealed.len());
     for segment in sealed {
         let bytes = std::fs::metadata(&segment.path).map_err(Error::Io)?.len();
         rows.push(SegmentRow {
             id: segment.id,
-            stream: Stream::Pages,
+            stream,
             local_path: segment.path.to_string_lossy().into_owned(),
             sealed_at_ms: now_ms,
             rows: segment.stats.rows,
@@ -1642,36 +1692,43 @@ fn receipt(path: &Path, published: &Published) -> Result<(), Error> {
 /// the convert and not part of it.
 fn keep(
     sealed: &[umi_crawl::Sealed],
-    layout: &Layout,
-    manifest: &mut Manifest,
+    into: &Path,
+    manifest: &mut Option<&mut Manifest>,
     summary: &mut Summary,
 ) -> Result<(), Error> {
+    if sealed.is_empty() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(into).map_err(Error::Io)?;
     for sealed in sealed {
         let name = format!("{}.parquet", sealed.id.to_text());
-        let out = layout.data.join(&name);
+        let out = into.join(&name);
         let segment = umi_file::Segment::open(&sealed.path)?;
         let converted =
             umi_publish::convert(&segment, &out).map_err(|e| Error::Crawl(e.to_string()))?;
         drop(segment);
 
-        manifest.insert(FileEntry {
-            path: format!("{DATA}/{name}"),
-            bytes: converted.bytes,
-            rows: converted.rows,
-            blake3: converted.blake3,
-            sha256: converted.sha256,
-            segment_ulid: sealed.id.to_text(),
-            coordinator: "local".to_owned(),
-            extractor: umi_types::CANON_VERSION.to_owned(),
-            fetched_at_min_ms: converted.first_ms,
-            fetched_at_max_ms: converted.last_ms,
-            // Everything in a focused crawl was fetched by this machine, so
-            // doc 06 has nobody to disagree with and every row is `local`.
-            verification: Verification {
-                local: converted.rows,
-                ..Verification::default()
-            },
-        });
+        if let Some(manifest) = manifest.as_mut() {
+            manifest.insert(FileEntry {
+                path: format!("{DATA}/{name}"),
+                bytes: converted.bytes,
+                rows: converted.rows,
+                blake3: converted.blake3,
+                sha256: converted.sha256,
+                segment_ulid: sealed.id.to_text(),
+                coordinator: "local".to_owned(),
+                extractor: umi_types::CANON_VERSION.to_owned(),
+                fetched_at_min_ms: converted.first_ms,
+                fetched_at_max_ms: converted.last_ms,
+                // Everything in a focused crawl was fetched by this machine,
+                // so doc 06 has nobody to disagree with and every row is
+                // `local`.
+                verification: Verification {
+                    local: converted.rows,
+                    ..Verification::default()
+                },
+            });
+        }
         summary.files += 1;
         summary.bytes_stored += converted.bytes;
         std::fs::remove_file(&sealed.path).map_err(Error::Io)?;

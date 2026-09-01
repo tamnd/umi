@@ -216,6 +216,11 @@ impl SegmentSink {
     fn next_id(&self, counter: u64, created_ms: u64) -> Ulid {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.info.coordinator);
+        // The stream is in the entropy because one coordinator now runs two
+        // sinks. Without it the pages sink and the robots sink derive the same
+        // identifiers from the same key and the same counter, and two segments
+        // that agree on their name are one segment with half its rows missing.
+        hasher.update(&(self.info.stream as u16).to_le_bytes());
         hasher.update(&counter.to_le_bytes());
         let mut entropy = [0u8; 10];
         entropy.copy_from_slice(&hasher.finalize().as_bytes()[..10]);
@@ -428,4 +433,28 @@ fn seal(open: &mut Open, dir: &Path) -> Result<Option<Sealed>, CrawlError> {
 
 fn sink_error(error: umi_file::Error) -> CrawlError {
     CrawlError::Sink(error.to_string())
+}
+
+/// The pages sink and the robots sink behind one [`Sink`].
+///
+/// Doc 10.1 gives a segment one stream, so a crawl that produces both writes
+/// two files at a time. This is the join: the loop keeps handing rows to one
+/// sink and does not learn that there are two, and the caller keeps two
+/// directories of segments to convert and publish separately.
+pub struct Streams {
+    /// Doc 10's pages.
+    pub pages: std::sync::Arc<SegmentSink>,
+    /// Doc 07.4's robots snapshots.
+    pub robots: std::sync::Arc<SegmentSink>,
+}
+
+#[async_trait::async_trait]
+impl Sink for Streams {
+    async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError> {
+        self.pages.write::<PageBuilder>(rows)
+    }
+
+    async fn take_robots(&self, rows: &[RobotsRow]) -> Result<(), CrawlError> {
+        self.robots.write::<RobotsBuilder>(rows)
+    }
 }

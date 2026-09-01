@@ -69,5 +69,5 @@ pub use run::{CrawlConfig, CrawlError, Crawler, Live, Sink, TickReport};
 pub use scope::{
     Budget, ContentFilter, Corpus, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,
 };
-pub use sink::{Sealed, SegmentInfo, SegmentSink};
+pub use sink::{Rows, Sealed, SegmentInfo, SegmentSink, Streams};
 pub use sitemap::{SitemapLimits, SitemapReport};

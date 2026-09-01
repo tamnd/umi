@@ -421,7 +421,7 @@ fn not_modified() -> Outcome {
 /// Rows in a vector, which is what a test wants and what `umi crawl --dry-run`
 /// wants for a different reason.
 #[derive(Default)]
-pub(crate) struct Collected(Mutex<Vec<PageRow>>);
+pub(crate) struct Collected(Mutex<Vec<PageRow>>, Mutex<Vec<crate::robots::RobotsRow>>);
 
 #[async_trait::async_trait]
 impl Sink for Collected {
@@ -432,11 +432,23 @@ impl Sink for Collected {
             .extend(rows.iter().cloned());
         Ok(())
     }
+
+    async fn take_robots(&self, rows: &[crate::robots::RobotsRow]) -> Result<(), CrawlError> {
+        self.1
+            .lock()
+            .expect("not poisoned")
+            .extend(rows.iter().cloned());
+        Ok(())
+    }
 }
 
 impl Collected {
     pub(crate) fn rows(&self) -> Vec<PageRow> {
         self.0.lock().expect("not poisoned").clone()
+    }
+
+    pub(crate) fn robots(&self) -> Vec<crate::robots::RobotsRow> {
+        self.1.lock().expect("not poisoned").clone()
     }
 }
 
@@ -3146,5 +3158,73 @@ async fn the_allowance_lowers_the_tier_ceiling_and_never_raises_it() {
     assert_eq!(
         crawler.config().max_tier.min(crawler.allowance().max_tier),
         Tier::Plain
+    );
+}
+
+#[tokio::test]
+async fn a_tick_publishes_one_robots_snapshot_per_host_it_fetched() {
+    // Doc 07.4's corpus, produced by the crawl rather than by a second pass.
+    // Two hosts, three urls, so the test would catch a row per lease as well
+    // as a row per host.
+    let state = seeded(&[
+        "https://a.example/1",
+        "https://a.example/2",
+        "https://b.example/1",
+    ])
+    .await;
+    let fetch = Canned::new()
+        .robots(
+            "https://a.example",
+            "User-agent: umi\nCrawl-delay: 2\nDisallow: /private\nSitemap: https://a.example/s.xml\n",
+        )
+        .robots("https://b.example", "User-agent: *\nDisallow: /\n")
+        .html("https://a.example/1", &page("A1", &[]))
+        .html("https://a.example/2", &page("A2", &[]))
+        .html("https://b.example/1", &page("B1", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+    let sink = Arc::new(Collected::default());
+
+    crawler.tick(&sink).await.expect("tick");
+
+    let mut snapshots = sink.robots();
+    snapshots.sort_by(|l, r| l.host.cmp(&r.host));
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|r| r.host.as_str())
+            .collect::<Vec<_>>(),
+        ["a.example", "b.example"],
+        "one row per host that was asked, and no scheme on the host",
+    );
+
+    let a = &snapshots[0];
+    assert_eq!(a.status, 200);
+    assert_eq!(a.groups, 1);
+    assert_eq!(a.rules, 1);
+    assert_eq!(a.crawl_delay_ms, Some(2000));
+    assert_eq!(a.allows_us, 1, "the root is not what was disallowed");
+    assert_eq!(a.sitemaps, ["https://a.example/s.xml"]);
+    assert!(
+        a.body.as_deref().is_some_and(|b| b.contains("Crawl-delay")),
+        "the raw file is what doc 07.4 promises, not our reading of it",
+    );
+
+    // A host that disallowed us is still in the corpus. Knowing that a site
+    // said no is the whole reason to publish this, and a corpus that only
+    // carried the sites that said yes would be the one nobody could use to
+    // avoid asking.
+    let b = &snapshots[1];
+    assert_eq!(b.allows_us, 0);
+    assert_eq!(b.rules, 1);
+
+    // A second tick reads the cache, so it publishes nothing. A row per lease
+    // rather than per fetch would put the same file in the corpus every day
+    // times however many pages the host has.
+    let sink = Arc::new(Collected::default());
+    crawler.tick(&sink).await.expect("tick");
+    assert!(
+        sink.robots().is_empty(),
+        "a cached robots.txt was published a second time: {:?}",
+        sink.robots().iter().map(|r| &r.host).collect::<Vec<_>>(),
     );
 }
