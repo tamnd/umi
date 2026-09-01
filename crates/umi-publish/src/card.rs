@@ -41,7 +41,7 @@ const SPEC: &str = "https://github.com/tamnd/umi/tree/main/docs/spec";
 #[must_use]
 pub fn card(corpus: &Corpus, family: Family, extractor: &str) -> String {
     let mut out = String::with_capacity(8192);
-    out.push_str(&front_matter(family));
+    out.push_str(&front_matter(corpus, family));
     out.push_str(&heading(corpus, family));
     out.push_str(&columns_table(family));
     out.push_str(&provenance(extractor));
@@ -53,7 +53,13 @@ pub fn card(corpus: &Corpus, family: Family, extractor: &str) -> String {
 }
 
 /// The YAML block Hugging Face reads to build the dataset viewer.
-fn front_matter(family: Family) -> String {
+///
+/// No `size_categories`. The card is written on the commit that creates the
+/// repository, which is the moment it holds one file, and the bucket a
+/// repository will end up in is not known then. The viewer counts the rows
+/// itself, so a guess here would be a claim that is wrong for the whole of the
+/// repository's life and nobody would go back and correct it.
+fn front_matter(corpus: &Corpus, family: Family) -> String {
     let (pretty, license, tags) = match family {
         Family::Pages => (
             "umi pages",
@@ -76,8 +82,16 @@ fn front_matter(family: Family) -> String {
             "- robots-txt\n- web-crawl\n- crawler-policy\n- parquet\n- umi",
         ),
     };
+    // A focused crawl gets its scope in the name, because a reader browsing the
+    // organisation sees the pretty name and nothing else, and three focused
+    // repositories all called "umi pages" are three repositories nobody can
+    // tell apart.
+    let pretty = match (&corpus.focus, family) {
+        (Some(name), Family::Pages) => format!("umi focus {name}"),
+        _ => pretty.to_owned(),
+    };
     format!(
-        "---\npretty_name: {pretty}\n{license}\nsize_categories:\n- 10M<n<100M\ntags:\n{tags}\nconfigs:\n- config_name: default\n  data_files:\n  - split: train\n    path: data/**/*.parquet\n---\n\n"
+        "---\npretty_name: {pretty}\n{license}\ntags:\n{tags}\nconfigs:\n- config_name: default\n  data_files:\n  - split: train\n    path: data/**/*.parquet\n---\n\n"
     )
 }
 
@@ -100,9 +114,12 @@ fn heading(corpus: &Corpus, family: Family) -> String {
         ),
         _ => String::new(),
     };
+    let name = match (&corpus.focus, family) {
+        (Some(focus), Family::Pages) => format!("umi-focus-{focus}"),
+        _ => family.stem().to_owned(),
+    };
     format!(
-        "# {name}\n\nPart of [umi](https://github.com/tamnd/umi), an open web crawl published as Parquet. Before you use any of this, read the exclusion list at [`{META_REPO}`](https://huggingface.co/datasets/{META_REPO}) and filter the rows it names. Published files are never rewritten and never deleted, so the exclusion list is how a takedown reaches you, and applying it is a condition of using the data rather than a suggestion.\n{focus}\n{what}\n\n",
-        name = family.stem(),
+        "# {name}\n\nPart of [umi](https://github.com/tamnd/umi), an open web crawl published as Parquet. Before you use any of this, read the exclusion list at [`{META_REPO}`](https://huggingface.co/datasets/{META_REPO}) and filter the rows it names. Published files are never rewritten and never deleted, so the exclusion list is how a takedown reaches you, and applying it is a condition of using the data rather than a suggestion.\n{focus}\n{what}\n\n"
     )
 }
 

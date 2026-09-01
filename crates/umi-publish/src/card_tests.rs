@@ -55,6 +55,10 @@ fn the_card_says_what_doc_12_9_says_it_says() {
         let card = general(family);
         assert!(card.starts_with("---\n"), "{family:?} has no front matter");
         assert!(
+            !card.contains("size_categories"),
+            "{family:?} guesses at a size on the day the repository is empty",
+        );
+        assert!(
             card.contains("configs:"),
             "{family:?} has no viewer configuration, so the dataset page is blank",
         );
@@ -144,6 +148,10 @@ fn a_focused_crawl_says_it_is_one() {
         "{card}"
     );
     assert!(card.contains("not an unbiased sample"));
+    // And it is named after its scope in both places a reader sees a name: the
+    // title, and the one Hugging Face puts at the top of the dataset page.
+    assert!(card.contains("pretty_name: umi focus blog.rust-lang.org"));
+    assert!(card.contains("# umi-focus-blog.rust-lang.org"));
 
     // And the general corpus does not carry the sentence, since it is not true
     // of it.
