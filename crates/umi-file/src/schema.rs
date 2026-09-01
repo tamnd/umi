@@ -1,4 +1,4 @@
-//! The three stream schemas from doc 10.5, as Arrow.
+//! The stream schemas from doc 10.5, as Arrow.
 //!
 //! Arrow rather than a type of our own because doc 10.10 makes a shoal into a
 //! Parquet row group one to one, and the shortest path from a column chunk to a
@@ -6,10 +6,12 @@
 //! `RecordBatch` and the reader gives one back, so neither end of this crate
 //! has a hand written builder for a thirty column schema.
 //!
-//! Doc 10.3: three stream kinds share the container and differ only in schema.
+//! Doc 10.3: the stream kinds share the container and differ only in schema.
 //! The header names the stream and the schema id, and a reader that does not
 //! recognise the schema id refuses to open the file rather than guessing. That
-//! keeps one writer, one reader and one crash story instead of three.
+//! keeps one writer, one reader and one crash story however many streams there
+//! are, which is the reason doc 08.6's frontier spill is a fourth stream here
+//! rather than a second file format somewhere else.
 
 use std::sync::Arc;
 
@@ -18,7 +20,7 @@ use arrow::datatypes::{DataType, Field, Fields, Schema, SchemaRef};
 use crate::codec::Codec;
 use crate::{Error, Result};
 
-/// Which of doc 10.3's three streams a segment carries.
+/// Which of doc 10.3's streams a segment carries.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(u16)]
 pub enum StreamKind {
@@ -31,6 +33,10 @@ pub enum StreamKind {
     /// Host, fetch time, status, raw text and the parsed decision summary from
     /// doc 07.4.
     Robots = 3,
+    /// Known URLs that have not been fetched yet, spilled out of the state
+    /// layer so the fleet's disks do not have to hold the whole backlog. Doc
+    /// 08.6.
+    Frontier = 4,
 }
 
 impl StreamKind {
@@ -46,6 +52,7 @@ impl StreamKind {
             Self::Pages => 1,
             Self::Receipts => 2,
             Self::Robots => 3,
+            Self::Frontier => 4,
         }
     }
 
@@ -60,6 +67,7 @@ impl StreamKind {
             1 => Ok(Self::Pages),
             2 => Ok(Self::Receipts),
             3 => Ok(Self::Robots),
+            4 => Ok(Self::Frontier),
             other => Err(Error::UnknownStream(other)),
         }
     }
@@ -71,6 +79,7 @@ impl StreamKind {
             Self::Pages => pages(),
             Self::Receipts => receipts(),
             Self::Robots => robots(),
+            Self::Frontier => frontier(),
         }
     }
 }
@@ -249,6 +258,49 @@ fn robots() -> SchemaRef {
     ]))
 }
 
+/// Doc 08.6's frontier shard: known URLs that are not fetched yet.
+///
+/// This is the ledger from doc 08.3 with one column added and one changed. The
+/// added one is `url`, because the local seen set is fingerprints and a backlog
+/// nobody can turn back into a URL is not a backlog. The changed one is `etag`,
+/// which is text here and an integer in the local store, because the integer
+/// interns against a pool that belongs to one box's state file and a published
+/// file has to stand on its own.
+///
+/// Rows are written in `(pld_id, host_id, url_key)` order, which is doc 08.2's
+/// ordering and the local ledger's primary key. Sorted that way a domain is one
+/// contiguous range, so a reader that wants one site reads the row groups whose
+/// statistics cover it and skips the rest, and a coordinator warming a shard
+/// pulls a byte range rather than a file.
+///
+/// Everything that describes a fetch that already happened is nullable, because
+/// the rows worth spilling are overwhelmingly rows nothing has fetched. A
+/// column that is null on nearly every row costs a validity bit, and the same
+/// column carrying a zero would read as a real fetch at the epoch.
+fn frontier() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        nn("pld_id", fixed(8)),
+        nn("host_id", fixed(8)),
+        nn("url_key", fixed(10)),
+        nn("url_key_full", fixed(16)),
+        nn("url", utf8()),
+        nn("depth", DataType::UInt8),
+        nn("priority", DataType::UInt16),
+        nn("state", DataType::UInt8),
+        nn("next_due_ms", DataType::UInt64),
+        ok("last_fetch_ms", DataType::UInt64),
+        ok("last_change_ms", DataType::UInt64),
+        nn("fetch_count", DataType::UInt32),
+        nn("change_count", DataType::UInt32),
+        ok("content_hash", fixed(8)),
+        ok("etag", utf8()),
+        ok("last_mod_ms", DataType::UInt64),
+        ok("status", DataType::UInt16),
+        ok("tier_used", DataType::UInt8),
+        nn("fail_streak", DataType::UInt8),
+    ]))
+}
+
 /// Which encoding a leaf column gets, from doc 10.6.
 ///
 /// Doc 10.6 is explicit that there is no sampling based auto selection: the
@@ -293,7 +345,10 @@ fn is_incompressible(name: &str) -> bool {
     matches!(
         leaf_of(name),
         "url_key"
+            | "url_key_full"
             | "pld_id"
+            | "host_id"
+            | "content_hash"
             | "body_digest"
             | "chunk_root"
             | "extract_digest"
@@ -328,7 +383,12 @@ mod tests {
 
     #[test]
     fn every_stream_has_a_schema_and_a_distinct_id() {
-        let kinds = [StreamKind::Pages, StreamKind::Receipts, StreamKind::Robots];
+        let kinds = [
+            StreamKind::Pages,
+            StreamKind::Receipts,
+            StreamKind::Robots,
+            StreamKind::Frontier,
+        ];
         for kind in kinds {
             assert!(!kind.arrow().fields().is_empty());
             assert_eq!(StreamKind::from_code(kind as u16).expect("known"), kind);
@@ -352,6 +412,27 @@ mod tests {
         // than discovering it per chunk.
         for name in ["minhash", "body_digest", "url_key", "simhash", "signature"] {
             assert_eq!(codec_for(name, &DataType::UInt64), Codec::Raw, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_frontier_carries_the_url_and_the_key_it_was_derived_from() {
+        // The point of the spill is that a box can drop the URL text and get
+        // it back, so the text and the fingerprint have to travel together. A
+        // file with only the fingerprints would be a backlog nothing can fetch
+        // and a file with only the text would not join against the seen set.
+        let schema = StreamKind::Frontier.arrow();
+        for name in ["url", "url_key", "url_key_full", "pld_id", "host_id"] {
+            let field = schema.field_with_name(name).expect(name);
+            assert!(!field.is_nullable(), "{name} is not optional");
+        }
+        // And the fetch history is optional, because a spilled row has usually
+        // never been fetched and a zero there would read as a fetch in 1970.
+        for name in ["last_fetch_ms", "status", "content_hash", "etag"] {
+            assert!(
+                schema.field_with_name(name).expect(name).is_nullable(),
+                "{name} is optional"
+            );
         }
     }
 

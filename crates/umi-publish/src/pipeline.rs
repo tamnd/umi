@@ -723,6 +723,7 @@ pub const fn stream_kind(stream: Stream) -> StreamKind {
         Stream::Pages => StreamKind::Pages,
         Stream::Receipts => StreamKind::Receipts,
         Stream::Robots => StreamKind::Robots,
+        Stream::Frontier => StreamKind::Frontier,
     }
 }
 
@@ -733,6 +734,7 @@ pub const fn stream_of(kind: StreamKind) -> Stream {
         StreamKind::Pages => Stream::Pages,
         StreamKind::Receipts => Stream::Receipts,
         StreamKind::Robots => Stream::Robots,
+        StreamKind::Frontier => Stream::Frontier,
     }
 }
 

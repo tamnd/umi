@@ -1281,9 +1281,14 @@ pub struct StateStats {
 /// puts them side by side, the frontier has no business knowing how a shoal is
 /// encoded, and a state backend that linked the writer would drag zstd into
 /// every dashboard tool that opens the sqlite file. The discriminants match on
-/// purpose, so the two can be converted with a three arm match at the one call
+/// purpose, so the two can be converted with one match at the one call
 /// site that has both crates in scope, and a test in umi-crawl asserts they
 /// still line up.
+///
+/// The frontier is a stream here even though it is the state layer's own rows
+/// going out. It has to be: the local copy is only safe to drop once doc 12.7's
+/// fourth condition holds, and that condition is a segment row with a read back
+/// digest on it, which is this table.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 #[repr(u8)]
 pub enum Stream {
@@ -1293,6 +1298,8 @@ pub enum Stream {
     Receipts = 2,
     /// Fetched robots.txt, raw and parsed.
     Robots = 3,
+    /// Doc 08.6's spilled backlog, which is state on its way out of state.
+    Frontier = 4,
 }
 
 impl Stream {
@@ -1314,6 +1321,7 @@ impl Stream {
             1 => Some(Self::Pages),
             2 => Some(Self::Receipts),
             3 => Some(Self::Robots),
+            4 => Some(Self::Frontier),
             _ => None,
         }
     }

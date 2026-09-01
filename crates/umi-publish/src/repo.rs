@@ -33,7 +33,8 @@ pub const ROBOTS_REPO: &str = "open-index/umi-robots";
 /// This is [`umi_file::StreamKind`] seen from the publishing side. They are
 /// deliberately not the same type: a stream is what a segment holds and a
 /// family is where it is published, and doc 12.4 maps robots to a single
-/// repository while pages and receipts get one per week and slice.
+/// repository while pages, receipts and the frontier get one per week and
+/// slice.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Family {
     /// `umi-pages-<YYYY>w<WW>-<NN>`, the corpus.
@@ -42,6 +43,16 @@ pub enum Family {
     Receipts,
     /// `umi-robots`, doc 07.4's longitudinal corpus.
     Robots,
+    /// `umi-frontier-<YYYY>w<WW>-<NN>`, doc 08.6's spilled backlog.
+    ///
+    /// Sliced like pages and receipts rather than held in one repository like
+    /// robots, because the backlog is the biggest thing the project has: 100
+    /// billion known URLs is terabytes even after the local ledger's columns
+    /// have been dropped, and no single repository is going to hold it. Nothing
+    /// looks a spill up by repository name, so slicing costs nothing. A
+    /// coordinator finds a domain's rows through the per domain pointer doc
+    /// 08.6 keeps locally, and everyone else reads the manifest.
+    Frontier,
 }
 
 impl Family {
@@ -52,13 +63,14 @@ impl Family {
             umi_file::StreamKind::Pages => Self::Pages,
             umi_file::StreamKind::Receipts => Self::Receipts,
             umi_file::StreamKind::Robots => Self::Robots,
+            umi_file::StreamKind::Frontier => Self::Frontier,
         }
     }
 
     /// The stream a repository of this family holds.
     ///
     /// The inverse of [`Family::of`], and total in both directions because the
-    /// two enums have the same three members for the same reason. The card
+    /// two enums have the same members for the same reason. The card
     /// generator wants it: it knows which repository it is writing a README for
     /// and needs the schema that repository's files carry.
     #[must_use]
@@ -67,6 +79,7 @@ impl Family {
             Self::Pages => umi_file::StreamKind::Pages,
             Self::Receipts => umi_file::StreamKind::Receipts,
             Self::Robots => umi_file::StreamKind::Robots,
+            Self::Frontier => umi_file::StreamKind::Frontier,
         }
     }
 
@@ -77,6 +90,7 @@ impl Family {
             Self::Pages => "umi-pages",
             Self::Receipts => "umi-receipts",
             Self::Robots => "umi-robots",
+            Self::Frontier => "umi-frontier",
         }
     }
 
