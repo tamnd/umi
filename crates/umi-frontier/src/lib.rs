@@ -66,8 +66,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use umi_state::{
-    AdmitReport, BATCH, Budget, Candidate, Discovery, EvictReport, Lease, LeaseRequest, Priority,
-    Result, State,
+    ADMIT_BATCH, AdmitReport, Budget, Candidate, Discovery, EvictReport, Lease, LeaseRequest,
+    Priority, Result, State,
 };
 use umi_types::{FetcherId, PldId, RowKey, Tier, canonicalize};
 
@@ -409,7 +409,7 @@ impl<S: State> Frontier<S> {
             }
         }
 
-        for chunk in batch.chunks(BATCH) {
+        for chunk in batch.chunks(ADMIT_BATCH) {
             let part = self.state.admit(chunk).await?;
             report.admitted = add(report.admitted, part);
         }

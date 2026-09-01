@@ -2627,7 +2627,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
 
         let mut admitted = 0;
         for (depth, group) in by_depth {
-            for chunk in group.chunks(umi_state::BATCH) {
+            for chunk in group.chunks(umi_state::ADMIT_BATCH) {
                 let report = self
                     .frontier
                     .admit_at(chunk, depth, now_ms, Discovery::Trusted)
