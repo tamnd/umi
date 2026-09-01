@@ -54,6 +54,8 @@ pub struct Scope {
     pub rate: RateOverride,
     /// Where the first URLs come from.
     pub seed: Seed,
+    /// Which published corpus the pages belong in.
+    pub corpus: Corpus,
 }
 
 impl Default for Scope {
@@ -78,6 +80,7 @@ impl Scope {
             budget: Budget::general(),
             rate: RateOverride::default(),
             seed: Seed::default(),
+            corpus: Corpus::General,
         }
     }
 
@@ -128,6 +131,11 @@ impl Scope {
         let mut scope = Self {
             name,
             include: vec![matcher],
+            // Spelled out rather than inherited. `umi crawl example.com` is the
+            // definition of a focused crawl, and a target that quietly kept the
+            // general corpus off `Scope::general` would put one site's pages in
+            // the sample everybody else computes over.
+            corpus: Corpus::Focus,
             ..Self::general()
         };
         scope.stamp(target.as_bytes());
@@ -172,8 +180,27 @@ impl Scope {
             };
             list.extend(parsed.include);
         }
+        // A profile that asked for the general corpus and then had `--include`
+        // put on it at the command line is the same mistake as one that wrote
+        // both lines in the file, and it has to be refused in the same place a
+        // reader would look for it.
+        self.check_corpus()?;
         let source = format!("{}|{}", self.name, targets.join("|"));
         self.stamp(source.as_bytes());
+        Ok(())
+    }
+
+    /// Doc 13.8: a crawl that restricts where it may go cannot publish into the
+    /// general corpus.
+    ///
+    /// Refusing rather than downgrading, because an operator who asked for both
+    /// meant one of them and we do not know which, and a crawl that publishes
+    /// somewhere other than where it was told is worse than a crawl that does
+    /// not start.
+    fn check_corpus(&self) -> Result<(), ScopeError> {
+        if self.corpus == Corpus::General && self.filters_links() {
+            return Err(ScopeError::Corpus);
+        }
         Ok(())
     }
 
@@ -208,7 +235,9 @@ impl Scope {
             },
             rate: file.rate,
             seed: file.seed,
+            corpus: file.corpus,
         };
+        scope.check_corpus()?;
         scope.stamp(text.as_bytes());
         Ok(scope)
     }
@@ -312,6 +341,33 @@ impl Matcher {
             Self::UrlRegex(re) => re.is_match(url.as_str()),
         }
     }
+}
+
+/// Which published corpus this crawl's pages belong in.
+///
+/// Doc 13.8 keeps focused crawls out of `umi-pages-*`, because the general
+/// corpus is meant to be an unbiased sample of the web and a crawl of one
+/// domain is not. The rule is right and it cannot be decided by looking at the
+/// profile, because what makes a crawl biased is the seed as much as the
+/// matchers, and a run seeded from one site is not an unbiased sample however
+/// few matchers it has. Nothing in the code can tell whether a list of ten
+/// thousand hostnames is representative of the web, and a rule that guesses
+/// will guess wrong in the direction that poisons a corpus other people are
+/// computing statistics over.
+///
+/// So the operator says. The default is the safe one: a profile that says
+/// nothing publishes to its own repository, where being biased costs nobody
+/// anything, and getting into the general corpus takes a line that somebody
+/// had to write on purpose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum Corpus {
+    /// `umi-focus-<name>`, named after the scope. The default.
+    #[default]
+    Focus,
+    /// `umi-pages-<iso week>-<slice>`, the general corpus.
+    General,
 }
 
 /// What to do with a link that leaves the scope.
@@ -531,6 +587,10 @@ pub enum ScopeError {
     /// The target of `umi crawl` was neither a URL nor a hostname.
     #[error("not a domain, host or url: {0}")]
     Target(String),
+    /// The profile asked for the general corpus and also restricts where the
+    /// crawl may go.
+    #[error("corpus = \"general\" needs a profile with no include and no exclude")]
+    Corpus,
 }
 
 /// Doc 13.4's profile, exactly as it is written.
@@ -554,6 +614,8 @@ struct ProfileFile {
     rate: RateOverride,
     #[serde(default)]
     seed: Seed,
+    #[serde(default)]
+    corpus: Corpus,
 }
 
 /// The budget as written, where the duration is still a string.

@@ -5,7 +5,7 @@
 //! web. The expensive bug here is not a crash, it is a focused crawl that
 //! quietly wandered off its own site and a report nobody questioned.
 
-use super::scope::{ContentFilter, LinkPolicy, Matcher, RateOverride, Scope};
+use super::scope::{ContentFilter, Corpus, LinkPolicy, Matcher, RateOverride, Scope};
 
 fn url(text: &str) -> url::Url {
     url::Url::parse(text).expect("test url parses")
@@ -275,4 +275,69 @@ fn a_rate_override_can_only_lower() {
         concurrency: 1,
     };
     assert!((gentle.clamped() - 0.25).abs() < f32::EPSILON);
+}
+
+#[test]
+fn a_profile_publishes_to_its_own_repository_unless_it_says_otherwise() {
+    // The default matters more than the feature does. Every profile written
+    // before the key existed carries no `corpus` line, and none of them should
+    // start publishing into the sample everybody else computes over.
+    let profile = r#"
+name = "rust-blog"
+include = [{ host_suffix = "blog.rust-lang.org" }]
+"#;
+    let scope = Scope::from_toml(profile).expect("profile parses");
+    assert_eq!(scope.corpus, Corpus::Focus);
+}
+
+#[test]
+fn a_profile_with_no_matchers_can_ask_for_the_general_corpus() {
+    let profile = r#"
+name = "wide"
+corpus = "general"
+"#;
+    let scope = Scope::from_toml(profile).expect("profile parses");
+    assert_eq!(scope.corpus, Corpus::General);
+}
+
+#[test]
+fn a_scoped_profile_cannot_ask_for_the_general_corpus() {
+    // Doc 13.7. A crawl that restricts where it may go is a focused crawl
+    // whatever it calls itself, and the answer is to refuse rather than to
+    // quietly publish somewhere other than where the profile says.
+    let scoped = r#"
+name = "wide"
+corpus = "general"
+include = [{ host_suffix = "example.com" }]
+"#;
+    assert!(Scope::from_toml(scoped).is_err());
+
+    let excluded = r#"
+name = "wide"
+corpus = "general"
+exclude = [{ host_suffix = "example.com" }]
+"#;
+    assert!(Scope::from_toml(excluded).is_err());
+}
+
+#[test]
+fn a_target_on_the_command_line_is_always_a_focused_crawl() {
+    // `for_target` builds on `Scope::general`, which is the general corpus, so
+    // this is the test that stops an inherited field from putting one site's
+    // pages in `umi-pages`.
+    let scope = Scope::for_target("example.com").expect("domain");
+    assert_eq!(scope.corpus, Corpus::Focus);
+}
+
+#[test]
+fn an_include_flag_cannot_smuggle_a_scope_into_the_general_corpus() {
+    // The same rule as the profile check, at the other door. `--include` is
+    // applied after the profile parses, so a profile that asked for the general
+    // corpus and passed would otherwise gain matchers afterwards and keep the
+    // corpus it no longer qualifies for.
+    let mut scope = Scope::from_toml("name = \"wide\"\ncorpus = \"general\"").expect("parses");
+    assert!(scope.add_include(&["example.com".to_owned()]).is_err());
+
+    let mut excluding = Scope::from_toml("name = \"wide\"\ncorpus = \"general\"").expect("parses");
+    assert!(excluding.add_exclude(&["example.com".to_owned()]).is_err());
 }
