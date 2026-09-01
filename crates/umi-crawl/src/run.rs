@@ -44,7 +44,7 @@
 //! wants them in a `.umi` file. Splitting it that way also keeps this file
 //! free of any I/O that is not a fetch.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -355,6 +355,42 @@ impl HostFloors {
     }
 }
 
+/// The two handles the robots prefetch needs, carried together.
+///
+/// Together because they are always passed together and neither means anything
+/// without the other: the prefetch takes a host's slot out of the first and
+/// leaves what it learned in the second. One argument down two layers of call
+/// rather than two.
+#[derive(Clone, Copy)]
+struct Warming<'a> {
+    floors: &'a Arc<HostFloors>,
+    warmed: &'a Arc<Warmed>,
+}
+
+/// What the robots prefetch learned, waiting for the loop to pick it up.
+///
+/// A prefetch runs on a task of its own and finishes whenever the origin gets
+/// round to it, which is not a moment the loop is waiting for anything. So it
+/// leaves what it learned here and the loop folds it in on its next pass, the
+/// same way a finished fetch leaves a signal.
+#[derive(Default)]
+struct Warmed(Mutex<Vec<Learned>>);
+
+impl Warmed {
+    fn push(&self, learned: Learned) {
+        self.lock().push(learned);
+    }
+
+    /// Everything left here, leaving the vector empty for the next pass.
+    fn take(&self) -> Vec<Learned> {
+        std::mem::take(&mut *self.lock())
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Learned>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// Where finished rows go.
 ///
 /// One method, taking a slice, for the same reason the state trait takes
@@ -565,6 +601,13 @@ pub struct TickReport {
     /// Normally zero. A number that stays high means hosts are escalating and
     /// de-escalating in turn, which is worth looking at.
     pub learned: usize,
+    /// Robots.txt files fetched ahead of the lease that wanted them.
+    ///
+    /// Against `robots_ms` this is what says whether the prefetch is doing its
+    /// job. A tick that warmed a lot of hosts and still spent most of its page
+    /// slots on robots.txt is a tick where the files arrived too late to help,
+    /// which means the queue was not deep enough to give them any runway.
+    pub robots_warmed: usize,
     /// Leases fetched at T2, for doc 05.9's 15 percent alert.
     pub emulated: usize,
     /// Leases fetched at T3 or above.
@@ -1105,6 +1148,11 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         // Shared rather than borrowed because every fetch is spawned, and a
         // spawned task cannot borrow the tick's stack frame.
         let floors = Arc::new(HostFloors::default());
+        let warmed = Arc::new(Warmed::default());
+        let warming = Warming {
+            floors: &floors,
+            warmed: &warmed,
+        };
         let mut pending = FuturesUnordered::new();
         let mut supply = Supply {
             queue: VecDeque::new(),
@@ -1142,7 +1190,14 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
 
         for _ in 0..window {
             let Some((lease, at)) = self
-                .next_lease(&mut supply, &allowance, window, &mut deferred, &mut report)
+                .next_lease(
+                    &mut supply,
+                    &allowance,
+                    window,
+                    &mut deferred,
+                    &warming,
+                    &mut report,
+                )
                 .await?
             else {
                 break;
@@ -1181,7 +1236,14 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 );
             }
             if let Some((lease, at)) = self
-                .next_lease(&mut supply, &allowance, window, &mut deferred, &mut report)
+                .next_lease(
+                    &mut supply,
+                    &allowance,
+                    window,
+                    &mut deferred,
+                    &warming,
+                    &mut report,
+                )
                 .await?
             {
                 pending.push(self.start(lease, at, &floors));
@@ -1209,6 +1271,16 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
 
             if disallowed {
                 report.disallowed += 1;
+            }
+            // Whatever the prefetch finished while this fetch was on the wire.
+            // Here rather than on the prefetch's own task because `held` is the
+            // loop's and folding is a scan, and here rather than once a window
+            // because a fact the loop is sitting on is a host record the tick
+            // has not written yet. Taking an empty vector is what this does on
+            // almost every pass.
+            for learned in warmed.take() {
+                report.robots_warmed += 1;
+                learn(&mut held.signals, learned);
             }
             if let Some(learned) = signal {
                 // A block with no row behind it is a challenge page: doc 05.8
@@ -1319,6 +1391,17 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 }
             }
         }
+        // The last of the prefetch, before the last store, so a file that
+        // arrived while the window was draining still reaches the host record
+        // in this tick. A prefetch still running when the tick ends is dropped
+        // on the floor rather than waited for, and that is the right trade: the
+        // entry is in the cache either way, and holding a tick open for a
+        // robots.txt that nothing is waiting for is the delay this whole change
+        // is about. See the note in `run_one` for what covers the loss.
+        for learned in warmed.take() {
+            report.robots_warmed += 1;
+            learn(&mut held.signals, learned);
+        }
         // Both, in order. The one in flight has the earlier window in it and
         // has to land first, for the same reason the two halves of a single
         // store are in the order they are.
@@ -1381,6 +1464,60 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         tokio::spawn(async move { shared.one(lease, at, &floors).await })
     }
 
+    /// Start fetching robots.txt for the hosts a batch of leases will need it
+    /// for, before any of those leases goes on the wire.
+    ///
+    /// This is the biggest single thing in a page's bill and it was hiding in
+    /// plain sight. Measured on server3 at a window of 1024 against the real
+    /// seed, a page cost 4309 ms of which 3597 ms was robots.txt, so 83 percent
+    /// of every slot in the window was a slot not fetching a page. It stays
+    /// that high on a broad crawl rather than fading after the first tick,
+    /// because link discovery keeps turning up hosts nobody has met: the same
+    /// run reported 3220 ms of robots on its last tick with a million URLs
+    /// queued.
+    ///
+    /// The fix is not to make the file cheaper, it is to stop paying for it out
+    /// of a window slot. A lease sits in the queue for about as long as the
+    /// window takes to drain, so kicking the fetch off when the lease arrives
+    /// rather than when it is dispatched gives the file a whole window's worth
+    /// of runway to arrive in. By the time the lease is picked up the cache
+    /// usually has the answer and [`RobotsCache::decide`] returns without a
+    /// request.
+    ///
+    /// Politeness is unchanged and it is [`HostFloors`] that keeps it that way.
+    /// The prefetch claims the host's next slot exactly as a lease would, so
+    /// the page that follows claims the one after it and the two requests are
+    /// spaced the way one lease making two requests was always spaced. What
+    /// changes is only which task is asleep in between.
+    ///
+    /// One task per host and not per lease, and nothing at all for a host whose
+    /// file we already hold, which after the first minute of a crawl is most of
+    /// them. The most this can have in flight is one batch's worth of distinct
+    /// hosts, which is the same order as the window it runs beside.
+    fn warm(&self, leases: &[umi_state::Lease], floors: &Arc<HostFloors>, warmed: &Arc<Warmed>) {
+        let mut seen = HashSet::with_capacity(leases.len());
+        for lease in leases {
+            if !seen.insert(lease.key.host) {
+                continue;
+            }
+            let Some(origin) = origin_of(&lease.url) else {
+                continue;
+            };
+            let shared = Arc::clone(&self.shared);
+            let floors = Arc::clone(floors);
+            let warmed = Arc::clone(warmed);
+            let (host, tier, delay_ms) = (lease.key.host, lease.tier, lease.delay_ms);
+            tokio::spawn(async move {
+                if let Some(learned) = shared
+                    .warm_one(host, &origin, tier, delay_ms, &floors)
+                    .await
+                {
+                    warmed.push(learned);
+                }
+            });
+        }
+    }
+
     /// Hand a finished window to the store, on a task of its own.
     ///
     /// The same reasoning as [`start`](Self::start) and the same mechanism, for
@@ -1441,6 +1578,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         allowance: &Allowance,
         chunk: usize,
         deferred: &mut Vec<LeaseId>,
+        warming: &Warming<'_>,
         report: &mut TickReport,
     ) -> Result<Option<(umi_state::Lease, u64)>, CrawlError> {
         loop {
@@ -1470,7 +1608,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                     return Ok(None);
                 }
             }
-            if self.take_ask(supply, report).await? == 0 {
+            if self.take_ask(supply, warming, report).await? == 0 {
                 supply.patience = (chunk / 2).max(1);
                 return Ok(None);
             }
@@ -1515,6 +1653,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
     async fn take_ask(
         &self,
         supply: &mut Supply,
+        warming: &Warming<'_>,
         report: &mut TickReport,
     ) -> Result<usize, CrawlError> {
         let Some(asking) = supply.asking.take() else {
@@ -1541,6 +1680,10 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         }
         let count = leases.len();
         report.leased += count;
+        // Before the queue and not after it, so that the runway a lease spends
+        // waiting for a slot is runway the robots fetch gets to use. See
+        // [`warm`](Self::warm).
+        self.warm(&leases, warming.floors, warming.warmed);
         supply.queue.extend(leases);
         Ok(count)
     }
@@ -1914,6 +2057,43 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         }
     }
 
+    /// One host's robots.txt, fetched ahead of the lease that needs it.
+    ///
+    /// [`None`] when there was nothing to do, which covers three cases and
+    /// treats them the same because the caller does the same thing with all of
+    /// them. The file is already held, or the host's next slot is further out
+    /// than a prefetch is worth waiting for, or the fetch happened but somebody
+    /// else's task was the one inside the cell that made the request. Only the
+    /// task that actually asked the origin has anything to teach.
+    async fn warm_one(
+        &self,
+        host: HostId,
+        origin: &str,
+        tier: Tier,
+        delay_ms: u32,
+        floors: &HostFloors,
+    ) -> Option<Learned> {
+        let now_ms = self.clock.now_ms();
+        if self.robots.holds(host, now_ms).await {
+            return None;
+        }
+        // The same ceiling a lease uses. A prefetch is not holding a window
+        // slot so it could afford to wait longer, but a host whose slots are
+        // spoken for that far out is a host this batch is not going to reach
+        // either, and taking its slot now would only push the lease further.
+        let ceiling = now_ms.saturating_add(PARKED_MS);
+        self.wait_for(host, now_ms, delay_ms, floors, ceiling)
+            .await?;
+        let (entry, fetched) = self
+            .robots
+            .entry(&self.fetch, host, origin, tier, self.clock.now_ms())
+            .await;
+        fetched.then(|| Learned {
+            robots: Some(RobotsFacts::of(&entry)),
+            ..Learned::nothing(host, tier, false)
+        })
+    }
+
     /// One lease, timed.
     ///
     /// A wrapper rather than a line at the end of [`one`](Self::one), because
@@ -1974,10 +2154,28 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             )
             .await;
         spent.robots_ms = ms(asked);
-        // Only the lease that paid for the fetch writes anything down. Every
-        // other lease on this host today read the same entry out of the cache
-        // and has nothing to say the host record does not already hold.
-        let robots = robots_fetched.then(|| RobotsFacts::of(&entry));
+        // What the file asks for against what this lease was spaced for. Read
+        // whoever fetched the file, because since the prefetch exists the lease
+        // that gets the answer is usually not the one that paid for it, and the
+        // number still has to be honoured on the lease that reads it.
+        let stated = entry
+            .robots
+            .crawl_delay()
+            .map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
+        let unspaced = stated > lease.delay_ms;
+        // Ordinarily only the lease that paid for the fetch writes anything
+        // down. Every other lease on this host today read the same entry out of
+        // the cache and has nothing to say the host record does not already
+        // hold, and a lookup per page is what that rule is there to avoid.
+        //
+        // The second half is what keeps that true now that a prefetch can be
+        // the one that paid. A prefetch leaves what it learned for the loop to
+        // fold, and a prefetch still running when the tick ends does not get
+        // folded, so the host record can be left not knowing about a delay the
+        // file published. A lease that finds it was spaced for less than the
+        // file asks for teaches the record itself, which both fixes that and
+        // costs nothing on the hosts that do not publish a delay at all.
+        let robots = (robots_fetched || unspaced).then(|| RobotsFacts::of(&entry));
         if !decision.is_allowed() {
             return Fetched::refused(&lease, now(), entry.robots.provenance())
                 .taught(&lease, robots);
@@ -2016,23 +2214,23 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         // slot open to do it by hand. The number comes off the parse and not
         // off the lease because the record does not learn it until the end of
         // the tick, which is after this decision.
-        if robots_fetched {
-            let stated = entry
-                .robots
-                .crawl_delay()
-                .map_or(0, |d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX));
-            if stated > lease.delay_ms {
-                // A T3 lease was holding one of doc 05.9's render slots, taken
-                // before anything here knew there was a robots.txt to fetch.
-                // No browser ran, so the slot goes back. The guard is the tier
-                // and not whether a slot was granted, because the one case
-                // that reaches here without a grant is a process with no
-                // browser at all, and `refund` on that process does nothing.
-                if lease.tier >= Tier::Rendered {
-                    self.render.refund();
-                }
-                return Fetched::robots_cost(&lease, now()).taught(&lease, robots);
+        // Whoever fetched the file, and not just this lease. A prefetched host
+        // reaches here with `robots_fetched` false and a record that has not
+        // learned the delay yet, so a check that trusted the flag would let the
+        // one request the file was written to stop go out anyway.
+        if unspaced {
+            // A T3 lease was holding one of doc 05.9's render slots, taken
+            // before anything here knew there was a robots.txt to fetch. No
+            // browser ran, so the slot goes back. The guard is the tier and not
+            // whether a slot was granted, because the one case that reaches
+            // here without a grant is a process with no browser at all, and
+            // `refund` on that process does nothing.
+            if lease.tier >= Tier::Rendered {
+                self.render.refund();
             }
+            return Fetched::robots_cost(&lease, now()).taught(&lease, robots);
+        }
+        if robots_fetched {
             let again = Instant::now();
             let ceiling = now().saturating_add(PARKED_MS);
             let second = self

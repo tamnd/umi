@@ -86,6 +86,21 @@ impl RobotsCache {
         self.len().await == 0
     }
 
+    /// Whether a fresh answer for this host is already in hand.
+    ///
+    /// A cell that exists but has not been filled yet counts as held, because
+    /// the fetch it is waiting on is one somebody already started and a second
+    /// caller would only queue behind it. What this is for is deciding whether
+    /// a host needs a request spent on it, and a host with a fetch in flight
+    /// does not.
+    pub async fn holds(&self, host: HostId, now_ms: u64) -> bool {
+        self.hosts
+            .lock()
+            .await
+            .get(&host)
+            .is_some_and(|cell| cell.get().is_none_or(|e| e.fresh(now_ms)))
+    }
+
     /// What robots.txt says about `url`, fetching the file first if we do not
     /// have a fresh copy.
     ///
