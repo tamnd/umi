@@ -315,6 +315,11 @@ struct CrawlArgs {
     /// Publish to Hugging Face, and delete local copies once they verify.
     #[arg(long)]
     publish: bool,
+    /// Serve doc 15.4's Prometheus series while the crawl runs. Bare, it binds
+    /// 127.0.0.1:9772. Give an address to bind somewhere else, and read the
+    /// note in `umi_cli::exporter` before you bind a public one.
+    #[arg(long, value_name = "ADDR", num_args = 0..=1, default_missing_value = "127.0.0.1:9772")]
+    metrics: Option<String>,
 }
 
 impl CrawlArgs {
@@ -352,6 +357,7 @@ impl CrawlArgs {
             out: self.out.clone(),
             publish: crawl::Publishing::resolve(config, self.publish)?,
             identity: crawl::Identity::resolve(config)?,
+            metrics: self.metrics.clone(),
         })
     }
 }

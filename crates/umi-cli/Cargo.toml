@@ -38,6 +38,10 @@ umi-state.workspace = true
 # not focused, so `--state nami` and `--state postgres` are still refused at the
 # flag rather than silently falling back to this.
 umi-state-sqlite.workspace = true
+# Doc 15.4's series. This crate holds the numbers, `src/exporter.rs` holds the
+# socket, and the split is deliberate: the metrics crate has no dependency on
+# tokio and should not grow one.
+umi-metrics.workspace = true
 
 blake3.workspace = true
 # The global allocator for the `umi` binary. See the note in the workspace
@@ -67,7 +71,8 @@ thiserror.workspace = true
 # a current thread runtime would serialise that behind the fetches. The crawl
 # builds the multi threaded runtime itself and the other commands keep using
 # the small one.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# `net` and `io-util` are the metrics listener in `src/exporter.rs`.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "net", "io-util"] }
 toml.workspace = true
 url.workspace = true
 

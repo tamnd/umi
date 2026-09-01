@@ -81,14 +81,16 @@ use umi_crawl::{
 use umi_fetch::webbotauth::Signer;
 use umi_fetch::{FetchConfig, Ladder};
 use umi_file::{StreamKind, WriterConfig};
+use umi_metrics::{AdmitResult, DiskRole, Metrics};
 use umi_publish::manifest::{FileEntry, Manifest, Verification};
 use umi_publish::repo::Corpus;
 use umi_publish::{BlockEntry, Hub, PublishConfig, Published, Publisher, Role, SigningKey};
 use umi_state::{Candidate, SegmentQuery, SegmentRow, State, StateStats, Stream};
 use umi_state_sqlite::SqliteState;
-use umi_types::{Digest, FetcherId, Tier, Ulid};
+use umi_types::{Digest, FetcherId, OutcomeCode, Tier, Ulid};
 
 use crate::Error;
+use crate::exporter::Exporter;
 
 #[cfg(test)]
 #[path = "crawl_tests.rs"]
@@ -237,6 +239,15 @@ pub struct Options {
     pub publish: Option<Publishing>,
     /// Doc 07.2's crawl identity key, or nothing when none is configured.
     pub identity: Option<Identity>,
+    /// Where to serve doc 15.4's metrics, or nothing when `--metrics` was not
+    /// given.
+    ///
+    /// A flag and not a configuration key on purpose. Doc 14.6 puts the admin
+    /// listener on `umid`, which is the process that runs for months and wants
+    /// its listener in a file. A `umi crawl` is a run somebody started, and
+    /// which port that run's numbers come out on is a decision that belongs to
+    /// the run.
+    pub metrics: Option<String>,
 }
 
 /// The key doc 07.2 signs outgoing requests with.
@@ -1131,6 +1142,30 @@ fn run(
     };
 
     runtime.block_on(async {
+        // First, because a port that is already in use is a thing to be told
+        // about in the first second of a run rather than after the key
+        // directory has been written to and the first segment is on disk.
+        // Same rule the publishing token follows.
+        let exporter = match &options.metrics {
+            Some(addr) => {
+                let exporter = Exporter::start(addr).await?;
+                log.line(&format!("metrics on http://{}/metrics", exporter.addr()))?;
+                if exporter.is_public() {
+                    // A warning and not a refusal. An operator with a scraper
+                    // on another box has a real reason to bind an interface,
+                    // and a tool that will not do what you asked is a tool
+                    // people route around. But nobody should bind one by
+                    // accident and not be told.
+                    log.line(
+                        "that is not a loopback address, so anything that can reach \
+                         this box can read what this crawl is doing",
+                    )?;
+                }
+                Some(exporter)
+            }
+            None => None,
+        };
+
         // Doc 12.7's step 8 for whatever a previous run got as far as step 6
         // and then lost the process. Before the first fetch rather than after
         // the last one, because the reason it matters is disk, and disk is
@@ -1233,7 +1268,11 @@ fn run(
             // on the next batch rather than after one more.
             let tick_ms = clock.now_ms();
             if pressure.due(tick_ms) {
-                for moved in pressure.observe(&*state, tick_ms).await? {
+                let (signals, transitions) = pressure.observe(&*state, tick_ms).await?;
+                if let Some(exporter) = &exporter {
+                    pressed(exporter.metrics(), &signals, &transitions);
+                }
+                for moved in transitions {
                     log.line(&moved.to_string())?;
                 }
                 crawler.restrain(pressure.ladder.allowance());
@@ -1269,6 +1308,9 @@ fn run(
             }
             .map_err(|e| Error::Crawl(e.to_string()))?;
             add(&mut summary, &report);
+            if let Some(exporter) = &exporter {
+                ticked(exporter.metrics(), &report);
+            }
             harvest(
                 &sink,
                 layout,
@@ -2074,14 +2116,20 @@ impl Pressure {
     }
 
     /// Read the signals and move the ladders.
+    ///
+    /// The signals come back with the transitions because doc 15.4 exports
+    /// three of them as gauges, and reading them a second time for the
+    /// exporter would mean a second `df` and a second query for a number this
+    /// already has in hand.
     async fn observe(
         &mut self,
         state: &dyn State,
         now_ms: u64,
-    ) -> Result<Vec<umi_crawl::Transition>, Error> {
+    ) -> Result<(Signals, Vec<umi_crawl::Transition>), Error> {
         self.sampled_ms = Some(now_ms);
         let signals = self.read(state, now_ms).await?;
-        Ok(self.ladder.observe(&signals, now_ms))
+        let moved = self.ladder.observe(&signals, now_ms);
+        Ok((signals, moved))
     }
 
     async fn read(&self, state: &dyn State, now_ms: u64) -> Result<Signals, Error> {
@@ -2273,6 +2321,80 @@ fn span(ms: u64) -> String {
     }
 }
 
+/// Fold a finished tick into doc 15.4's series.
+///
+/// Only what the tick actually knows. Every number here comes off the report
+/// and none of it is derived from a ratio or an assumption, because a metric
+/// that is a guess is worse than a metric that is missing: the missing one
+/// looks missing on a dashboard and the guess looks like a fact.
+///
+/// What that leaves out is worth naming, because a reader will look for it.
+/// `umi_robots_fetch_total` needs the result of each robots.txt fetch and a
+/// tick reports how many it warmed and not how they came out.
+/// `umi_state_op_duration_seconds` is a histogram of single calls and a tick
+/// reports totals, and turning a total into one observation would move every
+/// quantile. `umi_frontier_size` needs a count per state, which is a query
+/// this loop does not run every tick and should not start running for a gauge.
+/// All three want a change under this function rather than an approximation
+/// inside it.
+fn ticked(metrics: &Metrics, report: &TickReport) {
+    for (tier, by_outcome) in Tier::ALL.iter().zip(&report.pages) {
+        for (outcome, count) in OutcomeCode::ALL.iter().zip(by_outcome) {
+            if *count > 0 {
+                metrics
+                    .pages_fetched()
+                    .get(*tier, *outcome)
+                    .add(u64::from(*count));
+            }
+        }
+    }
+    metrics.bytes_in().add(report.bytes_fetched);
+    // Doc 15.4 reads `admitted` over `seen` as the discovery health check, so
+    // both go in and `seen` is every candidate rather than the ones that were
+    // not admitted. The other two results need the state to say which of the
+    // refusals was the holding pen and which was the scope, and `admit`
+    // returns one number for both.
+    metrics
+        .admit()
+        .get(AdmitResult::Seen)
+        .add(report.links_seen as u64);
+    metrics
+        .admit()
+        .get(AdmitResult::Admitted)
+        .add(report.links_admitted as u64);
+}
+
+/// Fold a reading of doc 15.3's signals into doc 15.4's gauges.
+///
+/// The levels come from the transitions rather than from the ladder, because a
+/// ladder only moves by producing one, so the two cannot disagree and there is
+/// no accessor to add.
+fn pressed(metrics: &Metrics, signals: &Signals, moved: &[umi_crawl::Transition]) {
+    metrics.unpublished_bytes().set(signals.unpublished_bytes);
+    metrics
+        .publish_lag()
+        .set(signals.publish_lag_ms as f64 / 1000.0);
+    // One reading and three series. `Pressure` measures the filesystem the
+    // segments land on, and in a `umi crawl` the state file and the publisher's
+    // staging are in the same directory under the same `--out`, so all three
+    // roles really are the same number here. Doc 15.4's `DiskRole` says that
+    // is the expected case rather than a shortcut.
+    for role in [DiskRole::State, DiskRole::Segments, DiskRole::Staging] {
+        metrics.disk_free().get(role).set(signals.free_disk_bytes);
+    }
+    for transition in moved {
+        let ladder = match transition.ladder {
+            umi_crawl::Ladder::Disk => umi_metrics::Ladder::Disk,
+            umi_crawl::Ladder::Cpu => umi_metrics::Ladder::Cpu,
+            umi_crawl::Ladder::Memory => umi_metrics::Ladder::Memory,
+        };
+        metrics
+            .backpressure()
+            .get(ladder)
+            .set(u64::from(transition.to));
+    }
+}
+
 /// Doc 14.3's one word answer to "why is this not faster".
 ///
 /// One word and not a number, because the question everybody asks first is
@@ -2334,6 +2456,7 @@ impl Default for Options {
             out: None,
             publish: None,
             identity: None,
+            metrics: None,
         }
     }
 }

@@ -17,6 +17,7 @@ pub mod config;
 pub mod crawl;
 pub mod doctor;
 mod error;
+pub mod exporter;
 pub mod get;
 pub mod inspect;
 pub mod rdns;
