@@ -108,7 +108,10 @@ Output
   --state <backend>            sqlite | nami | postgres    [default: sqlite]
   --publish                    run doc 12 and delete local copies after verify
   --format <fmt>               progress output: auto | json | quiet
+  --metrics [addr]             serve doc 15.4's series, default 127.0.0.1:9772
 ```
+
+`--metrics` is off unless it is given, and given bare it binds loopback. It takes an address rather than a port so that an operator with a scraper on another box can bind an interface on purpose, and the crawl says in its log when the address it bound is not a loopback one. There is no configuration key for it, which is deliberate: doc 14.6 puts the durable admin listener on `umid`, and which port a run somebody started serves its numbers on is a decision that belongs to that run.
 
 The default when everything is omitted: whole registrable domain, unlimited depth, in scope links only, `text/html`, 1 request per second per host, 4 concurrent, tiers up to rendered, stop when the frontier is empty, output to `./example.com`, SQLite state, nothing published.
 

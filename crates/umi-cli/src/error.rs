@@ -102,6 +102,14 @@ pub enum Error {
     #[error("this machine is not ready: see the report above")]
     NotReady,
 
+    /// The metrics listener would not bind.
+    ///
+    /// Its own variant rather than an `Io`, because the thing an operator
+    /// needs to read is the address, and because this is the one failure in a
+    /// crawl that happens before any work and is entirely about this box.
+    #[error("metrics: {0}")]
+    Metrics(String),
+
     /// The command is in doc 14 and is not built yet.
     #[error("{0}: see docs/spec/16-roadmap.md")]
     NotBuilt(&'static str),
@@ -128,7 +136,10 @@ impl Error {
             // retry loop.
             Self::Unreadable(_) | Self::Segment(_) | Self::Parquet(_) => Exit::Verification,
             Self::Publish(cause) => publishing(cause),
-            Self::NotReady => Exit::Resource,
+            // A port already in use or an address this box does not have. Doc
+            // 14.9's exit 7 is about the machine rather than the command, and
+            // both of those are the machine.
+            Self::NotReady | Self::Metrics(_) => Exit::Resource,
             Self::Io(_)
             | Self::Arrow(_)
             | Self::Fetcher(_)

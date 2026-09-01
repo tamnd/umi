@@ -3482,6 +3482,7 @@ dependencies = [
  "umi-extract",
  "umi-fetch",
  "umi-file",
+ "umi-metrics",
  "umi-publish",
  "umi-seed",
  "umi-state",

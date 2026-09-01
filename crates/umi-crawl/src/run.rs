@@ -60,7 +60,7 @@ use umi_state::{
     Budget, Discovery, FetchOutcome, FetchResult, LeaseId, NackReason, Pace, RobotsRef, State,
     StateError,
 };
-use umi_types::{FetcherId, HostId, Revalidator, Tier, TierSignal, Verification};
+use umi_types::{FetcherId, HostId, OutcomeCode, Revalidator, Tier, TierSignal, Verification};
 
 use crate::backpressure::Allowance;
 use crate::clock::Clock;
@@ -586,6 +586,15 @@ pub struct TickReport {
     /// URLs robots.txt said no to, which are completed as excluded and never
     /// fetched.
     pub disallowed: usize,
+    /// Rows this tick produced, by the tier that fetched them and how they
+    /// came out.
+    ///
+    /// A tally and not a pair of totals, because doc 15.4's
+    /// `umi_pages_fetched_total` is labelled by both and there is no way to
+    /// get a joint distribution back out of two marginals. Eighty five
+    /// counters is 340 bytes on a struct that is built once a tick, and
+    /// filling it is one increment per row.
+    pub pages: [[u32; OutcomeCode::ALL.len()]; Tier::ALL.len()],
     /// Links seen on the pages in this tick.
     pub links_seen: usize,
     /// Links that were new and went to the frontier.
@@ -1325,8 +1334,16 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 self.live.failed.fetch_add(1, Ordering::Relaxed);
             }
             if let Some(row) = row {
+                // Both indexes come off the row rather than off anything this
+                // loop decided, so the tally counts what was written. A tier
+                // byte from a newer build than this one would be out of range
+                // and there is no such thing yet, but a metric is not worth a
+                // panic, so it lands nowhere rather than anywhere.
+                if let Some(by_tier) = report.pages.get_mut(row.tier_used as usize) {
+                    by_tier[row.outcome as usize] += 1;
+                }
                 match row.outcome {
-                    umi_types::OutcomeCode::Ok => report.fetched += 1,
+                    OutcomeCode::Ok => report.fetched += 1,
                     _ => {
                         report.failed += 1;
                         self.live.failed.fetch_add(1, Ordering::Relaxed);

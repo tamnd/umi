@@ -142,6 +142,8 @@ umi_peer_lag_seconds{peer}
 
 Scraping runs on server3 only. Running a metrics stack on server1 would consume the memory budget that `umid` needs, and if server3 is down the metrics are the least of the problems.
 
+The endpoint exists ahead of `umid`, on `umi crawl --metrics`, because a crawl that runs for a day is the thing we are currently trying to measure and it should not have to wait for the daemon. Eight of the series above are filled from it today: `umi_pages_fetched_total`, `umi_bytes_in_total`, `umi_admit_total` for `seen` and `admitted`, `umi_unpublished_bytes`, `umi_publish_lag_seconds`, `umi_disk_free_bytes` and `umi_backpressure_level`. The rest render at zero, which is the honest answer for a number nothing has written yet, and each one needs a source rather than an estimate: the robots counters need the result of each fetch rather than the count of them, the state histograms need per call timings rather than a tick total, and the frontier gauge needs a count per state that the loop does not currently ask for.
+
 ## 15.5 The DuckDB view
 
 Doc 08 includes a DuckDB backend for exactly this, and the design intent is that it is read mostly and attaches to published checkpoints rather than competing with the live crawl for the state file.
