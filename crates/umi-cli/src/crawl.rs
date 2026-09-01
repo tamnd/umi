@@ -2161,6 +2161,14 @@ impl Pressure {
 /// links, which is about fifty per page on the open web and is also the only
 /// one of the three that gets slower as the frontier it inserts into gets
 /// bigger.
+///
+/// The links cost carries the two counts it is a cost for, admitted of seen,
+/// and they are there because they say which of two very different problems a
+/// slow admit is. A tick that admitted almost everything it saw is paying for
+/// urls it had never met and there is nothing to skip. A tick that admitted a
+/// tenth of what it saw is spending nine tenths of the largest write in the
+/// tick recognising links it already has, and the answer to that is a cheaper
+/// way of recognising them rather than a faster insert.
 fn progress(
     summary: &Summary,
     report: &TickReport,
@@ -2174,7 +2182,7 @@ fn progress(
          {} ms per page ({} robots, {} polite, {} warmed)  \
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
-         {:.0}s links)  \
+         {:.0}s links for {} of {})  \
          {} MB fetched  {} MB stored  {} failed  bottleneck: {}",
         summary.rows,
         report.window_mean(),
@@ -2194,6 +2202,8 @@ fn progress(
         report.rows_ms as f64 / 1000.0,
         report.complete_ms as f64 / 1000.0,
         report.admit_ms as f64 / 1000.0,
+        report.links_admitted,
+        report.links_seen,
         summary.bytes_fetched / (1 << 20),
         summary.bytes_stored / (1 << 20),
         summary.failed,
