@@ -55,6 +55,21 @@ impl Family {
         }
     }
 
+    /// The stream a repository of this family holds.
+    ///
+    /// The inverse of [`Family::of`], and total in both directions because the
+    /// two enums have the same three members for the same reason. The card
+    /// generator wants it: it knows which repository it is writing a README for
+    /// and needs the schema that repository's files carry.
+    #[must_use]
+    pub const fn stream(self) -> umi_file::StreamKind {
+        match self {
+            Self::Pages => umi_file::StreamKind::Pages,
+            Self::Receipts => umi_file::StreamKind::Receipts,
+            Self::Robots => umi_file::StreamKind::Robots,
+        }
+    }
+
     /// The name stem, without the week or the slice.
     #[must_use]
     pub const fn stem(self) -> &'static str {

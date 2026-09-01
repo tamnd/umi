@@ -197,10 +197,18 @@ impl Robots {
     ///
     /// The 5xx rule is the one people get wrong, and getting it wrong means
     /// crawling a site hardest at the moment it is least able to serve.
+    ///
+    /// A 429 goes with the 5xx rather than with the rest of the 4xx, which is
+    /// where Google's implementation puts it and where doc 07.6 already puts
+    /// it for pages. The status codes are grouped by what the number means and
+    /// not by which hundred it is in: a 404 is a site saying it has no rules,
+    /// and a 429 is a site saying we are asking too often, which is the last
+    /// answer that should turn into permission to crawl the whole host.
     #[must_use]
     pub fn for_status(status: u16, body: &[u8]) -> Self {
         match status {
             200..=299 => Self::parse(body),
+            429 => Self::disallow_all(Provenance::ServerError),
             400..=499 => Self::allow_all(Provenance::NotFound),
             500..=599 => Self::disallow_all(Provenance::ServerError),
             // A 1xx or a 3xx that reached here means the caller ran out of

@@ -153,6 +153,30 @@ impl Publisher {
         &self.hub
     }
 
+    /// Write doc 12.9's dataset card into a repository that has just been made.
+    ///
+    /// Public because a repository created before this existed has no card, and
+    /// the way to give it one is to call this against it rather than to delete
+    /// and republish a week of files.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the hub says.
+    pub async fn write_card(&self, repo: &str, family: Family) -> Result<()> {
+        let card = crate::card::card(&self.config.corpus, family, &self.config.extractor);
+        self.hub
+            .upload(
+                repo,
+                &[Upload::Inline {
+                    path: "README.md".to_owned(),
+                    bytes: card.into_bytes(),
+                }],
+                "Add the dataset card",
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Put this publisher's key in doc 12.5's directory if it is not there.
     ///
     /// Returns whether this call added it, which is true once per key and
@@ -317,7 +341,15 @@ impl Publisher {
         // Step 4. `ensure_dataset` first, because the first segment of a week
         // lands in a repository nobody has created, and a create that finds it
         // already there is a 409 the hub client reads as success.
-        self.hub.ensure_dataset(&location.repo).await?;
+        if self.hub.ensure_dataset(&location.repo).await? {
+            // Only on the commit that created it. The card is generated, so
+            // writing it every time would be a no change commit per segment,
+            // and a repository whose history is ten thousand identical README
+            // commits is one nobody can read the real history of. A card that
+            // needs updating gets updated by a pass over the repositories,
+            // which is a different job from publishing a file.
+            self.write_card(&location.repo, Family::of(stream)).await?;
+        }
         self.hub
             .upload(
                 &location.repo,

@@ -371,6 +371,19 @@ fn a_4xx_means_fully_allowed() {
 }
 
 #[test]
+fn a_429_goes_with_the_5xx_and_not_with_the_rest_of_the_4xx() {
+    // The one 4xx that is not a site saying it has no rules. A 429 is a site
+    // saying we are already asking too often, and reading that as permission to
+    // crawl the whole host is the worst available answer to it. Google's
+    // implementation carves it out of the 4xx rule for the same reason and doc
+    // 07.6 already backs a host off hard on one.
+    let robots = Robots::for_status(429, b"");
+    assert_eq!(robots.allows("/anything"), Decision::Disallowed);
+    assert_eq!(robots.provenance(), Provenance::ServerError);
+    assert!(robots.is_blanket_disallow());
+}
+
+#[test]
 fn anything_unclassifiable_is_disallowed_rather_than_allowed() {
     // A 3xx reaching here means the caller ran out of redirect hops. Unknown
     // is not the same as permitted.

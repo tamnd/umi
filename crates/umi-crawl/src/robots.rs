@@ -329,14 +329,29 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
                 // the most common robots.txt result on the web.
                 status = got.unwrap_or(0);
                 match failure {
-                    // A 4xx on robots.txt is the common case on the web: most
-                    // sites do not have one. RFC 9309 2.3.1.3 says that means
-                    // no restrictions.
-                    umi_fetch::Failure::NotFound => Robots::allow_all(Provenance::NotFound),
-                    umi_fetch::Failure::ServerError | umi_fetch::Failure::RateLimited => {
-                        Robots::disallow_all(Provenance::ServerError)
+                    // The three where the origin answered and the answer was
+                    // still not a file we could read. A 200 that went past the
+                    // body cap arrives here with no bytes at all, and running
+                    // the status rule on it would parse an empty file and call
+                    // that permission. Fail closed instead: the site published
+                    // rules and we did not manage to read one of them.
+                    umi_fetch::Failure::TooLarge
+                    | umi_fetch::Failure::Malformed
+                    | umi_fetch::Failure::NotDocument => {
+                        Robots::disallow_all(Provenance::Unreachable)
                     }
-                    _ => Robots::disallow_all(Provenance::Unreachable),
+                    // Everything else is decided by the status, through the
+                    // same function the success path uses. Routing on our
+                    // client's failure kind instead used to give a 403 one
+                    // answer when it arrived as a response and a different one
+                    // when it arrived as a block, which put two readings of the
+                    // same status in the published corpus.
+                    _ => match got {
+                        Some(code) => Robots::for_status(code, b""),
+                        // No status means no answer, and doc 07.4's 5xx rule
+                        // covers the case for the same reason.
+                        None => Robots::disallow_all(Provenance::Unreachable),
+                    },
                 }
             }
             // `Outcome` is non_exhaustive, so a variant added later lands here.

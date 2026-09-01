@@ -470,6 +470,64 @@ async fn a_server_error_is_written_down_as_an_answer_we_did_not_get() {
 }
 
 #[tokio::test]
+async fn a_403_on_robots_is_read_off_the_status_and_not_off_our_own_diagnosis() {
+    // A 403 with a bot management marker on it comes back as `Blocked` rather
+    // than as a response, and the two used to disagree: the response path ran
+    // RFC 9309's status rule and allowed, the block path fell through to
+    // unreachable and disallowed. Same status, two answers, and which one a
+    // host got depended on whether our client recognised the wall in front of
+    // it. That is not a rule anybody can act on, and doc 07.4 has a rule: 4xx
+    // is full allow.
+    //
+    // It costs nothing in practice, which is worth saying, because allowing a
+    // host whose robots.txt is behind a wall sounds worse than it is. The pages
+    // are behind the same wall and come back 403 too. What changes is that the
+    // published snapshot says the same thing about two hosts that answered the
+    // same way.
+    let url = format!("{ORIGIN}/a");
+    let state = seeded(&[&url]).await;
+    let fetch = Canned::new()
+        .outcome(
+            &format!("{ORIGIN}/robots.txt"),
+            umi_fetch::Outcome::Failed {
+                failure: umi_fetch::Failure::Blocked,
+                status: Some(403),
+                retry_after: None,
+            },
+        )
+        .html(&url, &page("A", &[]));
+    let walled = crawler(fetch, Arc::clone(&state));
+
+    let report = walled
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    assert_eq!(report.fetched, 1, "{report:?}");
+    assert!(walled.fetcher().asked_for(&url));
+
+    // A 503 behind the same marker keeps the 5xx rule, because that one is
+    // about the origin having a bad day and the status still says so.
+    let url = format!("{ORIGIN}/b");
+    let state = seeded(&[&url]).await;
+    let fetch = Canned::new()
+        .outcome(
+            &format!("{ORIGIN}/robots.txt"),
+            umi_fetch::Outcome::Failed {
+                failure: umi_fetch::Failure::Blocked,
+                status: Some(503),
+                retry_after: None,
+            },
+        )
+        .html(&url, &page("B", &[]));
+    let sick = crawler(fetch, state);
+
+    sick.tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    assert!(!sick.fetcher().asked_for(&url));
+}
+
+#[tokio::test]
 async fn a_file_with_no_crawl_delay_leaves_the_host_on_our_own_pace() {
     // The common case, and the one that has to stay cheap. The one lease that
     // fetched the file writes the host record and no other lease on that host
