@@ -589,7 +589,17 @@ impl<'a> Group<'a> {
         if !seconds.is_finite() || seconds < 0.0 {
             return;
         }
-        let raw = Duration::from_secs_f64(seconds);
+        // Finite is not the same as representable. `Crawl-delay: 1e30` parses
+        // to a perfectly ordinary f64 and is more seconds than a `Duration`
+        // can hold, and the infallible conversion panics on it. This is not
+        // hypothetical: it killed two prefetch runs after a million hosts
+        // each, which is a lot of work to lose to one line of somebody's
+        // robots.txt. Anything past the ceiling is the ceiling, the same
+        // answer `Crawl-delay: 86400` already gets.
+        let Ok(raw) = Duration::try_from_secs_f64(seconds) else {
+            self.crawl_delay = Some(MAX_CRAWL_DELAY);
+            return;
+        };
         self.crawl_delay = Some(raw.clamp(MIN_CRAWL_DELAY, MAX_CRAWL_DELAY));
     }
 }

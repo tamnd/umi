@@ -23,6 +23,13 @@ harness = false
 name = "dns"
 harness = false
 
+# Issue #208's ceiling: the fetch path against an origin on loopback, so that
+# our own cost is not hidden behind DNS, a handshake and a slow far end. Needs
+# nothing but a spare port, so it runs on a plain `cargo bench`.
+[[bench]]
+name = "path"
+harness = false
+
 # Doc 05.6's per page cost, which needs a real browser and so cannot be part of
 # a default `cargo bench`. `required-features` is what keeps it out.
 [[bench]]
