@@ -331,10 +331,7 @@ async fn serve(mut socket: TcpStream, replies: &[[Arc<Vec<u8>>; 2]; 2]) -> io::R
 fn flags(head: &[u8]) -> &str {
     let line = std::str::from_utf8(head).unwrap_or("");
     let path = line.split(' ').nth(1).unwrap_or("");
-    path.trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or("")
+    path.trim_start_matches('/').split('/').next().unwrap_or("")
 }
 
 /// A whole response, ready to write.

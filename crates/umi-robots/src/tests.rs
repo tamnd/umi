@@ -494,7 +494,11 @@ fn a_crawl_delay_too_big_for_a_duration_is_clamped_rather_than_a_panic() {
     for value in ["1e30", "1e300", "99999999999999999999999999", "1.8e19"] {
         let body = format!("User-agent: *\nCrawl-delay: {value}\n");
         let robots = Robots::parse_str(&body);
-        assert_eq!(robots.crawl_delay(), Some(MAX_CRAWL_DELAY), "value {value:?}");
+        assert_eq!(
+            robots.crawl_delay(),
+            Some(MAX_CRAWL_DELAY),
+            "value {value:?}"
+        );
         assert!(robots.crawl_delay_was_clamped(), "value {value:?}");
     }
 }
