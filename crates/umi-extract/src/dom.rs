@@ -23,7 +23,9 @@
 
 use html5ever::tendril::TendrilSink;
 use html5ever::{ParseOpts, parse_document};
-use markup5ever_rcdom::{Handle, NodeData, RcDom};
+use markup5ever_rcdom::{Handle, NodeData};
+
+use crate::sink::Sink;
 
 /// The index of the root node, which every arena has and which is never an
 /// element.
@@ -263,7 +265,7 @@ impl Dom {
         // two percent. If this needs to be fast, the answer is to build the
         // arena from html5ever's tokeniser and skip `RcDom`, not to guess ahead
         // of it.
-        let parsed = parse_document(RcDom::default(), ParseOpts::default())
+        let parsed = parse_document(Sink::default(), ParseOpts::default())
             .from_utf8()
             .one(html);
         let mut dom = Self {

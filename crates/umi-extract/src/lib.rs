@@ -30,6 +30,7 @@ mod links;
 mod markdown;
 mod meta;
 mod score;
+mod sink;
 mod text;
 
 use url::Url;
