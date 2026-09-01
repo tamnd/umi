@@ -79,6 +79,7 @@ use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKey
 
 mod row;
 mod schema;
+mod seen;
 mod sql;
 
 #[cfg(test)]
@@ -202,6 +203,12 @@ struct Inner {
     /// step by `supervise`, because the lease path cannot afford a query per
     /// url any more than the block check can.
     supervised_plds: HashSet<PldId>,
+    /// Url keys `admit` has already put in the `seen` table, so that the half
+    /// of a batch that is links we have met before does not cost a descent
+    /// into the table to be told so. Built on the first admit rather than at
+    /// open, because a process that only reads state should not pay for it and
+    /// the tests open a great many stores that never admit anything.
+    seen: Option<seen::Seen>,
     next_lease: u64,
     checkpoint_seq: u64,
 }
@@ -273,6 +280,7 @@ impl SqliteState {
                 blocked,
                 blocked_plds,
                 supervised_plds,
+                seen: None,
                 next_lease,
                 checkpoint_seq,
             }),
@@ -725,8 +733,10 @@ impl State for SqliteState {
                 conn,
                 blocked,
                 blocked_plds,
+                seen: known,
                 ..
             } = &mut *guard;
+            let known = known.get_or_insert_with(seen::Seen::new);
             set_sync(conn, Sync::Buffered)?;
             let tx = conn.transaction().state()?;
             let mut report = AdmitReport::default();
@@ -752,6 +762,14 @@ impl State for SqliteState {
             order.sort_by_key(|index| batch[*index].key.url);
             let mut fresh = vec![false; batch.len()];
 
+            // Urls this batch asked SQLite about, in the order it asked, so
+            // that the cache can be filled in once the transaction they went
+            // into has committed. Filling it inside the transaction would let
+            // a rollback leave the cache claiming rows that the table does not
+            // have, and those urls would then be dropped from the crawl for
+            // good.
+            let mut learned = Vec::new();
+
             {
                 // The seen set decides first, so a url that is already known is
                 // `seen` whatever its ledger state is. That is what makes
@@ -759,6 +777,16 @@ impl State for SqliteState {
                 let mut see = tx.prepare_cached(sql::INSERT_SEEN).state()?;
                 for &index in &order {
                     let candidate = &batch[index];
+                    // A hit is exact and means the row is in the table, so the
+                    // insert would have changed nothing and the answer would
+                    // have been `seen`. This is the whole saving: on a warm
+                    // frontier most of a batch lands here and never touches
+                    // the b-tree at all.
+                    if known.holds(&candidate.key.url) {
+                        report.seen += 1;
+                        continue;
+                    }
+                    learned.push(candidate.key.url);
                     if see
                         .execute(params![&candidate.key.url.as_bytes()[..]])
                         .state()?
@@ -843,6 +871,13 @@ impl State for SqliteState {
             }
 
             tx.commit().state()?;
+            // Committed, so every url that pass one asked about is in the
+            // table now, whether it was already there or this transaction put
+            // it there. `learned` is still in url order, so this walks the
+            // cache forwards the same way the probes did.
+            for url in &learned {
+                known.remember(url);
+            }
             // One file, no cold tier, so nothing was ever warmed. Doc 08.4 is
             // explicit that this is zero on a backend that does not shard, and
             // reporting anything else would make the operator's cache miss rate
