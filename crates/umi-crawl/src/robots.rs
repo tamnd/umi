@@ -22,7 +22,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use arrow::array::{
+    ArrayRef, ListBuilder, RecordBatch, StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder,
+    UInt64Builder,
+};
+use arrow::datatypes::{DataType, Field};
 use tokio::sync::{Mutex, OnceCell};
+use umi_file::StreamKind;
 use umi_robots::{Decision, Provenance, Robots};
 use umi_types::{Digest, HostId, Tier};
 
@@ -53,6 +59,29 @@ pub struct Entry {
     pub fetched_ms: u64,
     /// When it stops counting.
     pub expires_ms: u64,
+    /// The status the fetch came back with, or zero when it never got a
+    /// response at all.
+    ///
+    /// Kept because doc 07.4 publishes it and because it is the one field that
+    /// separates the three ways a host ends up with no rules: it said so, it
+    /// has no file, or it was down.
+    pub status: u16,
+    /// The raw text the rules were parsed from, for hosts that served one.
+    ///
+    /// Doc 07.4 publishes the raw file, not only our reading of it, so this is
+    /// what the snapshot carries. A reader who wants to know what a site said
+    /// to some other crawler can only get that from the bytes.
+    ///
+    /// `None` when no body arrived or the status was not a 2xx. A 404 body is
+    /// somebody's HTML error page rather than a robots.txt, and keeping those
+    /// would fill the corpus with pages that say "not found" in forty
+    /// languages.
+    ///
+    /// Behind an `Arc` because every fetch on a host clones the entry and the
+    /// file can be half a megabyte. The whole cache is hosts touched in the
+    /// last day, tens of thousands of them at a couple of kilobytes each, so
+    /// carrying the text costs tens of megabytes and not more.
+    pub body: Option<Arc<str>>,
 }
 
 impl Entry {
@@ -172,12 +201,14 @@ impl RobotsCache {
         let entry = cell
             .get_or_init(|| async {
                 fetched = true;
-                let (robots, digest) = fetch_robots(fetch, origin, tier).await;
+                let got = fetch_robots(fetch, origin, tier).await;
                 Entry {
-                    robots: Arc::new(robots),
-                    digest,
+                    robots: Arc::new(got.robots),
+                    digest: got.digest,
                     fetched_ms: now_ms,
                     expires_ms: now_ms + TTL_MS,
+                    status: got.status,
+                    body: got.body,
                 }
             })
             .await
@@ -218,7 +249,7 @@ impl RobotsCache {
 /// round trip a robots.txt costs because of it. RFC 9309 2.3.1.2 asks for at
 /// least five hops followed "even across authorities", and the rules that come
 /// back apply to the origin we started from.
-async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) -> (Robots, Digest) {
+async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) -> Fetched {
     let mut url = format!("{origin}/robots.txt");
     let mut hops = 0u32;
     // The empty digest until a body arrives, which is what every path that
@@ -227,6 +258,8 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
     // giving them the same digest is honest rather than lossy: what tells the
     // two apart on the way back out is the authoritative flag.
     let mut digest = digest_of(b"");
+    let mut status = 0u16;
+    let mut body: Option<Arc<str>> = None;
     loop {
         // Never conditional, which `fetch_robots` now enforces by not taking a
         // revalidator. A stale robots.txt that a 304 confirmed is still a file
@@ -242,6 +275,16 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
         let robots = match fetch.fetch_robots(&url, tier).await.map(|s| s.outcome) {
             Ok(umi_fetch::Outcome::Ok(page)) => {
                 digest = digest_of(page.body.as_ref());
+                status = page.status;
+                if (200..300).contains(&page.status) {
+                    // Lossy rather than strict. RFC 9309 says the file is
+                    // UTF-8 and plenty of them are not, and a parser that
+                    // read the bytes anyway should not be contradicted by a
+                    // publisher that drops the file for being ill formed.
+                    body = Some(Arc::from(
+                        String::from_utf8_lossy(page.body.as_ref()).as_ref(),
+                    ));
+                }
                 Robots::for_status(page.status, page.body.as_ref())
             }
             Ok(umi_fetch::Outcome::RedirectedOffDomain {
@@ -253,28 +296,64 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
                 hops += u32::try_from(redirects.len()).unwrap_or(u32::MAX);
                 hops += 1;
                 if hops > umi_robots::MAX_REDIRECTS {
-                    return (Robots::disallow_all(Provenance::Unreachable), digest);
+                    return Fetched {
+                        robots: Robots::disallow_all(Provenance::Unreachable),
+                        digest,
+                        status,
+                        body,
+                    };
                 }
                 url = target;
                 continue;
             }
+            // A 410 is a 404 that means it, so the rules are the same and only
+            // the published status differs.
+            Ok(umi_fetch::Outcome::Gone) => {
+                status = 410;
+                Robots::allow_all(Provenance::NotFound)
+            }
             // A 304 cannot happen because nothing above sends a conditional
             // request for robots.txt. It is the unreachable case rather than
             // the allow-all case: we asked and did not get an answer.
-            Ok(umi_fetch::Outcome::Gone) => Robots::allow_all(Provenance::NotFound),
             Ok(umi_fetch::Outcome::NotModified { .. }) => {
                 Robots::disallow_all(Provenance::Unreachable)
             }
-            Ok(umi_fetch::Outcome::Failed { failure, .. }) => match failure {
-                // A 4xx on robots.txt is the common case on the web: most sites
-                // do not have one. RFC 9309 2.3.1.3 says that means no
-                // restrictions.
-                umi_fetch::Failure::NotFound => Robots::allow_all(Provenance::NotFound),
-                umi_fetch::Failure::ServerError | umi_fetch::Failure::RateLimited => {
-                    Robots::disallow_all(Provenance::ServerError)
+            Ok(umi_fetch::Outcome::Failed {
+                failure,
+                status: got,
+                ..
+            }) => {
+                // A 404 is an answer and a timeout is not, and the published
+                // status is the only column that tells them apart. Leaving
+                // both at zero made the corpus say "we never heard back" about
+                // the most common robots.txt result on the web.
+                status = got.unwrap_or(0);
+                match failure {
+                    // The three where the origin answered and the answer was
+                    // still not a file we could read. A 200 that went past the
+                    // body cap arrives here with no bytes at all, and running
+                    // the status rule on it would parse an empty file and call
+                    // that permission. Fail closed instead: the site published
+                    // rules and we did not manage to read one of them.
+                    umi_fetch::Failure::TooLarge
+                    | umi_fetch::Failure::Malformed
+                    | umi_fetch::Failure::NotDocument => {
+                        Robots::disallow_all(Provenance::Unreachable)
+                    }
+                    // Everything else is decided by the status, through the
+                    // same function the success path uses. Routing on our
+                    // client's failure kind instead used to give a 403 one
+                    // answer when it arrived as a response and a different one
+                    // when it arrived as a block, which put two readings of the
+                    // same status in the published corpus.
+                    _ => match got {
+                        Some(code) => Robots::for_status(code, b""),
+                        // No status means no answer, and doc 07.4's 5xx rule
+                        // covers the case for the same reason.
+                        None => Robots::disallow_all(Provenance::Unreachable),
+                    },
                 }
-                _ => Robots::disallow_all(Provenance::Unreachable),
-            },
+            }
             // `Outcome` is non_exhaustive, so a variant added later lands here.
             // Disallow rather than allow: a fetch whose result this build
             // cannot name is a fetch that did not answer the question, and the
@@ -282,11 +361,218 @@ async fn fetch_robots<F: Fetch + ?Sized>(fetch: &F, origin: &str, tier: Tier) ->
             // job is to say no.
             Ok(_) | Err(_) => Robots::disallow_all(Provenance::Unreachable),
         };
-        return (robots, digest);
+        return Fetched {
+            robots,
+            digest,
+            status,
+            body,
+        };
     }
+}
+
+/// What one robots.txt fetch produced.
+///
+/// A struct rather than a tuple because the last two exist only to be
+/// published and a reader of the call site should not have to count positions
+/// to work out which of two similar looking values is the body.
+struct Fetched {
+    robots: Robots,
+    digest: Digest,
+    status: u16,
+    body: Option<Arc<str>>,
 }
 
 /// blake3 of a robots.txt body.
 fn digest_of(body: &[u8]) -> Digest {
     Digest::from_bytes(*blake3::hash(body).as_bytes())
+}
+
+/// One host's robots.txt as doc 07.4 publishes it.
+///
+/// Built from an [`Entry`] and the host it belongs to, which is everything the
+/// snapshot carries. The parsed half is a summary rather than the rules
+/// themselves: a reader who wants the rules has the raw text in `body`, and a
+/// reader who wants to know whether a host is worth queueing wants the four
+/// numbers next to it without parsing anything.
+///
+/// The summary is our reading of the file, for our user agent. `rules` is the
+/// count in the group that applied to us and `groups` is the count in the whole
+/// file, so `groups` above one with `rules` at zero means the site wrote rules
+/// for somebody else and left us the default.
+#[derive(Clone, Debug)]
+pub struct RobotsRow {
+    /// The host the file was fetched from, without a scheme.
+    pub host: String,
+    /// When we fetched it.
+    pub fetched_at_ms: u64,
+    /// The HTTP status, or zero when the fetch never got a response.
+    pub status: u16,
+    /// The raw text, for a host that served one.
+    pub body: Option<String>,
+    /// How many user agent groups the whole file had.
+    pub groups: u32,
+    /// How many rules applied to us.
+    pub rules: u32,
+    /// `Crawl-delay` for our group, clamped the way doc 07.4 clamps it.
+    pub crawl_delay_ms: Option<u32>,
+    /// Whether the file lets us fetch the root path. One for yes, zero for no.
+    ///
+    /// The root rather than the whole host, because "does this site allow us"
+    /// has no single answer for a file with rules in it. A zero here is the
+    /// strong signal, since a site that disallows `/` for us disallows
+    /// everything under it.
+    pub allows_us: u8,
+    /// Every `Sitemap` line in the file, in the order they appeared.
+    pub sitemaps: Vec<String>,
+    /// The file's AIPREF `Content-Usage`, rendered the same way the pages
+    /// stream renders it so the two columns compare.
+    pub content_usage: Option<String>,
+}
+
+impl RobotsRow {
+    /// Build the published row for `host` out of what the cache holds.
+    #[must_use]
+    pub fn build(host: &str, entry: &Entry) -> Self {
+        let robots = &entry.robots;
+        Self {
+            host: host.to_owned(),
+            fetched_at_ms: entry.fetched_ms,
+            status: entry.status,
+            body: entry.body.as_deref().map(ToOwned::to_owned),
+            groups: robots.group_count(),
+            rules: u32::try_from(robots.rule_count()).unwrap_or(u32::MAX),
+            // Milliseconds because the schema says so, and the value is
+            // already clamped to five minutes by the parser, so the cast
+            // cannot lose anything.
+            crawl_delay_ms: robots
+                .crawl_delay()
+                .map(|d| u32::try_from(d.as_millis()).unwrap_or(u32::MAX)),
+            allows_us: u8::from(robots.allows("/").is_allowed()),
+            sitemaps: robots.sitemaps().to_vec(),
+            content_usage: robots.usage().render(),
+        }
+    }
+}
+
+/// [`RobotsRow`]s into doc 10.5's robots batch.
+///
+/// The same shape as the page builder and for the same reason: rows go in one
+/// at a time, the builder says when it has had enough, and `finish` produces a
+/// batch that matches [`StreamKind::Robots`] exactly.
+pub struct RobotsBuilder {
+    host: StringBuilder,
+    fetched_at_ms: UInt64Builder,
+    status: UInt16Builder,
+    body: StringBuilder,
+    groups: UInt32Builder,
+    rules: UInt32Builder,
+    crawl_delay_ms: UInt32Builder,
+    allows_us: UInt8Builder,
+    sitemaps: ListBuilder<StringBuilder>,
+    content_usage: StringBuilder,
+    rows: usize,
+    bytes: usize,
+}
+
+impl Default for RobotsBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RobotsBuilder {
+    /// The row half of the shoal cap.
+    ///
+    /// Larger than the page limit because a robots row is small. The body is
+    /// capped at RFC 9309's 500 KiB and the median file is under two, so
+    /// sixty five thousand rows is a shoal in the same size class as a page
+    /// shoal of sixteen thousand.
+    pub const ROW_LIMIT: usize = 65_536;
+
+    /// The byte half of the shoal cap, doc 10.4's 32 MiB.
+    pub const BYTE_LIMIT: usize = 32 << 20;
+
+    /// An empty builder.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            host: StringBuilder::new(),
+            fetched_at_ms: UInt64Builder::new(),
+            status: UInt16Builder::new(),
+            body: StringBuilder::new(),
+            groups: UInt32Builder::new(),
+            rules: UInt32Builder::new(),
+            crawl_delay_ms: UInt32Builder::new(),
+            allows_us: UInt8Builder::new(),
+            sitemaps: ListBuilder::new(StringBuilder::new()).with_field(Arc::new(Field::new(
+                "item",
+                DataType::Utf8,
+                false,
+            ))),
+            content_usage: StringBuilder::new(),
+            rows: 0,
+            bytes: 0,
+        }
+    }
+
+    /// How many rows have gone in.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// Whether this shoal is full.
+    #[must_use]
+    pub const fn is_full(&self) -> bool {
+        self.rows >= Self::ROW_LIMIT || self.bytes >= Self::BYTE_LIMIT
+    }
+
+    /// Whether anything has gone in.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.rows == 0
+    }
+
+    /// Append one row.
+    pub fn push(&mut self, row: &RobotsRow) {
+        self.host.append_value(&row.host);
+        self.fetched_at_ms.append_value(row.fetched_at_ms);
+        self.status.append_value(row.status);
+        self.body.append_option(row.body.as_deref());
+        self.groups.append_value(row.groups);
+        self.rules.append_value(row.rules);
+        self.crawl_delay_ms.append_option(row.crawl_delay_ms);
+        self.allows_us.append_value(row.allows_us);
+        for sitemap in &row.sitemaps {
+            self.sitemaps.values().append_value(sitemap);
+        }
+        self.sitemaps.append(true);
+        self.content_usage
+            .append_option(row.content_usage.as_deref());
+
+        self.rows += 1;
+        self.bytes += row.host.len()
+            + row.body.as_ref().map_or(0, String::len)
+            + row.sitemaps.iter().map(String::len).sum::<usize>()
+            + row.content_usage.as_ref().map_or(0, String::len);
+    }
+
+    /// Finish the batch.
+    #[must_use]
+    pub fn finish(mut self) -> RecordBatch {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(self.host.finish()),
+            Arc::new(self.fetched_at_ms.finish()),
+            Arc::new(self.status.finish()),
+            Arc::new(self.body.finish()),
+            Arc::new(self.groups.finish()),
+            Arc::new(self.rules.finish()),
+            Arc::new(self.crawl_delay_ms.finish()),
+            Arc::new(self.allows_us.finish()),
+            Arc::new(self.sitemaps.finish()),
+            Arc::new(self.content_usage.finish()),
+        ];
+        RecordBatch::try_new(StreamKind::Robots.arrow(), columns)
+            .expect("the robots builder matches doc 10.5")
+    }
 }

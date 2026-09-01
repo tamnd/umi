@@ -53,6 +53,7 @@
 #![forbid(unsafe_code)]
 
 pub mod blocklist;
+pub mod card;
 pub mod convert;
 pub mod directory;
 pub mod gc;
@@ -70,6 +71,7 @@ mod scripted;
 mod tests;
 
 pub use blocklist::{BlockEntry, publish_blocks, published_blocks};
+pub use card::card;
 pub use convert::{Converted, Tally, convert, describe};
 pub use gc::{Blocked, Cleared, Evidence};
 pub use hub::{Commit, Hub, HubConfig, Remote, Retry, Upload, Who};

@@ -371,6 +371,19 @@ fn a_4xx_means_fully_allowed() {
 }
 
 #[test]
+fn a_429_goes_with_the_5xx_and_not_with_the_rest_of_the_4xx() {
+    // The one 4xx that is not a site saying it has no rules. A 429 is a site
+    // saying we are already asking too often, and reading that as permission to
+    // crawl the whole host is the worst available answer to it. Google's
+    // implementation carves it out of the 4xx rule for the same reason and doc
+    // 07.6 already backs a host off hard on one.
+    let robots = Robots::for_status(429, b"");
+    assert_eq!(robots.allows("/anything"), Decision::Disallowed);
+    assert_eq!(robots.provenance(), Provenance::ServerError);
+    assert!(robots.is_blanket_disallow());
+}
+
+#[test]
 fn anything_unclassifiable_is_disallowed_rather_than_allowed() {
     // A 3xx reaching here means the caller ran out of redirect hops. Unknown
     // is not the same as permitted.
@@ -513,6 +526,39 @@ Disallow: /x
             "https://example.com/news.xml"
         ]
     );
+}
+
+#[test]
+fn group_count_covers_the_whole_file_and_not_just_our_group() {
+    // The published snapshot reports this next to the rule count, and the
+    // pair only says something if the group count is the file's rather than
+    // ours. Three groups here and we match the last one.
+    let body = "\
+User-agent: googlebot
+Disallow: /a
+
+User-agent: bingbot
+User-agent: yandex
+Disallow: /b
+
+User-agent: umi
+Disallow: /c
+";
+    let robots = Robots::parse_str(body);
+    assert_eq!(robots.group_count(), 3);
+    assert_eq!(robots.rule_count(), 1);
+}
+
+#[test]
+fn group_count_is_zero_without_a_file_behind_it() {
+    // A status is not a file, so there is nothing to count. This is the
+    // difference a reader needs between a site that published an empty group
+    // and a site that was down when we asked.
+    assert_eq!(Robots::for_status(503, b"").group_count(), 0);
+    assert_eq!(Robots::for_status(404, b"").group_count(), 0);
+    // A file with rules but no user agent line has no groups either, and the
+    // rules in it apply to nobody.
+    assert_eq!(Robots::parse_str("Disallow: /\n").group_count(), 0);
 }
 
 #[test]

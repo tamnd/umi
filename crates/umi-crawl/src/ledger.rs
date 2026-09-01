@@ -245,6 +245,14 @@ impl<S: Sink + Sync> Sink for Recorded<S> {
         self.ledger.record(rows)?;
         self.inner.take(rows).await
     }
+
+    /// Straight through. Doc 05.7's ledger is about supervised fetches, and a
+    /// robots.txt has no tier path to record, but the pass through has to be
+    /// written out rather than left to the trait's default, which drops the
+    /// rows on the floor.
+    async fn take_robots(&self, rows: &[crate::robots::RobotsRow]) -> Result<(), CrawlError> {
+        self.inner.take_robots(rows).await
+    }
 }
 
 #[cfg(test)]

@@ -31,11 +31,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use arrow::record_batch::RecordBatch;
 use umi_file::{Create, SegmentWriter, WriterConfig};
 use umi_file::{SegmentStats, StreamKind};
 use umi_types::Ulid;
 
 use crate::page::{PageBuilder, PageRow};
+use crate::robots::{RobotsBuilder, RobotsRow};
 use crate::run::{CrawlError, Sink};
 
 /// Everything about a segment that does not change from one to the next.
@@ -45,8 +47,11 @@ use crate::run::{CrawlError, Sink};
 /// at every roll.
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentInfo {
-    /// Which stream, which for the crawl loop is always
-    /// [`StreamKind::Pages`].
+    /// Which stream this sink's segments carry.
+    ///
+    /// One per sink and not one per write, because doc 10.1's segment header
+    /// names a single stream. A crawl that produces both pages and doc 07.4's
+    /// robots snapshot opens two sinks over two directories.
     pub stream: StreamKind,
     /// Doc 04's coordinator key, which is also the entropy this sink derives
     /// its segment identifiers from.
@@ -211,6 +216,11 @@ impl SegmentSink {
     fn next_id(&self, counter: u64, created_ms: u64) -> Ulid {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&self.info.coordinator);
+        // The stream is in the entropy because one coordinator now runs two
+        // sinks. Without it the pages sink and the robots sink derive the same
+        // identifiers from the same key and the same counter, and two segments
+        // that agree on their name are one segment with half its rows missing.
+        hasher.update(&(self.info.stream as u16).to_le_bytes());
         hasher.update(&counter.to_le_bytes());
         let mut entropy = [0u8; 10];
         entropy.copy_from_slice(&hasher.finalize().as_bytes()[..10]);
@@ -244,18 +254,112 @@ impl SegmentSink {
     }
 }
 
-#[async_trait::async_trait]
-impl Sink for SegmentSink {
-    async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError> {
+/// A row type that knows how to become one of doc 10.5's batches.
+///
+/// This exists so that [`SegmentSink`] can carry doc 07.4's robots snapshot as
+/// well as doc 10's pages. Everything the sink does around a batch is the same
+/// for both streams: derive an identifier, roll at the caps, seal, hand the
+/// file to the caller. The only parts that differ are which builder encodes the
+/// row and where its timestamp lives, so those are the only two things here.
+pub trait Rows: Default {
+    /// The row this builder takes.
+    type Row;
+
+    /// Which stream the rows belong to.
+    ///
+    /// Checked against the sink's own stream on every write, because a segment
+    /// header that says `Pages` over robots batches would produce a file that
+    /// writes without complaint and cannot be read.
+    const KIND: StreamKind;
+
+    /// Append one row.
+    fn push(&mut self, row: &Self::Row);
+
+    /// Whether this shoal has hit doc 10.4's caps.
+    fn is_full(&self) -> bool;
+
+    /// Whether anything has gone in.
+    fn is_empty(&self) -> bool;
+
+    /// Encode what has gone in.
+    fn finish(self) -> RecordBatch;
+
+    /// When the row was fetched, which is the clock this file reads instead of
+    /// the wall clock. See the module docs.
+    fn stamp(row: &Self::Row) -> u64;
+}
+
+impl Rows for PageBuilder {
+    type Row = PageRow;
+    const KIND: StreamKind = StreamKind::Pages;
+
+    fn push(&mut self, row: &PageRow) {
+        Self::push(self, row);
+    }
+    fn is_full(&self) -> bool {
+        Self::is_full(self)
+    }
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
+    }
+    fn finish(self) -> RecordBatch {
+        Self::finish(self)
+    }
+    fn stamp(row: &PageRow) -> u64 {
+        row.fetched_at_ms
+    }
+}
+
+impl Rows for RobotsBuilder {
+    type Row = RobotsRow;
+    const KIND: StreamKind = StreamKind::Robots;
+
+    fn push(&mut self, row: &RobotsRow) {
+        Self::push(self, row);
+    }
+    fn is_full(&self) -> bool {
+        Self::is_full(self)
+    }
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
+    }
+    fn finish(self) -> RecordBatch {
+        Self::finish(self)
+    }
+    fn stamp(row: &RobotsRow) -> u64 {
+        row.fetched_at_ms
+    }
+}
+
+impl SegmentSink {
+    /// Write a batch of rows, rolling the segment if this fills it.
+    ///
+    /// The stream is on the sink rather than on the call, so a caller that
+    /// wants both streams opens two sinks over two directories. That is the
+    /// honest shape: doc 10.1's segment header names one stream, and a file
+    /// cannot hold two.
+    ///
+    /// # Errors
+    ///
+    /// [`CrawlError::Sink`] if `B` is not the stream this sink was opened for,
+    /// or if the write or the seal failed.
+    pub fn write<B: Rows>(&self, rows: &[B::Row]) -> Result<(), CrawlError> {
+        if B::KIND != self.info.stream {
+            return Err(CrawlError::Sink(format!(
+                "this sink writes {:?} and was handed {:?}",
+                self.info.stream,
+                B::KIND
+            )));
+        }
         if rows.is_empty() {
             return Ok(());
         }
         let mut open = self.locked();
 
-        let first_ms = rows.iter().map(|r| r.fetched_at_ms).min().unwrap_or(0);
+        let first_ms = rows.iter().map(B::stamp).min().unwrap_or(0);
         open.latest_ms = open
             .latest_ms
-            .max(rows.iter().map(|r| r.fetched_at_ms).max().unwrap_or(0));
+            .max(rows.iter().map(B::stamp).max().unwrap_or(0));
         if open.writer.is_none() {
             self.open_segment(&mut open, first_ms)?;
         }
@@ -264,7 +368,7 @@ impl Sink for SegmentSink {
         // handed out, and doc 10.4's caps are about what a reader has to hold
         // in memory to decode one shoal, so the two numbers have nothing to do
         // with each other and the sink is where they are reconciled.
-        let mut builder = PageBuilder::new();
+        let mut builder = B::default();
         for row in rows {
             builder.push(row);
             open.rows += 1;
@@ -297,6 +401,13 @@ impl Sink for SegmentSink {
     }
 }
 
+#[async_trait::async_trait]
+impl Sink for SegmentSink {
+    async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError> {
+        self.write::<PageBuilder>(rows)
+    }
+}
+
 /// Push one batch into the open writer.
 fn push(open: &mut Open, batch: &arrow::record_batch::RecordBatch) -> Result<(), CrawlError> {
     open.writer
@@ -322,4 +433,28 @@ fn seal(open: &mut Open, dir: &Path) -> Result<Option<Sealed>, CrawlError> {
 
 fn sink_error(error: umi_file::Error) -> CrawlError {
     CrawlError::Sink(error.to_string())
+}
+
+/// The pages sink and the robots sink behind one [`Sink`].
+///
+/// Doc 10.1 gives a segment one stream, so a crawl that produces both writes
+/// two files at a time. This is the join: the loop keeps handing rows to one
+/// sink and does not learn that there are two, and the caller keeps two
+/// directories of segments to convert and publish separately.
+pub struct Streams {
+    /// Doc 10's pages.
+    pub pages: std::sync::Arc<SegmentSink>,
+    /// Doc 07.4's robots snapshots.
+    pub robots: std::sync::Arc<SegmentSink>,
+}
+
+#[async_trait::async_trait]
+impl Sink for Streams {
+    async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError> {
+        self.pages.write::<PageBuilder>(rows)
+    }
+
+    async fn take_robots(&self, rows: &[RobotsRow]) -> Result<(), CrawlError> {
+        self.robots.write::<RobotsBuilder>(rows)
+    }
 }

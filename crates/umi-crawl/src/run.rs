@@ -67,7 +67,7 @@ use crate::clock::Clock;
 use crate::fetch::Fetch;
 use crate::page::{Crawled, PageRow};
 use crate::render::{RenderBudget, RenderPolicy, Slot};
-use crate::robots::{Entry as RobotsEntry, RobotsCache};
+use crate::robots::{Entry as RobotsEntry, RobotsCache, RobotsRow};
 use crate::scope::{LinkPolicy, Scope};
 
 /// How big a tick has to be before its T2 share is worth an alert.
@@ -191,6 +191,9 @@ struct Held {
     /// What the answers said about the tiers they came back on, merged per
     /// host by [`learn`].
     signals: Vec<Learned>,
+    /// Doc 07.4's robots snapshots, for the sink. Not merged, because each one
+    /// is a distinct fetch of a distinct host.
+    robots: Vec<RobotsRow>,
 }
 
 impl Held {
@@ -226,6 +229,8 @@ impl Held {
 struct Stored {
     /// Rows the sink took.
     rows: usize,
+    /// Robots snapshots the sink took.
+    robots: usize,
     /// Hosts whose tier memory moved.
     learned: usize,
     /// Links that were new to the frontier.
@@ -407,6 +412,25 @@ pub trait Sink: Send + Sync {
     /// URLs are handed out again. That is the right failure: a page whose row
     /// could not be stored has not been crawled, however well the fetch went.
     async fn take(&self, rows: &[PageRow]) -> Result<(), CrawlError>;
+
+    /// Take a batch of doc 07.4's robots snapshots.
+    ///
+    /// Defaulted to dropping them, because most sinks are counters and test
+    /// doubles that have no interest in a second stream, and because a crawl
+    /// that publishes no robots corpus is a crawl that is still correct. The
+    /// one implementation that keeps them is the pair of segment sinks the CLI
+    /// opens.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the sink reports. Unlike [`take`](Self::take) this does not
+    /// hold the tick's pages hostage in practice, but it is still an error
+    /// rather than a warning: a sink that cannot write is a disk that is about
+    /// to fail the pages too.
+    async fn take_robots(&self, rows: &[RobotsRow]) -> Result<(), CrawlError> {
+        let _ = rows;
+        Ok(())
+    }
 }
 
 /// What went wrong.
@@ -1287,11 +1311,16 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             // because a fact the loop is sitting on is a host record the tick
             // has not written yet. Taking an empty vector is what this does on
             // almost every pass.
-            for learned in warmed.take() {
+            for mut learned in warmed.take() {
                 report.robots_warmed += 1;
+                held.robots.extend(learned.snapshot.take());
                 learn(&mut held.signals, learned);
             }
-            if let Some(learned) = signal {
+            if let Some(mut learned) = signal {
+                // Before the `teaches` check below and not inside it. A lease
+                // that spent its slot on robots.txt and learned nothing about
+                // the ladder still fetched a file doc 07.4 publishes.
+                held.robots.extend(learned.snapshot.take());
                 // A block with no row behind it is a challenge page: doc 05.8
                 // says a 200 carrying a wall is not a fetch, so `one` throws
                 // the row away and this is what is left of it. A block that
@@ -1415,8 +1444,9 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         // entry is in the cache either way, and holding a tick open for a
         // robots.txt that nothing is waiting for is the delay this whole change
         // is about. See the note in `run_one` for what covers the loss.
-        for learned in warmed.take() {
+        for mut learned in warmed.take() {
             report.robots_warmed += 1;
+            held.robots.extend(learned.snapshot.take());
             learn(&mut held.signals, learned);
         }
         // Both, in order. The one in flight has the earlier window in it and
@@ -1782,6 +1812,15 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     ) -> Result<Stored, CrawlError> {
         let began = Instant::now();
         let mut done = Stored::default();
+        if !held.robots.is_empty() {
+            // Before the pages and not counted with them. Doc 07.4's snapshot
+            // is a different stream going to a different repository, and
+            // rolling its cost into `rows_ms` would make the tick line's page
+            // write look like it slowed down on the one tick a day that warmed
+            // a lot of hosts.
+            sink.take_robots(&held.robots).await?;
+            done.robots = held.robots.len();
+        }
         if !held.rows.is_empty() {
             let at = Instant::now();
             sink.take(&held.rows).await?;
@@ -2107,6 +2146,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             .await;
         fetched.then(|| Learned {
             robots: Some(RobotsFacts::of(&entry)),
+            snapshot: Some(RobotsRow::build(authority_of(origin), &entry)),
             ..Learned::nothing(host, tier, false)
         })
     }
@@ -2192,7 +2232,13 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         // file published. A lease that finds it was spaced for less than the
         // file asks for teaches the record itself, which both fixes that and
         // costs nothing on the hosts that do not publish a delay at all.
-        let robots = (robots_fetched || unspaced).then(|| RobotsFacts::of(&entry));
+        let robots = (robots_fetched || unspaced).then(|| Taught {
+            facts: RobotsFacts::of(&entry),
+            // Gated on the fetch and not on `unspaced`, because an unspaced
+            // lease read the file out of the cache and publishing a second row
+            // for it would put the same fetch in the corpus twice.
+            snapshot: robots_fetched.then(|| RobotsRow::build(authority_of(&origin), &entry)),
+        });
         if !decision.is_allowed() {
             return Fetched::refused(&lease, now(), entry.robots.provenance())
                 .taught(&lease, robots);
@@ -2710,6 +2756,14 @@ struct Learned {
     /// read the same file out of the cache, which is what keeps this off the
     /// per page bill.
     robots: Option<RobotsFacts>,
+    /// Doc 07.4's published snapshot of the same file.
+    ///
+    /// Set on the one task that made the request and nowhere else, which is
+    /// what keeps the corpus one row per host per fetch rather than one row
+    /// per lease that read the cache. It rides here rather than inside
+    /// [`RobotsFacts`] because the facts are folded per host by `learn` and a
+    /// published row is not something to merge.
+    snapshot: Option<RobotsRow>,
 }
 
 /// What one robots.txt fetch said about the host that owns it, beyond the
@@ -2720,6 +2774,19 @@ struct Learned {
 /// file. Until this existed the pacer never saw a site's `Crawl-delay` at all,
 /// so a site asking for one request every ten seconds got one every second,
 /// which is the request the file was written to stop.
+/// What one robots.txt fetch produced for the rest of the tick.
+///
+/// A pair rather than two arguments because every return site in `run_one`
+/// passes it straight through, and widening those nine calls to carry a second
+/// value would be nine chances to pass the wrong one.
+struct Taught {
+    /// The half that goes in the host record.
+    facts: RobotsFacts,
+    /// The half that gets published, present only when this task is the one
+    /// that asked the origin.
+    snapshot: Option<RobotsRow>,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 struct RobotsFacts {
     /// Doc 08.3's `RobotsRef`: the digest, the two times and whether the
@@ -2798,6 +2865,7 @@ impl Learned {
             weak: 0,
             lie: false,
             robots: None,
+            snapshot: None,
         }
     }
 
@@ -3041,11 +3109,13 @@ impl Fetched {
     /// here, including the ones that failed, because what the file said about
     /// the host is true whatever happened to the URL afterwards. A lease that
     /// read the file out of the cache passes `None` and this does nothing.
-    fn taught(mut self, lease: &umi_state::Lease, robots: Option<RobotsFacts>) -> Self {
-        if robots.is_some() {
-            self.signal
-                .get_or_insert_with(|| Learned::nothing(lease.key.host, lease.tier, lease.probe))
-                .robots = robots;
+    fn taught(mut self, lease: &umi_state::Lease, robots: Option<Taught>) -> Self {
+        if let Some(robots) = robots {
+            let signal = self
+                .signal
+                .get_or_insert_with(|| Learned::nothing(lease.key.host, lease.tier, lease.probe));
+            signal.robots = Some(robots.facts);
+            signal.snapshot = robots.snapshot;
         }
         self
     }
@@ -3180,6 +3250,17 @@ const fn failure_kind(code: umi_types::OutcomeCode) -> umi_state::FailureKind {
 }
 
 /// The scheme and authority of a URL, which is where its robots.txt lives.
+/// The authority half of an origin, which is what identifies a robots.txt.
+///
+/// RFC 9309 scopes the file to the scheme, the host and the port, and the
+/// published snapshot drops the scheme because a host that serves different
+/// rules over http and https is rare enough that carrying a column for it
+/// costs more than it explains. The port stays, on the hosts that have one,
+/// because a different port is a different file.
+fn authority_of(origin: &str) -> &str {
+    origin.split_once("://").map_or(origin, |(_, rest)| rest)
+}
+
 fn origin_of(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
     let host = parsed.host_str()?;

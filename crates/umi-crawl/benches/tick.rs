@@ -684,6 +684,8 @@ async fn prime_robots<F: Fetch + 'static>(crawler: &Crawler<F, Arc<FixedClock>>,
                     digest,
                     fetched_ms: T0,
                     expires_ms: T0 + TTL_MS,
+                    status: 200,
+                    body: Some(Arc::from(std::str::from_utf8(BODY).expect("utf8"))),
                 },
             )
             .await;

@@ -260,3 +260,61 @@ async fn a_crawler_can_write_straight_into_it() {
         Some(SegmentSink::EXTENSION)
     );
 }
+
+/// A robots row with something in every column, including the nullable ones,
+/// so a round trip that silently dropped one would fail rather than pass on an
+/// all null column.
+fn robots_row(n: usize) -> crate::robots::RobotsRow {
+    crate::robots::RobotsRow {
+        host: format!("host{n}.example"),
+        fetched_at_ms: T0 + n as u64,
+        status: 200,
+        body: Some(format!("User-agent: umi\nDisallow: /p{n}\n")),
+        groups: 1,
+        rules: 1,
+        crawl_delay_ms: Some(1000),
+        allows_us: 1,
+        sitemaps: vec![format!("https://host{n}.example/sitemap.xml")],
+        content_usage: Some("train-ai=n".to_owned()),
+    }
+}
+
+#[tokio::test]
+async fn robots_rows_go_in_and_come_back_out() {
+    // Doc 07.4's snapshot through the same sink as doc 10's pages. The point
+    // of the test is the decode: a builder whose column order drifted from the
+    // schema would write a file that looks fine until somebody reads it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = SegmentSink::create(
+        dir.path(),
+        SegmentInfo {
+            stream: umi_file::StreamKind::Robots,
+            ..SegmentInfo::default()
+        },
+        WriterConfig::default(),
+    )
+    .expect("create");
+
+    let rows: Vec<_> = (0..100).map(robots_row).collect();
+    sink.write::<crate::robots::RobotsBuilder>(&rows)
+        .expect("write");
+    assert_eq!(sink.rows(), 100);
+
+    let sealed = sink.finish().expect("finish").expect("a segment was open");
+    assert_eq!(sealed.stats.rows, 100);
+    assert_eq!(read(&sealed.path), 100);
+}
+
+#[tokio::test]
+async fn a_sink_refuses_rows_from_a_stream_it_did_not_open() {
+    // The header names one stream and a file cannot hold two, so this has to
+    // be an error rather than a file that writes and will not read.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = SegmentSink::create(dir.path(), SegmentInfo::default(), WriterConfig::default())
+        .expect("create");
+
+    let err = sink
+        .write::<crate::robots::RobotsBuilder>(&[robots_row(0)])
+        .expect_err("a pages sink cannot take robots rows");
+    assert!(format!("{err}").contains("Robots"), "{err}");
+}

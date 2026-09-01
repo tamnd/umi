@@ -514,7 +514,7 @@ async fn a_recorded_segment_is_one_the_publisher_will_pick_up() {
     }];
     let state = umi_state::MemoryState::default();
     let state: &dyn umi_state::State = &state;
-    super::record(&sealed, state, 1_787_616_000_000)
+    super::record(&sealed, umi_state::Stream::Pages, state, 1_787_616_000_000)
         .await
         .expect("record");
 
