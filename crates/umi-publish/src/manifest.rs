@@ -321,6 +321,7 @@ pub fn schema_id(stream: StreamKind) -> String {
         StreamKind::Pages => "umi-pages",
         StreamKind::Receipts => "umi-receipts",
         StreamKind::Robots => "umi-robots",
+        StreamKind::Frontier => "umi-frontier",
     };
     format!("{name}/{}", stream.schema_id())
 }

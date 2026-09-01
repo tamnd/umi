@@ -34,10 +34,14 @@ use crate::schema::StreamKind;
 /// the small deltas doc 10.6 expects rather than an arbitrary spread.
 pub const T0: u64 = 1_760_000_000_000;
 
-/// All three of doc 10.3's streams, for a test or a bench that wants to cover
+/// Every one of doc 10.3's streams, for a test or a bench that wants to cover
 /// each of them without spelling the list out again.
-pub const EVERY_STREAM: [StreamKind; 3] =
-    [StreamKind::Pages, StreamKind::Receipts, StreamKind::Robots];
+pub const EVERY_STREAM: [StreamKind; 4] = [
+    StreamKind::Pages,
+    StreamKind::Receipts,
+    StreamKind::Robots,
+    StreamKind::Frontier,
+];
 
 /// A batch of `rows` sample rows for whichever stream is asked for.
 #[must_use]
@@ -46,6 +50,7 @@ pub fn batch(stream: StreamKind, rows: usize) -> RecordBatch {
         StreamKind::Pages => pages(rows),
         StreamKind::Receipts => receipts(rows),
         StreamKind::Robots => robots(rows),
+        StreamKind::Frontier => frontier(rows),
     }
 }
 
@@ -276,6 +281,113 @@ pub fn robots(rows: usize) -> RecordBatch {
         )),
     ];
     RecordBatch::try_new(schema, columns).expect("the sample robots batch matches doc 10.3")
+}
+
+/// How many hosts share one domain, and how many URLs share one host, in the
+/// sample backlog. Fifty and ten, so a batch of a few thousand rows holds
+/// several complete domains and a row group boundary lands inside one, which
+/// is the case a reader warming a single site has to get right.
+const HOSTS_PER_PLD: usize = 10;
+const URLS_PER_HOST: usize = 50;
+
+/// Doc 08.6's frontier shard, shaped like a real backlog.
+///
+/// The keys are big endian counters rather than digests, because the rows have
+/// to come out in `(pld_id, host_id, url_key)` order and a digest of the index
+/// would scatter them. That costs the sample its realistic entropy in those
+/// four columns, which does not matter: doc 10.6 stores them raw, so there is
+/// no compression number here for the entropy to distort.
+///
+/// One row in twenty has been fetched. The rest are pending with every fetch
+/// column null, which is what a spill actually looks like and is the reason the
+/// validity bitmaps on those columns are worth measuring.
+#[must_use]
+pub fn frontier(rows: usize) -> RecordBatch {
+    let schema = StreamKind::Frontier.arrow();
+    let fetched = |i: usize| i.is_multiple_of(20);
+    let columns: Vec<ArrayRef> = vec![
+        fixed(rows, 8, |i| {
+            ((i / (HOSTS_PER_PLD * URLS_PER_HOST)) as u64)
+                .to_be_bytes()
+                .to_vec()
+        }),
+        fixed(rows, 8, |i| {
+            ((i / URLS_PER_HOST) as u64).to_be_bytes().to_vec()
+        }),
+        fixed(rows, 10, |i| {
+            let mut key = vec![0u8; 2];
+            key.extend_from_slice(&(i as u64).to_be_bytes());
+            key
+        }),
+        fixed(rows, 16, |i| {
+            let mut key = vec![0u8; 8];
+            key.extend_from_slice(&(i as u64).to_be_bytes());
+            key
+        }),
+        Arc::new(StringArray::from_iter_values((0..rows).map(|i| {
+            format!("https://{}/section{}/page-{i}", pending_host(i), i % 13)
+        }))),
+        Arc::new(UInt8Array::from_iter_values(
+            (0..rows).map(|i| (i % 5) as u8),
+        )),
+        Arc::new(UInt16Array::from_iter_values(
+            (0..rows).map(|i| ((i * 7) % 1000) as u16),
+        )),
+        Arc::new(UInt8Array::from_iter_values(
+            (0..rows).map(|i| u8::from(fetched(i))),
+        )),
+        Arc::new(UInt64Array::from_iter_values(
+            (0..rows).map(|i| T0 + (i as u64) * 1_000),
+        )),
+        Arc::new(UInt64Array::from_iter(
+            (0..rows).map(|i| fetched(i).then(|| T0 - (i as u64) * 1_000)),
+        )),
+        Arc::new(UInt64Array::from_iter((0..rows).map(|i| {
+            (fetched(i) && i % 40 == 0).then(|| T0 - (i as u64) * 2_000)
+        }))),
+        Arc::new(UInt32Array::from_iter_values(
+            (0..rows).map(|i| u32::from(fetched(i))),
+        )),
+        Arc::new(UInt32Array::from_iter_values(
+            (0..rows).map(|i| u32::from(fetched(i) && i % 40 == 0)),
+        )),
+        fixed_opt(rows, 8, |i| {
+            fetched(i).then(|| {
+                (i as u64)
+                    .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    .to_be_bytes()
+                    .to_vec()
+            })
+        }),
+        Arc::new(StringArray::from_iter((0..rows).map(|i| {
+            (fetched(i) && i % 60 == 0).then(|| format!("\"etag-{i}\""))
+        }))),
+        Arc::new(UInt64Array::from_iter(
+            (0..rows).map(|i| fetched(i).then(|| T0 - (i as u64) * 3_000)),
+        )),
+        Arc::new(UInt16Array::from_iter((0..rows).map(|i| {
+            fetched(i).then_some(if i % 200 == 0 { 404 } else { 200 })
+        }))),
+        Arc::new(UInt8Array::from_iter(
+            (0..rows).map(|i| fetched(i).then_some(if i % 100 == 0 { 2 } else { 1 })),
+        )),
+        Arc::new(UInt8Array::from_iter_values(
+            (0..rows).map(|i| u8::from(i % 500 == 0)),
+        )),
+    ];
+    RecordBatch::try_new(schema, columns).expect("the sample frontier batch matches doc 10.3")
+}
+
+/// The host a sample backlog row belongs to, named so that the text sorts the
+/// same way the keys do. That is not required by the schema, which sorts on the
+/// fingerprints, but a sample where the two disagree makes every failure harder
+/// to read than it needs to be.
+fn pending_host(i: usize) -> String {
+    format!(
+        "h{:06}.d{:05}.example.com",
+        i / URLS_PER_HOST,
+        i / (HOSTS_PER_PLD * URLS_PER_HOST)
+    )
 }
 
 fn fixed(rows: usize, width: i32, value: impl Fn(usize) -> Vec<u8>) -> ArrayRef {

@@ -59,7 +59,7 @@ local data footprint              = 8 x 128 MB = ~1 GB per host, steady state
 
 One gigabyte of segment data resident per host, against 67 GB free on the tightest box. The disk pressure from doc 01 is entirely about what happens when publishing stalls, not about steady state, and doc 15's backpressure ladder is what covers the stall.
 
-Three stream kinds share the container and differ only in schema: `pages`, `receipts`, and `robots`. The header names the stream and the schema id, and a reader that does not recognise the schema id refuses to open the file rather than guessing. This keeps one writer, one reader and one crash story instead of three.
+Four stream kinds share the container and differ only in schema: `pages`, `receipts`, `robots` and `frontier`. The header names the stream and the schema id, and a reader that does not recognise the schema id refuses to open the file rather than guessing. This keeps one writer, one reader and one crash story however many streams there are, which is the reason doc 08.6's spilled backlog is a fourth stream here rather than a second file format somewhere else.
 
 ## 10.4 File layout
 
@@ -154,7 +154,11 @@ The `snippets` list repeats what `title`, `description` and `headings` already h
 
 `receipts` is the doc 04 `Receipt` flattened, one row per delivery, including the signature, so that anyone can re verify our published corpus against the fetcher keys without trusting us. `robots` is host, fetch time, status, raw text, and the parsed decision summary from doc 07.4.
 
+`frontier` is doc 08.6's spilled backlog: the ledger row from doc 08.3 with the URL text alongside it, so that a box which has dropped a URL can get it back. It carries two columns the local store does not. `url` is there because the local seen set is fingerprints and a backlog nobody can turn back into a URL is not a backlog. `etag` is text rather than the interned integer, because the pool that integer indexes into belongs to one box's state file and a published file has to stand on its own. Every column describing a fetch that already happened is nullable, because the rows worth spilling are overwhelmingly rows nothing has fetched, and the same column carrying a zero would read as a real fetch at the epoch.
+
 Rows arrive in fetch completion order and are written in that order and there is no sorting within a shoal at all. This spec originally kept one exception, a reorder window of 4096 rows grouped by host, because host adjacency is what makes URL prefix elision pay, and said the window comes out if the win is under 5 percent. It was measured with the rest of 10.6. Sorting 15000 real crawled URLs before encoding took the `url` column from 20.5 bytes a URL to 16.3, and the `url` column is half a percent of a segment, so the whole window buys a tenth of a percent of the file for 25 MB of buffer and a hold on rows that have already been fetched. It came out.
+
+That is about the three streams a crawl produces. `frontier` is the one exception and it is not a reorder window, it is the order the rows are already in: the ledger's primary key is `(pld, host, url_key)` and a spill walks it in that order, so the writer sorts nothing and the file comes out sorted anyway. The point is not compression, it is that a row group's statistics then bound the domains inside it, so a coordinator warming one site reads one row group over a byte range instead of a file. That is the whole reason the backlog can live somewhere other than the box that needs it.
 
 ## 10.6 Encodings
 

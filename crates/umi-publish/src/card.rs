@@ -44,7 +44,7 @@ pub fn card(corpus: &Corpus, family: Family, extractor: &str) -> String {
     out.push_str(&front_matter(corpus, family));
     out.push_str(&heading(corpus, family));
     out.push_str(&columns_table(family));
-    out.push_str(&provenance(extractor));
+    out.push_str(&provenance(family, extractor));
     out.push_str(PREFERENCES);
     out.push_str(&exclusions());
     out.push_str(&licensing(family));
@@ -81,6 +81,11 @@ fn front_matter(corpus: &Corpus, family: Family) -> String {
             "license: cc0-1.0",
             "- robots-txt\n- web-crawl\n- crawler-policy\n- parquet\n- umi",
         ),
+        Family::Frontier => (
+            "umi frontier",
+            "license: cc0-1.0",
+            "- web-crawl\n- url-list\n- frontier\n- parquet\n- umi",
+        ),
     };
     // A focused crawl gets its scope in the name, because a reader browsing the
     // organisation sees the pretty name and nothing else, and three focused
@@ -106,6 +111,9 @@ fn heading(corpus: &Corpus, family: Family) -> String {
         }
         Family::Robots => {
             "One row per `robots.txt` fetch: the host, when we asked, what the origin answered, the raw text if it served one, and the summary our parser read out of it. It is a record of what sites told crawlers, kept over time, and as far as we know nobody else publishes it."
+        }
+        Family::Frontier => {
+            "One row per URL umi knows about and has not fetched yet, with the scheduling state that decides when it would be. This is the crawler's backlog, published rather than kept, because a hundred billion known URLs do not fit on the machines doing the crawling and because a backlog is more useful to everyone else than it is to us. Nothing in here has been fetched, so nothing in here has been checked against the origin's `robots.txt`. Read the rules first, the same as we would."
         }
     };
     let focus = match (&corpus.focus, family) {
@@ -162,9 +170,20 @@ fn render(ty: &DataType) -> String {
 }
 
 /// The versions, and the purpose declaration doc 12.9 puts next to them.
-fn provenance(extractor: &str) -> String {
+fn provenance(family: Family, extractor: &str) -> String {
+    // Which column a reader should push a filter down to depends on the order
+    // the writer put the rows in, and the frontier is the one family that is
+    // sorted by key rather than left in the order the crawl produced.
+    let order = match family {
+        Family::Frontier => {
+            "Rows are written in `(pld_id, host_id, url_key)` order, so a row group's statistics bound the domains inside it and a reader after one site reads one row group rather than the file."
+        }
+        _ => {
+            "Rows are written in fetch completion order, so the `fetched_at_ms` statistics on a row group are the ones worth pushing a filter down to."
+        }
+    };
     format!(
-        "## How this was made\n\nExtractor `{extractor}`, canonicalisation `{canon}`, against the spec at [`docs/spec`]({SPEC}). Rows are written in fetch completion order, so the `fetched_at_ms` statistics on a row group are the ones worth pushing a filter down to. Files are around 128 MB and a day folder holds one day of them.\n\numi crawls to build a public, openly licensed web index, and that is the whole declaration. We do not train models on the corpus, we do not run an agent that browses for a user, and we do not resell access. The crawler identifies itself as `umi` and its bot page is [{BOT_PAGE}]({BOT_PAGE}). The corpus is open, so what anyone else does with it is out of our hands, which is a fact worth stating plainly rather than eliding.\n\n",
+        "## How this was made\n\nExtractor `{extractor}`, canonicalisation `{canon}`, against the spec at [`docs/spec`]({SPEC}). {order} Files are around 128 MB and a day folder holds one day of them.\n\numi crawls to build a public, openly licensed web index, and that is the whole declaration. We do not train models on the corpus, we do not run an agent that browses for a user, and we do not resell access. The crawler identifies itself as `umi` and its bot page is [{BOT_PAGE}]({BOT_PAGE}). The corpus is open, so what anyone else does with it is out of our hands, which is a fact worth stating plainly rather than eliding.\n\n",
         canon = umi_types::CANON_VERSION,
     )
 }
@@ -184,7 +203,7 @@ fn exclusions() -> String {
 fn licensing(family: Family) -> String {
     match family {
         Family::Pages => "## Licence\n\nThe split is real and worth stating plainly. Everything umi created is CC0: the annotations, the quality signals, the duplicate sketches, the link structure, the manifests and the schemas. The extracted page content is third party material that we did not create and cannot license. It is published on the same basis Common Crawl has published on for over a decade, with per row provenance, the publisher's own stated preferences carried in the row next to it, and a takedown process that works. Putting a single licence tag on the repository and hoping nobody looked closely would be the dishonest version.\n\n".to_owned(),
-        Family::Receipts | Family::Robots => {
+        Family::Receipts | Family::Robots | Family::Frontier => {
             "## Licence\n\nCC0. This is a record umi produced rather than content it collected, so there is nothing here anybody else holds a right in.\n\n".to_owned()
         }
     }
@@ -207,6 +226,7 @@ const fn described(family: Family) -> &'static [(&'static str, &'static str)] {
         Family::Pages => PAGES,
         Family::Receipts => RECEIPTS,
         Family::Robots => ROBOTS,
+        Family::Frontier => FRONTIER,
     }
 }
 
@@ -419,5 +439,82 @@ const ROBOTS: &[(&str, &str)] = &[
     (
         "content_usage",
         "The AIPREF `Content-Usage` value the file declared, verbatim.",
+    ),
+];
+
+/// Doc 08.6's frontier shard, in reader's terms.
+const FRONTIER: &[(&str, &str)] = &[
+    (
+        "pld_id",
+        "The pay level domain the URL belongs to, as an 8 byte fingerprint. Every host under `example.co.uk` shares one, and it is what the file is sorted on first.",
+    ),
+    (
+        "host_id",
+        "The host, as an 8 byte fingerprint. Rate limiting applies per host, so this is the second sort key.",
+    ),
+    (
+        "url_key",
+        "The 80 bit fingerprint of the canonical URL, which is what umi deduplicates on.",
+    ),
+    (
+        "url_key_full",
+        "The 128 bit fingerprint of the same URL. It exists so that a collision in the short one is detectable rather than silent.",
+    ),
+    (
+        "url",
+        "The URL itself, canonicalised. Everything else in the row describes this.",
+    ),
+    (
+        "depth",
+        "Link distance from the nearest seed. Zero is a seed, one is a page linked from a seed, and so on.",
+    ),
+    (
+        "priority",
+        "The score the scheduler would pick this URL on, higher first. It is umi's own opinion and not a property of the page.",
+    ),
+    (
+        "state",
+        "0 pending, 1 fetched, 2 failed, 3 gone, 4 excluded. A spill is overwhelmingly pending, which is the point of it.",
+    ),
+    (
+        "next_due_ms",
+        "The earliest time umi would fetch or refetch this, Unix milliseconds.",
+    ),
+    (
+        "last_fetch_ms",
+        "When it was last fetched, null when it never was.",
+    ),
+    (
+        "last_change_ms",
+        "When the extracted text last actually changed, which is not the same as when it was last fetched. Null until it has changed twice.",
+    ),
+    ("fetch_count", "How many times it has been fetched."),
+    (
+        "change_count",
+        "How many of those fetches found different content. The two counts together are the change rate estimator doc 09 schedules on.",
+    ),
+    (
+        "content_hash",
+        "A truncated digest of the extracted text as of the last fetch, so a refetch can tell a change from a rerun. Null when it has never been fetched.",
+    ),
+    (
+        "etag",
+        "The `ETag` the origin last served, verbatim. Null when it served none.",
+    ),
+    (
+        "last_mod_ms",
+        "The `Last-Modified` the origin last served, Unix milliseconds. Null when it served none.",
+    ),
+    (
+        "status",
+        "The status of the last fetch. Null when it has never been fetched.",
+    ),
+    (
+        "tier_used",
+        "Which rung of doc 05's ladder answered last time: 0 revalidate, 1 plain HTTP, 2 emulated, 3 rendered, 4 supervised. Null when it has never been fetched.",
+    ),
+    (
+        "fail_streak",
+        "Consecutive failures. It is what retires a URL, and it resets on any success.",
     ),
 ];

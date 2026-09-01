@@ -69,7 +69,7 @@ That is 76 bytes laid out naively and 24 to 32 bytes once the shard encoding in 
 
 ```rust
 struct SegmentRow {
-    stream:        StreamKind,   // Pages | Receipts | Robots
+    stream:        StreamKind,   // Pages | Receipts | Robots | Frontier
     local_path:    String,
     sealed_at_ms:  u64,
     rows:          u64,
@@ -207,17 +207,21 @@ It also reads the published Parquet directly, so the same DuckDB session can joi
 
 At 100 billion URLs the state is roughly 2 TB in nami's encoding, against 342 GB of free local disk. So state has the same lifecycle as data: local is a cache, object storage is the truth.
 
-The unit is the PLD shard. A shard holds the seen set, ledger, and frontier index for one registrable domain, self contained, in the same encoding used in the local file. Shards are content addressed by the blake3 of their bytes and stored at `s3://umi-state/<pld_id[0:2]>/<pld_id>.nami-shard`, with the mapping from PLD to current shard digest held in a small manifest that does fit locally.
+The unit is the PLD shard. A shard holds the ledger and the frontier index for one registrable domain, self contained. The seen set stays local, because it is fingerprints with nothing else attached, it is the thing `admit` touches on every candidate, and it is the one structure that would be ruined by a round trip. Everything else goes, and what dominates the bytes is the URL text, which is why spilling the ledger and keeping the seen set is roughly a fourteen fold reduction rather than a small one.
+
+Shards are written as `frontier` segments, doc 10.3's fourth stream, and published as Parquet into `open-index/umi-frontier-<YYYY>w<WW>-<NN>` the same way every other family is published, with the same manifests, the same digests and the same signatures. This spec originally said `s3://umi-state/<pld_id[0:2]>/<pld_id>.nami-shard`, one object per domain in a private bucket. Three things are better about the published form. A domain is not one object, it is a range of rows inside a sorted file, so warming a site is a byte range against a row group whose statistics say it is the right one, and 100 billion URLs is hundreds of thousands of files rather than 200 million objects. It reuses the publish path that already exists, including the read back digest check and the local delete that follows it, so the backlog offloads local disk through the same code that offloads pages. And a backlog is worth more to everyone else than it is to us, so publishing it costs nothing and gives doc 04's fetcher protocol a bulk work transport for free.
+
+The mapping from PLD to the file and row group holding it is a small index that does fit locally. It is the only part of the cold tier a coordinator must keep.
 
 Lifecycle:
 
-**Warm.** The scheduler decides to work a PLD. If the shard is not resident, fetch it, verify the digest, and map it in. A shard for a typical domain is a few hundred KB and a warm costs one object GET, so 50 to 100 ms.
+**Warm.** The scheduler decides to work a PLD. If it is not resident, read the row group the local index points at, check it against the manifest's digest, and load it. A typical domain is a few hundred KB and a warm is one ranged GET against a CDN, so 50 to 100 ms.
 
-**Work.** All operations are local. The shard is dirty.
+**Work.** All operations are local. The rows are dirty.
 
-**Evict.** When the domain goes idle, or under memory or disk pressure, the shard is sealed, rewritten with its merges applied, uploaded, and the manifest updated to the new digest. Then the local copy is dropped.
+**Evict.** When the domain goes idle, or under memory or disk pressure, the rows are written into the open frontier segment in key order, and when that segment seals it is published like any other. The local index moves to the new file and row group once the read back digest matches, and only then are the local rows dropped, which is doc 12.7's fourth condition applied to state instead of to pages. A domain with leases in flight is not evicted, because evicting it would strand the completions.
 
-**Forget.** Nothing is deleted from object storage. Old shard versions are garbage collected after 7 days, which gives a rollback window.
+**Forget.** Nothing published is ever deleted or rewritten, which is doc 12's rule and it holds here too. A domain's older rows stay where they are and stop being pointed at, so the index is what makes a version current and the previous file is a rollback window that lasts as long as the file does. What that costs is dead rows accumulating in old files, and compaction is what collects them: a run reads the live rows out of the files with the worst live fraction, writes them into a new segment, and moves the index. That is a background job against published files, not a rewrite of them.
 
 The resident set is sized by disk, not by policy: hold as many shards as fit in the local state budget, evict least recently used. On server3 with 112 GB free, splitting the budget with the data segments, roughly 40 GB of state is maybe 60 to 100 thousand resident domains. That is far more than the few thousand being actively worked, so the hit rate should be very high, and `shard_misses` from `admit` is how we find out it is not.
 
