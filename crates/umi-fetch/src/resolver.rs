@@ -136,7 +136,15 @@ impl Resolver {
         options.max_active_requests = ACTIVE;
         options.timeout = ATTEMPT;
         options.attempts = 2;
-        options.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
+        // A record first and the quad A only if there was no A record, rather
+        // than both every time. Both every time doubles the query count and
+        // makes every lookup wait for the slower of two answers, and the
+        // resolver's request list is the thing that runs out first on a bulk
+        // run. Almost every host on the web has an A record, so the second
+        // query is almost always work nobody uses. A host that is v6 only
+        // still resolves, it just costs a round trip, and there are few
+        // enough of those that the trade is not close.
+        options.ip_strategy = LookupIpStrategy::Ipv4thenIpv6;
         let built = builder.build().ok()?;
         let _ = self.inner.set(built);
         self.inner.get()
