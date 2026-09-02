@@ -3616,6 +3616,7 @@ dependencies = [
  "arrow",
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "ed25519-dalek",
  "hex",
  "parquet",
