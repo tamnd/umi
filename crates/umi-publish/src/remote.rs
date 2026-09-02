@@ -24,10 +24,10 @@
 //! The parquet crate has an async reader that would do the ranged reads by
 //! itself. It is not used here, because it would want the `async` feature and
 //! the futures stack behind it in order to save one thing we do not need saved:
-//! the reads are already down to two, they are both awaited before any decoding
-//! starts, and a warm is off the critical path by the time doc 08.6's prefetch
-//! is doing its job. [`Window`] is what makes the sync reader work on a partial
-//! file, and it is fourteen lines.
+//! the reads are already down to one per domain, each is awaited before any
+//! decoding starts, and a warm is off the critical path by the time doc 08.6's
+//! prefetch is doing its job. A small `ChunkReader` over the fetched span is
+//! what makes the sync reader work on a partial file, and it is fourteen lines.
 
 use std::future::Future;
 use std::ops::Range;
@@ -133,8 +133,7 @@ impl Ranges for HubFile<'_> {
 ///
 /// `first` and `last` are inclusive and come straight from doc 08.6's local
 /// index. The batches come back in file order, which for a frontier file is key
-/// order, which is the order [`restore`](umi_state::State::restore) wants them
-/// in anyway.
+/// order, which is the order `State::restore` wants them in anyway.
 ///
 /// The footer is an argument rather than something this reads for itself,
 /// because one frontier file holds a row group per domain and a warm asks for
