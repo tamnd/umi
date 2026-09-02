@@ -63,6 +63,7 @@ pub mod manifest;
 pub mod pipeline;
 pub mod remote;
 pub mod repo;
+pub mod retract;
 pub mod supervised;
 pub mod verify;
 

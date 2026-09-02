@@ -14,8 +14,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use umi_cli::{
-    Error, block, cards, config, crawl, doctor, evict, get, inspect, robots, supervise, verify,
-    warm,
+    Error, block, cards, config, crawl, doctor, evict, get, inspect, retract, robots, supervise,
+    verify, warm,
 };
 use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
@@ -216,6 +216,34 @@ enum Command {
         /// every umi repository in the organisation.
         repo: Option<String>,
         /// Say what would be written without writing it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Take published files back out, on the record.
+    ///
+    /// Doc 12.2 says a published file is never rewritten and never deleted,
+    /// because both break every checksum anyone recorded, and this command does
+    /// not soften that. It is here so that an operator who has decided a
+    /// deletion has to happen anyway does it in a form that leaves the
+    /// repository verifiable: the deletions and the rewritten day manifests go
+    /// in one commit, the chain is relinked to the end of the repository, and a
+    /// record naming every removed file with the digest it had is published to
+    /// the meta repository first.
+    Retract {
+        /// The repository, with or without the organisation on it.
+        repo: String,
+        /// A repository relative path to remove. Repeat it, or use --from.
+        #[arg(long = "file", value_name = "PATH")]
+        files: Vec<String>,
+        /// A file holding one path per line, with blank lines and # comments
+        /// skipped. For the case where there are too many to read on one
+        /// command line.
+        #[arg(long, value_name = "PATH")]
+        from: Option<String>,
+        /// Why, in words. Published with the record and required.
+        #[arg(long)]
+        reason: Option<String>,
+        /// Print what would go and commit nothing.
         #[arg(long)]
         dry_run: bool,
     },
@@ -640,6 +668,46 @@ fn run(command: &Command) -> Result<(), Error> {
                 publishing,
                 identity,
             ))
+        }
+        Command::Retract {
+            repo,
+            files,
+            from,
+            reason,
+            dry_run,
+        } => {
+            let config = load(command)?;
+            // The same pair `umi publish` needs, because this writes and signs
+            // exactly like a publish does. Read before anything else so a run
+            // without a key fails now rather than after the record is up.
+            let publishing = crawl::Publishing::resolve(&config, true)?.ok_or_else(|| {
+                Error::Missing("umi retract needs publish.token and publish.key".to_owned())
+            })?;
+            let report = retract::run(
+                &retract::Options {
+                    repo,
+                    files: retract::paths(files, from.as_ref().map(std::path::Path::new))?,
+                    reason: reason.as_deref().unwrap_or_default(),
+                    dry_run: *dry_run,
+                    meta_repo: umi_publish::repo::META_REPO,
+                    org: &config.org.value,
+                    now_ms: SystemClock.now_ms(),
+                },
+                publishing.token.clone(),
+                &publishing.key,
+            )?;
+            for path in &report.removed {
+                println!("{path}: {}", if *dry_run { "would go" } else { "gone" });
+            }
+            println!(
+                "{} files, {} rows, {} bytes, {} manifests rewritten, record at {}",
+                report.removed.len(),
+                report.rows,
+                report.bytes,
+                report.rewritten.len(),
+                report.record
+            );
+            Ok(())
         }
         Command::Verify { target, full } => {
             let config = load(command)?;

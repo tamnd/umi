@@ -46,6 +46,7 @@ umi evict <dir>               move the backlog to the hub and free the disk, doc
 umi warm <dir>                bring the backlog back off the hub, doc 8.6
 umi verify <repo|dir>         re verify manifests, signatures and digests
 umi manifest <repo>           print or validate a manifest chain
+umi retract <repo>            take published files out on the record, doc 12.8
 
 umi block [<domain>]          add to the block list, or print it, doc 07.7
 umi supervise [<domain>]      add to the T4 allowlist, or print it, doc 05.7
@@ -57,7 +58,7 @@ umi peers                     coordinator peering state
 umi fetchers                  connected fetchers, reputation, rates, doc 06
 ```
 
-Twenty nine commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
+Thirty commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
 
 `--publish` is a flag on all three of `crawl`, `resume` and `watch`, and it means the same thing on each one. A crawl started with it and resumed without it keeps its next segments locally, which is deliberate: the flag is the operator saying what this run should do, not a property the directory remembers, because the two things it needs are secrets and secrets do not belong in a directory that gets moved around.
 
@@ -370,6 +371,23 @@ It reads every day manifest in the repository, checks that each one parses and i
 The file check is free by default and that is worth explaining. Hugging Face stores a large file through lfs, and lfs names an object by the sha256 of its content, so the digest in the listing is a digest of the bytes rather than of a git blob header, and comparing it to the manifest checks the whole file without downloading a byte of it. It is a real check that trusts the hub to have computed the digest honestly. `--full` downloads each file and digests it locally, which trusts nothing and costs the bandwidth. The default is the cheap one because a verifier that downloaded a week of the corpus every time is a verifier nobody runs, and the output says which of the two ran so that nobody has to guess.
 
 Everything that fails to check out is exit 6, which doc 14.9 never retries automatically. A repository that does not verify does not start verifying because you asked twice.
+
+### `umi retract`
+
+```
+umi retract umi-robots --file data/20260901/01ABC.parquet --reason "duplicate rows from overlapping runs"
+umi retract umi-robots --from doomed.txt --reason "..." --dry-run
+```
+
+`umi retract` removes published files. Doc 12.8 explains why it exists and what it does not change, and the short version is that a project with no supported way to delete a file does not stop deletions happening, it just gets them done by hand, and a file deleted by hand leaves a repository that reads as attacked. So this is the supported form: the deletions and the rewritten day manifests go in one commit, the chain is relinked from the first changed day to the end of the repository, and a record naming every removed file with the digest it had is published to `umi-meta` under `retractions/` before the deletion happens.
+
+It is meant to be awkward. There is no glob, no prefix and no threshold, because every one of those is a way to delete more than you meant to and none of them makes the hard part easier. The hard part is deciding which files, and that decision belongs in whatever query produced the list rather than in this command. `--file` names one and repeats, `--from` reads one path per line and skips blanks and `#` comments so the list can carry a note at the top saying which query produced it, and the two combine. A path named twice is deleted once and counted once. `--reason` is required and goes into the published record in the words it was typed, for the same reason doc 07.7 requires one on a block, which is that the operator a year from now is a stranger.
+
+A path that no manifest in the repository names stops the run before anything is committed. The two ways that happens are a typo and a file that was already retracted, and neither of them should quietly go ahead: without the check, a mistyped path commits a rewrite of nothing, re-signs every manifest it touched, and breaks every digest a reader recorded in exchange for no change at all. For the same reason only the days that actually moved are rewritten, so a retraction against the last day of a repository with a year of history rewrites one manifest and not three hundred.
+
+A day left holding no files keeps its manifest rather than losing it. The manifest is a link in the chain and the day after it points at the day's digest, so deleting the empty one would break the chain a second time in the middle of repairing it.
+
+`--dry-run` prints the same report and commits nothing, which is how a list of forty one paths gets checked before it is used. The command needs the same token and publishing key `umi publish` needs, because it writes and it signs exactly like a publish does, and both are read before the first hub request so a run without a key fails now rather than after the record is already up.
 
 ## 14.7 Configuration
 

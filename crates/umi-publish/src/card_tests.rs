@@ -86,6 +86,25 @@ fn the_card_says_what_doc_12_9_says_it_says() {
 }
 
 #[test]
+fn every_card_says_where_to_look_when_a_digest_stops_matching() {
+    // The card used to promise a published file is never deleted, and then one
+    // was, so the promise had to become a procedure. A reader whose recorded
+    // digest fails has to be able to find out whether we removed the file or
+    // somebody altered it, and the card is the only place they will look.
+    for family in FAMILIES {
+        let card = general(family);
+        assert!(
+            card.contains("retractions/"),
+            "{family:?} does not say where a retraction is recorded",
+        );
+        assert!(
+            !card.contains("never delete"),
+            "{family:?} still promises something that has already stopped being true",
+        );
+    }
+}
+
+#[test]
 fn the_obligation_to_filter_is_in_the_first_paragraph() {
     // Doc 12.8, in those words: every published dataset card says so in the
     // first paragraph. Further down is where a reader stops reading.
