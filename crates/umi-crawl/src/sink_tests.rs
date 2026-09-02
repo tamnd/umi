@@ -318,3 +318,64 @@ async fn a_sink_refuses_rows_from_a_stream_it_did_not_open() {
         .expect_err("a pages sink cannot take robots rows");
     assert!(format!("{err}").contains("Robots"), "{err}");
 }
+
+#[tokio::test]
+async fn frontier_rows_go_in_and_come_back_out() {
+    // Doc 08.6's eviction through the same sink pages and robots go through.
+    // The point is the decode: twenty columns, seven of them nullable, and a
+    // builder whose order drifted from the schema would write a file that only
+    // fails when somebody reads it back a week later.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sink = SegmentSink::create(
+        dir.path(),
+        SegmentInfo {
+            stream: umi_file::StreamKind::Frontier,
+            ..SegmentInfo::default()
+        },
+        WriterConfig::default(),
+    )
+    .expect("create");
+
+    let rows: Vec<_> = (0..100u8).map(spill_row).collect();
+    sink.write::<crate::frontier::FrontierBuilder>(&rows)
+        .expect("write");
+    assert_eq!(sink.rows(), 100);
+
+    let sealed = sink.finish().expect("finish").expect("a segment was open");
+    assert_eq!(sealed.stats.rows, 100);
+    assert_eq!(read(&sealed.path), 100);
+}
+
+/// A spilled row with something in every nullable column, so a round trip that
+/// dropped one would fail rather than pass on an all null column.
+fn spill_row(n: u8) -> umi_state::SpillRow {
+    let url = format!("https://example.com/backlog/{n}");
+    umi_state::SpillRow {
+        key: RowKey {
+            pld: umi_types::PldId::from_bytes([1; 8]),
+            host: umi_types::HostId::from_bytes([2; 8]),
+            url: umi_types::UrlKey::from_bytes([n; 10]),
+        },
+        row: umi_state::LedgerRow {
+            url_key_full: umi_types::UrlKeyFull::derive(url.as_bytes()),
+            host_id: umi_types::HostId::from_bytes([2; 8]),
+            depth: 2,
+            priority: umi_state::Priority::DEFAULT,
+            state: umi_state::UrlState::Fetched,
+            next_due_ms: T0 + u64::from(n),
+            last_fetch_ms: T0 - 1000,
+            last_change_ms: T0 - 2000,
+            fetch_count: 3,
+            change_count: 1,
+            observed_secs: 86_400,
+            content_hash: [n; 8],
+            etag_ref: 0,
+            last_mod_ms: T0 - 3000,
+            status: 200,
+            tier_used: Tier::Plain,
+            fail_streak: 0,
+        },
+        url,
+        etag: Some(format!("W/\"{n}\"")),
+    }
+}
