@@ -634,6 +634,10 @@ impl State for SlowLease {
         self.inner.spill(pld, after, limit).await
     }
 
+    async fn restore(&self, rows: &[umi_state::SpillRow]) -> umi_state::Result<usize> {
+        self.inner.restore(rows).await
+    }
+
     async fn unload(&self, plds: &[umi_types::PldId]) -> umi_state::Result<Vec<umi_types::PldId>> {
         self.inner.unload(plds).await
     }

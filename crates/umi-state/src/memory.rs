@@ -895,6 +895,37 @@ impl State for MemoryState {
             .collect())
     }
 
+    async fn restore(&self, rows: &[SpillRow]) -> Result<usize> {
+        let mut inner = self.lock();
+        let mut restored = 0;
+        for spill in rows {
+            // A row already here wins, because the only way one can exist for a
+            // domain that was cold is that something wrote it after the
+            // eviction. `entry` would give the same answer with an allocation
+            // for the url on every row that turns out to be present.
+            if inner.ledger.contains_key(&spill.key) {
+                continue;
+            }
+            let etag_ref = match spill.etag.as_deref() {
+                Some(etag) => inner.intern_etag(etag),
+                None => LedgerRow::NO_ETAG,
+            };
+            let mut row = spill.row;
+            row.etag_ref = etag_ref;
+            inner.ledger.insert(
+                spill.key,
+                Entry {
+                    row,
+                    url: spill.url.clone(),
+                    lease: None,
+                },
+            );
+            inner.resident.insert(spill.key.pld);
+            restored += 1;
+        }
+        Ok(restored)
+    }
+
     async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>> {
         let mut inner = self.lock();
         let mut unloaded = Vec::new();

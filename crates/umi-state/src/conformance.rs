@@ -37,8 +37,8 @@ use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 
 use crate::{
     BlockRow, Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow,
-    LeaseRequest, NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow,
-    Shard, State, Stream, SupervisionRow, TierPolicy, retry_after_ms,
+    LeaseRequest, LedgerRow, NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery,
+    SegmentRow, Shard, State, Stream, SupervisionRow, TierPolicy, retry_after_ms,
 };
 
 /// A fixed instant to run every case from, so nothing in here depends on when
@@ -225,6 +225,9 @@ where
     run!(spill_reads_one_domain_and_not_its_neighbours);
     run!(unload_drops_a_domains_rows_and_leaves_the_seen_set);
     run!(a_domain_with_a_lease_in_flight_is_not_unloaded);
+    run!(a_warmed_domain_comes_back_the_way_it_left);
+    run!(restoring_a_row_that_is_already_local_keeps_the_local_one);
+    run!(a_warmed_domain_is_resident_and_leasable_again);
     run!(a_shard_entry_round_trips);
     run!(an_unevicted_domain_has_no_shard_entry);
     run!(evicting_a_domain_again_replaces_its_entry);
@@ -2038,6 +2041,156 @@ async fn a_domain_with_a_lease_in_flight_is_not_unloaded(state: &dyn State) -> O
         urls.len(),
         "a refused unload dropped rows anyway"
     );
+    Ok(())
+}
+
+async fn a_warmed_domain_comes_back_the_way_it_left(state: &dyn State) -> Outcome {
+    // The whole point of `restore` being its own call rather than an admission.
+    // A warmed row has a fetch behind it, and a round trip that lost the
+    // history would refetch a page that had not changed and start doc 09.5's
+    // interval estimate again from nothing.
+    let urls: Vec<String> = (0..4).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let pld = key(&urls[0]).pld;
+    // Every one of them, because a domain with anything in flight is not
+    // unloaded and a lease left open would make the eviction below a no op.
+    let leases = lease_one(state, T0).await?;
+    ensure_eq!(leases.len(), urls.len(), "not every url was leased");
+    let bodies: Vec<String> = (0..urls.len()).map(|n| format!("body {n}")).collect();
+    let outcomes: Vec<FetchOutcome> = leases
+        .iter()
+        .zip(&bodies)
+        .map(|(lease, body)| FetchOutcome {
+            result: FetchResult::Fetched {
+                status: 200,
+                content_hash: crate::memory::content_hash(body),
+                revalidate: Revalidator {
+                    etag: Some(format!("\"{body}\"")),
+                    last_modified_ms: Some(T0 - 5000),
+                },
+            },
+            ..fetched(lease, T0 + 100, body)
+        })
+        .collect();
+    state
+        .complete(&outcomes)
+        .await
+        .map_err(|e| format!("complete failed: {e}"))?;
+
+    let before = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    ensure_eq!(before.len(), urls.len(), "spill did not read the domain");
+    state
+        .unload(&[pld])
+        .await
+        .map_err(|e| format!("unload failed: {e}"))?;
+
+    let restored = state
+        .restore(&before)
+        .await
+        .map_err(|e| format!("restore failed: {e}"))?;
+    ensure_eq!(restored, before.len(), "restore did not put every row back");
+
+    let after = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    ensure_eq!(
+        after.len(),
+        before.len(),
+        "the domain came back a different size"
+    );
+    for (was, now) in before.iter().zip(&after) {
+        // The whole row, not a field at a time. `etag_ref` is the one column
+        // allowed to differ, because it indexes a local pool that a rebuilt
+        // store numbers differently, and `spill` resolves it to text for
+        // exactly that reason.
+        ensure_eq!(now.key, was.key, "a key changed on the way back");
+        ensure_eq!(
+            now.url.as_str(),
+            was.url.as_str(),
+            "a url changed on the way back"
+        );
+        ensure_eq!(
+            now.etag.as_deref(),
+            was.etag.as_deref(),
+            "an etag was lost on the way back"
+        );
+        ensure_eq!(
+            LedgerRow {
+                etag_ref: 0,
+                ..now.row
+            },
+            LedgerRow {
+                etag_ref: 0,
+                ..was.row
+            },
+            "a warmed row is not the row that was evicted"
+        );
+    }
+    Ok(())
+}
+
+async fn restoring_a_row_that_is_already_local_keeps_the_local_one(state: &dyn State) -> Outcome {
+    // A warm has to be safe to repeat, because the thing that makes it repeat
+    // is a crash between restoring the rows and clearing the shard entry. The
+    // second one restores nothing and says so.
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let pld = key(&urls[0]).pld;
+    let rows = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+
+    let restored = state
+        .restore(&rows)
+        .await
+        .map_err(|e| format!("restore failed: {e}"))?;
+    ensure_eq!(
+        restored,
+        0,
+        "restore overwrote rows that were already local"
+    );
+    let after = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    ensure_eq!(after.len(), rows.len(), "restore duplicated the domain");
+    Ok(())
+}
+
+async fn a_warmed_domain_is_resident_and_leasable_again(state: &dyn State) -> Outcome {
+    // A warm that put the rows somewhere the scheduler cannot see them would be
+    // a domain that is local, findable and still never fetched.
+    let urls: Vec<String> = (0..2).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let pld = key(&urls[0]).pld;
+    let rows = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    state
+        .unload(&[pld])
+        .await
+        .map_err(|e| format!("unload failed: {e}"))?;
+    state
+        .restore(&rows)
+        .await
+        .map_err(|e| format!("restore failed: {e}"))?;
+
+    let resident = state
+        .resident()
+        .await
+        .map_err(|e| format!("resident failed: {e}"))?;
+    ensure!(
+        resident.contains(&pld),
+        "a warmed domain is not resident, so nothing will ever schedule it"
+    );
+    let leases = lease_one(state, T0).await?;
+    ensure!(!leases.is_empty(), "a warmed row could not be leased");
     Ok(())
 }
 
