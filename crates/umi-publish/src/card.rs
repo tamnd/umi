@@ -46,6 +46,10 @@ pub fn card(corpus: &Corpus, family: Family, extractor: &str) -> String {
     out.push_str(&columns_table(family));
     out.push_str(&provenance(family, extractor));
     out.push_str(PREFERENCES);
+    if family == Family::Robots {
+        out.push_str(SILENCE);
+        out.push_str(&reading(corpus));
+    }
     out.push_str(&exclusions());
     out.push_str(&licensing(family));
     out.push_str(&contact());
@@ -191,6 +195,35 @@ fn provenance(family: Family, extractor: &str) -> String {
 /// What the robots and `Content-Usage` columns mean, which doc 12.9 asks for by
 /// name because they are the two a reader is most likely to get wrong.
 const PREFERENCES: &str = "## Robots and Content-Usage\n\nEvery page in the corpus was fetched under RFC 9309: the host's `robots.txt` was read first, a `Disallow` that matched was obeyed, and a `robots.txt` we could not read at all disallowed the host rather than allowing it. On the pages schema `robots_checked_ms` says when the file behind that decision was last read.\n\n`content_usage` carries the site's AIPREF `Content-Usage` preference, from the response header or the `robots.txt`, verbatim and unparsed. We record it and we do not act on it, because it is the publisher's statement to whoever reads the corpus and not ours to interpret on their behalf. If you are training on this data, that column is the one to read.\n\nA robots snapshot is only good for a day. RFC 9309 caps a cached `robots.txt` at 24 hours and umi honours that, so the robots corpus is a record of what a host said when we asked, not a standing permission you can crawl against today. Use it to plan, to see which hosts have rules at all, to pick up `Crawl-delay` and `Sitemap` before you queue anything, and then ask the origin yourself.\n\n";
+
+/// What a zero status is, which is the one column of this corpus a reader will
+/// misread if nobody tells them.
+///
+/// It is about a third of the rows, so it is not a footnote. The temptation is
+/// to read it as "this host has no robots.txt", and that is wrong twice over: a
+/// host with no file answers 404, and a zero means the request did not come
+/// back at all. Some of those hosts are gone and some of them were simply busy.
+///
+/// The numbers here are measured and are worth keeping current, but they are on
+/// the card rather than in a notebook somewhere because a reader who does not
+/// know the shape of the silence will draw a conclusion about the web from
+/// what is actually a fact about our network.
+const SILENCE: &str = "## What a zero status means\n\nAbout a third of the rows carry `status = 0`, and it does not mean the host has no `robots.txt`. A host with no file answers 404 and gets a row saying 404. A zero means the request came back with nothing at all: the name did not resolve, or it resolved and the connection was refused, reset, or timed out.\n\nThat matters because the two cases are very different and the column does not tell them apart. On the deep tail of the domain ranking most of the silence is names that no longer exist, and sampled against the ranking, 88 percent of dead apexes at rank two million and 97 percent at rank five and a half million were NXDOMAIN. Further down it inverts: on ranks past eighteen million, nearly half the hosts we ask are names that resolve and then serve nothing.\n\nWe ask twice. A host that answers nothing on the first request is asked once more when its name resolves, and about a third of those second asks come back with something, so a third of what would otherwise be silence is a real answer. Rows fetched before 2026-09-02 were one attempt only and carry more transient zeros than later rows do. `fetched_at_ms` is how you tell them apart.\n\nSo treat a zero as \"we did not get an answer\" and not as a statement by the site. In particular `allows_us` is 0 on those rows because RFC 9309 says an unreadable `robots.txt` disallows rather than allows, which is our rule applied to our own failure. It is not the host refusing you.\n\n";
+
+/// A worked query, because the first thing anybody does with a dataset is try
+/// to open it and the second thing is give up.
+///
+/// Only on the robots card. The other families are split by week and slice, so
+/// their repository names carry a date this function does not have, and a
+/// snippet naming the wrong repository is worse than no snippet. This one is a
+/// single repository for the life of the corpus, which is what makes the path
+/// safe to write down.
+fn reading(corpus: &Corpus) -> String {
+    let repo = format!("{}/{}", corpus.org, Family::Robots.stem());
+    format!(
+        "## Reading it\n\nDuckDB over the files in place, without downloading the repository:\n\n```sql\nCREATE SECRET (TYPE huggingface, PROVIDER credential_chain);\n\nSELECT host, crawl_delay_ms, sitemaps\nFROM read_parquet('hf://datasets/{repo}/data/**/*.parquet')\nWHERE status = 200 AND crawl_delay_ms IS NOT NULL\nLIMIT 20;\n```\n\nThe files are around 128 MB and a day folder holds one day of them, so a query that names a day reads a day. Rows are in fetch completion order, which means `fetched_at_ms` is the column whose row group statistics are worth pushing a filter down to, and `host` is not: a run walks the domain ranking rather than the alphabet, so hosts are spread across every file.\n\nOne host can appear more than once. The corpus keeps history rather than replacing rows, because what a site told crawlers last month is the interesting part, so take the newest `fetched_at_ms` per host if what you want is the current answer.\n\n"
+    )
+}
 
 /// The exclusion list, again, with the paths on it.
 fn exclusions() -> String {

@@ -119,6 +119,47 @@ fn the_robots_card_does_not_let_anyone_think_it_replaces_asking() {
 }
 
 #[test]
+fn the_robots_card_says_what_a_zero_status_is() {
+    // A third of the rows carry one, and the obvious reading of it is wrong: a
+    // host with no `robots.txt` answers 404, and a zero means the request never
+    // came back. A reader who takes zero for "no file" counts several hundred
+    // million hosts as having no rules when what we actually have is no answer.
+    let card = general(Family::Robots);
+    assert!(card.contains("does not mean the host has no"), "{card}");
+    assert!(
+        card.contains("we did not get an answer"),
+        "the card does not say what to read it as instead",
+    );
+    // And the half of it that is ours rather than the web's. `allows_us` is 0
+    // on a silent row because RFC 9309 says so, which is our rule applied to
+    // our own failure and not the host refusing anybody.
+    assert!(card.contains("not the host refusing you"), "{card}");
+
+    // The other families have no such column and should not carry the section.
+    assert!(!general(Family::Pages).contains("What a zero status means"));
+}
+
+#[test]
+fn only_the_robots_card_names_a_repository_to_query() {
+    // The snippet is worth having because the first thing anybody does with a
+    // dataset is try to open it. It is only on this card because every other
+    // family is split by week and slice, so its repository name carries a date
+    // the card generator is not given, and a query naming the wrong repository
+    // is worse than no query at all.
+    let card = general(Family::Robots);
+    assert!(
+        card.contains("hf://datasets/open-index/umi-robots/data/**/*.parquet"),
+        "{card}"
+    );
+    for family in [Family::Pages, Family::Receipts, Family::Frontier] {
+        assert!(
+            !general(family).contains("hf://"),
+            "{family:?} names a repository this card cannot know",
+        );
+    }
+}
+
+#[test]
 fn the_pages_card_does_not_claim_a_licence_we_do_not_hold() {
     // Doc 12.9's split. A `license: cc0-1.0` tag on a repository full of other
     // people's text would be a claim we cannot make, and it is the kind of
