@@ -35,7 +35,7 @@ async fn directory(hosts: usize) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(dir.path().join("profile.toml"), PROFILE).expect("profile");
     std::fs::create_dir_all(dir.path().join("segments")).expect("segments");
-    let state = SqliteState::open(&dir.path().join("state.sqlite")).expect("state");
+    let state = SqliteState::open(dir.path().join("state.sqlite")).expect("state");
     let urls: Vec<String> = (0..hosts)
         .map(|i| format!("https://site{i}.example/index.html"))
         .collect();
@@ -81,7 +81,7 @@ async fn a_dry_run_says_how_many_would_move_and_moves_none() {
     assert_eq!(summary.files, 0);
 
     // Nothing left the store, which is the half of a dry run that matters.
-    let state = SqliteState::open(&dir.path().join("state.sqlite")).expect("state");
+    let state = SqliteState::open(dir.path().join("state.sqlite")).expect("state");
     assert_eq!(state.resident().await.expect("resident").len(), 20);
 }
 
