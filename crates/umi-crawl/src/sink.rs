@@ -34,8 +34,10 @@ use std::sync::Mutex;
 use arrow::record_batch::RecordBatch;
 use umi_file::{Create, SegmentWriter, WriterConfig};
 use umi_file::{SegmentStats, StreamKind};
+use umi_state::SpillRow;
 use umi_types::Ulid;
 
+use crate::frontier::FrontierBuilder;
 use crate::page::{PageBuilder, PageRow};
 use crate::robots::{RobotsBuilder, RobotsRow};
 use crate::run::{CrawlError, Sink};
@@ -328,6 +330,36 @@ impl Rows for RobotsBuilder {
     }
     fn stamp(row: &RobotsRow) -> u64 {
         row.fetched_at_ms
+    }
+}
+
+impl Rows for FrontierBuilder {
+    type Row = SpillRow;
+    const KIND: StreamKind = StreamKind::Frontier;
+
+    fn push(&mut self, row: &SpillRow) {
+        Self::push(self, row);
+    }
+    fn is_full(&self) -> bool {
+        Self::is_full(self)
+    }
+    fn is_empty(&self) -> bool {
+        Self::is_empty(self)
+    }
+    fn finish(self) -> RecordBatch {
+        Self::finish(self)
+    }
+    /// `next_due_ms` and not `last_fetch_ms`, which is the one place the
+    /// frontier stream reads a different column than the other two.
+    ///
+    /// The rows worth spilling are rows nothing has fetched, so their
+    /// `last_fetch_ms` is zero, and a segment whose stamps are all zero has an
+    /// age of zero forever and never seals on it. `next_due_ms` is set on every
+    /// row, it comes off the row rather than off a clock so the file stays
+    /// reproducible, and it moves forward as the crawl does, which is what the
+    /// age rule needs to fire between two bursts of eviction.
+    fn stamp(row: &SpillRow) -> u64 {
+        row.row.next_due_ms
     }
 }
 
