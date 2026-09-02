@@ -363,6 +363,31 @@ impl Rows for FrontierBuilder {
     }
 }
 
+/// Where one call's rows ended up.
+///
+/// Doc 08.6's local index needs this and nothing else does, which is why the
+/// numbers are shoals rather than bytes: doc 12 converts one shoal into one
+/// Parquet row group, so the range here is the range a reader gives a ranged
+/// GET without having to open the file first.
+///
+/// A call's rows are always contiguous and always inside one segment. The seal
+/// check runs after the whole call rather than between its shoals, so a batch
+/// that overshoots the size cap overshoots it rather than straddling two files,
+/// and a caller that writes one domain per call gets a domain that lives in one
+/// file with no gaps in it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Placement {
+    /// The segment the rows went into.
+    pub segment: Ulid,
+    /// The first shoal holding them, counting from zero within the segment.
+    pub first_group: u32,
+    /// The last, inclusive. Equal to `first_group` for a call that fitted in
+    /// one shoal, which is the common case.
+    pub last_group: u32,
+    /// How many rows the call wrote.
+    pub rows: u64,
+}
+
 impl SegmentSink {
     /// Write a batch of rows, rolling the segment if this fills it.
     ///
@@ -376,6 +401,37 @@ impl SegmentSink {
     /// [`CrawlError::Sink`] if `B` is not the stream this sink was opened for,
     /// or if the write or the seal failed.
     pub fn write<B: Rows>(&self, rows: &[B::Row]) -> Result<(), CrawlError> {
+        self.put::<B>(rows, false).map(drop)
+    }
+
+    /// The same, but the rows get shoals of their own and the call says which.
+    ///
+    /// For doc 08.6's local index, and for nothing else. The index points a
+    /// domain at a range of row groups, doc 12 turns one shoal into one row
+    /// group, and a warm is a ranged GET of that range, so a domain sharing a
+    /// shoal with the domain written before it is a domain you cannot warm
+    /// without warming its neighbour too. To stop that this flushes whatever
+    /// is buffered before it starts and again when it finishes, which costs a
+    /// small row group per call and buys an exact warm.
+    ///
+    /// Not the default, because a page does not need to know which shoal it is
+    /// in, a segment full of pages is read whole, and a flush per tick would
+    /// turn doc 10.4's shoal caps into a suggestion.
+    ///
+    /// `None` for no rows, which writes nothing and opens nothing.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`write`](Self::write).
+    pub fn write_grouped<B: Rows>(&self, rows: &[B::Row]) -> Result<Option<Placement>, CrawlError> {
+        self.put::<B>(rows, true)
+    }
+
+    fn put<B: Rows>(
+        &self,
+        rows: &[B::Row],
+        grouped: bool,
+    ) -> Result<Option<Placement>, CrawlError> {
         if B::KIND != self.info.stream {
             return Err(CrawlError::Sink(format!(
                 "this sink writes {:?} and was handed {:?}",
@@ -384,7 +440,7 @@ impl SegmentSink {
             )));
         }
         if rows.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let mut open = self.locked();
 
@@ -395,6 +451,11 @@ impl SegmentSink {
         if open.writer.is_none() {
             self.open_segment(&mut open, first_ms)?;
         }
+        if grouped {
+            flush(&mut open)?;
+        }
+        let segment = open.id;
+        let first_group = shoals(&open);
 
         // Shoals, not one batch. A tick's batch is whatever the frontier
         // handed out, and doc 10.4's caps are about what a reader has to hold
@@ -413,6 +474,19 @@ impl SegmentSink {
             let batch = builder.finish();
             push(&mut open, &batch)?;
         }
+        if grouped {
+            flush(&mut open)?;
+        }
+        // Read before the seal, because sealing takes the writer and there is
+        // no shoal count to ask for afterwards. The last shoal is inclusive, and
+        // the count is at least one on a grouped call since the rows were not
+        // empty and the flush above committed them.
+        let placement = Placement {
+            segment,
+            first_group,
+            last_group: shoals(&open).saturating_sub(1),
+            rows: rows.len() as u64,
+        };
 
         // The roll happens after the batch, never in the middle of one. A
         // segment that closed halfway through a tick would put two file names
@@ -429,7 +503,20 @@ impl SegmentSink {
                 open.sealed.push(sealed);
             }
         }
-        Ok(())
+        Ok(Some(placement))
+    }
+}
+
+/// How many shoals the open segment has committed, or zero when none is open.
+fn shoals(open: &Open) -> u32 {
+    open.writer.as_ref().map_or(0, |w| w.shoals() as u32)
+}
+
+/// Commit whatever the writer has buffered, so the next row starts a shoal.
+fn flush(open: &mut Open) -> Result<(), CrawlError> {
+    match open.writer.as_mut() {
+        Some(writer) => writer.flush().map_err(sink_error),
+        None => Ok(()),
     }
 }
 
