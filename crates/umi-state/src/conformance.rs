@@ -218,6 +218,13 @@ where
     run!(a_seal_window_is_half_open);
     run!(warming_a_domain_the_store_has_never_seen_is_not_an_error);
     run!(evicting_a_domain_that_is_not_resident_is_not_an_error);
+    run!(spill_reads_a_domain_in_key_order_with_its_urls);
+    run!(spill_carries_the_etag_text_and_not_the_pool_index);
+    run!(spill_pages_through_a_domain_without_repeating_a_row);
+    run!(spilling_a_domain_the_store_has_never_seen_is_empty);
+    run!(spill_reads_one_domain_and_not_its_neighbours);
+    run!(unload_drops_a_domains_rows_and_leaves_the_seen_set);
+    run!(a_domain_with_a_lease_in_flight_is_not_unloaded);
     run!(a_shard_entry_round_trips);
     run!(an_unevicted_domain_has_no_shard_entry);
     run!(evicting_a_domain_again_replaces_its_entry);
@@ -1830,6 +1837,206 @@ async fn evicting_a_domain_that_is_not_resident_is_not_an_error(state: &dyn Stat
         report.evicted,
         0,
         "a domain the store has never seen was reported as evicted"
+    );
+    Ok(())
+}
+
+async fn spill_reads_a_domain_in_key_order_with_its_urls(state: &dyn State) -> Outcome {
+    let urls: Vec<String> = (0..8).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let pld = key(&urls[0]).pld;
+
+    let rows = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    ensure_eq!(
+        rows.len(),
+        urls.len(),
+        "spill did not read the whole domain"
+    );
+    ensure!(
+        rows.windows(2).all(|pair| pair[0].key < pair[1].key),
+        "spill did not answer in key order, so the segment it writes cannot be range scanned"
+    );
+    for row in &rows {
+        ensure!(
+            urls.contains(&row.url),
+            "spill answered with a url nobody admitted: {}",
+            row.url
+        );
+        ensure_eq!(
+            row.key,
+            key(&row.url),
+            "the key and the url disagree, so a warm would put the row back under the wrong domain"
+        );
+    }
+    Ok(())
+}
+
+async fn spill_carries_the_etag_text_and_not_the_pool_index(state: &dyn State) -> Outcome {
+    // The pool an `etag_ref` indexes into is local. A published file carrying
+    // the index would be a file nobody else can read, and a warm on a rebuilt
+    // store would resolve it to a different ETag or to nothing.
+    let urls = vec![path_url(0)];
+    admit_all(state, &urls).await?;
+    let leases = lease_one(state, T0).await?;
+    let lease = leases.first().ok_or("nothing was leased")?;
+    let outcome = FetchOutcome {
+        result: FetchResult::Fetched {
+            status: 200,
+            content_hash: crate::memory::content_hash("a body"),
+            revalidate: Revalidator {
+                etag: Some("\"abc123\"".to_owned()),
+                last_modified_ms: None,
+            },
+        },
+        ..fetched(lease, T0 + 100, "a body")
+    };
+    state
+        .complete(&[outcome])
+        .await
+        .map_err(|e| format!("complete failed: {e}"))?;
+
+    let rows = state
+        .spill(key(&urls[0]).pld, None, 10)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    let row = rows.first().ok_or("spill answered with nothing")?;
+    ensure_eq!(
+        row.etag.as_deref(),
+        Some("\"abc123\""),
+        "the etag did not come back as text"
+    );
+    Ok(())
+}
+
+async fn spill_pages_through_a_domain_without_repeating_a_row(state: &dyn State) -> Outcome {
+    // A domain larger than one batch is the ordinary case at the sizes doc
+    // 08.6 is written for, and a cursor that overlapped would write the same
+    // url into a segment twice.
+    let urls: Vec<String> = (0..9).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let pld = key(&urls[0]).pld;
+
+    let mut seen = Vec::new();
+    let mut after = None;
+    loop {
+        let page = state
+            .spill(pld, after, 4)
+            .await
+            .map_err(|e| format!("spill failed: {e}"))?;
+        ensure!(page.len() <= 4, "spill answered with more than the limit");
+        let Some(last) = page.last() else { break };
+        after = Some(last.key.url);
+        seen.extend(page.into_iter().map(|row| row.url));
+    }
+
+    ensure_eq!(
+        seen.len(),
+        urls.len(),
+        "paging through the domain did not see every row exactly once: {seen:?}"
+    );
+    let mut sorted = seen.clone();
+    sorted.sort();
+    sorted.dedup();
+    ensure_eq!(sorted.len(), seen.len(), "paging repeated a row: {seen:?}");
+    Ok(())
+}
+
+async fn spilling_a_domain_the_store_has_never_seen_is_empty(state: &dyn State) -> Outcome {
+    let rows = state
+        .spill(PldId::derive(b"nowhere.invalid"), None, 100)
+        .await
+        .map_err(|e| format!("spill of an unknown domain failed: {e}"))?;
+    ensure!(rows.is_empty(), "an unknown domain answered with {rows:?}");
+    Ok(())
+}
+
+async fn spill_reads_one_domain_and_not_its_neighbours(state: &dyn State) -> Outcome {
+    // Evicting one domain must not carry another one's rows into the segment,
+    // because the index entry that gets written points at one domain and the
+    // rows of the other would then be both local and published.
+    let mine: Vec<String> = (0..3)
+        .map(|n| format!("https://mine.example/{n}"))
+        .collect();
+    let theirs: Vec<String> = (0..3)
+        .map(|n| format!("https://theirs.example/{n}"))
+        .collect();
+    admit_all(state, &mine).await?;
+    admit_all(state, &theirs).await?;
+
+    let pld = key(&mine[0]).pld;
+    let rows = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    ensure_eq!(
+        rows.len(),
+        mine.len(),
+        "spill read the wrong number of rows"
+    );
+    for row in &rows {
+        ensure_eq!(row.key.pld, pld, "spill crossed into another domain");
+    }
+    Ok(())
+}
+
+async fn unload_drops_a_domains_rows_and_leaves_the_seen_set(state: &dyn State) -> Outcome {
+    let urls: Vec<String> = (0..5).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let pld = key(&urls[0]).pld;
+
+    let unloaded = state
+        .unload(&[pld])
+        .await
+        .map_err(|e| format!("unload failed: {e}"))?;
+    ensure_eq!(unloaded, vec![pld], "unload did not report what it dropped");
+
+    let left = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    ensure!(left.is_empty(), "unload left rows behind: {left:?}");
+
+    // The fingerprints stay, which is doc 08.6's whole split: an unloaded
+    // domain still dedups every link that points into it without warming
+    // anything. Re-admitting the same urls must therefore admit none of them.
+    let report = admit_all(state, &urls).await?;
+    ensure_eq!(
+        report.admitted,
+        0,
+        "unload dropped the seen set with the rows, so an unloaded domain re-admits everything"
+    );
+    Ok(())
+}
+
+async fn a_domain_with_a_lease_in_flight_is_not_unloaded(state: &dyn State) -> Outcome {
+    // Dropping half a domain would leave the completion with nowhere to land,
+    // and dropping the leased rows too would lose a fetch already paid for.
+    let urls: Vec<String> = (0..3).map(path_url).collect();
+    admit_all(state, &urls).await?;
+    let pld = key(&urls[0]).pld;
+    let leases = lease_one(state, T0).await?;
+    ensure!(!leases.is_empty(), "nothing was leased");
+
+    let unloaded = state
+        .unload(&[pld])
+        .await
+        .map_err(|e| format!("unload failed: {e}"))?;
+    ensure!(
+        unloaded.is_empty(),
+        "a domain with a lease in flight was unloaded anyway"
+    );
+
+    let left = state
+        .spill(pld, None, 100)
+        .await
+        .map_err(|e| format!("spill failed: {e}"))?;
+    ensure_eq!(
+        left.len(),
+        urls.len(),
+        "a refused unload dropped rows anyway"
     );
     Ok(())
 }

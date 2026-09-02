@@ -1211,6 +1211,28 @@ pub struct EvictReport {
     pub bytes_written: u64,
 }
 
+/// One ledger row on its way out to a frontier segment.
+///
+/// A [`LedgerRow`] plus the three things a published file needs and a local
+/// ledger keeps somewhere else. The key, because doc 08.2's ordering is what
+/// makes a domain a contiguous range and the file has to be written in it. The
+/// URL text, which the ledger keeps in a per shard pool because at 100 billion
+/// rows it would dominate everything else. And the ETag, resolved from the
+/// interning pool rather than left as the `etag_ref` index into it, since that
+/// index means nothing to anyone reading the published file.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SpillRow {
+    /// Where the row sorts, which is `(pld, host, url_key)`.
+    pub key: RowKey,
+    /// The URL itself.
+    pub url: String,
+    /// Everything the scheduler decides from.
+    pub row: LedgerRow,
+    /// The ETag, if the row has one. [`LedgerRow::etag_ref`] on `row` is still
+    /// the local pool's index and a warm has to re-intern from this instead.
+    pub etag: Option<String>,
+}
+
 /// Where one domain's evicted rows went, which is doc 08.6's local index.
 ///
 /// One of these per domain that has been evicted and not warmed back, and that

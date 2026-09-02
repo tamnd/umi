@@ -27,8 +27,8 @@ use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Tier, Ulid, Url
 use crate::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,
-    Priority, Quotas, RefreshClass, Result, Revalidator, SegmentQuery, SegmentRow, Shard, State,
-    StateStats, SupervisionRow, TierPolicy, UrlState, next_due_dated, retry_after_ms,
+    Priority, Quotas, RefreshClass, Result, Revalidator, SegmentQuery, SegmentRow, Shard, SpillRow,
+    State, StateStats, SupervisionRow, TierPolicy, UrlState, next_due_dated, retry_after_ms,
 };
 
 /// A [`State`] that lives entirely in memory.
@@ -861,6 +861,69 @@ impl State for MemoryState {
         // backend seals the shard, uploads it and updates the manifest before
         // dropping the local copy, and reports the bytes that cost.
         Ok(report)
+    }
+
+    async fn spill(
+        &self,
+        pld: PldId,
+        after: Option<UrlKey>,
+        limit: usize,
+    ) -> Result<Vec<SpillRow>> {
+        let inner = self.lock();
+        // The ledger is a `BTreeMap` keyed the way doc 08.2 orders, so one
+        // domain is a contiguous range and this is a walk rather than a filter
+        // of the whole store. A real backend gets the same shape from its
+        // primary key and this is here to prove the trait can be implemented
+        // that way.
+        Ok(inner
+            .ledger
+            .range(
+                RowKey {
+                    pld,
+                    ..RowKey::default()
+                }..,
+            )
+            .take_while(|(key, _)| key.pld == pld)
+            .filter(|(key, _)| after.is_none_or(|from| key.url > from))
+            .take(limit)
+            .map(|(key, entry)| SpillRow {
+                key: *key,
+                url: entry.url.clone(),
+                row: entry.row,
+                etag: inner.etag(entry.row.etag_ref),
+            })
+            .collect())
+    }
+
+    async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>> {
+        let mut inner = self.lock();
+        let mut unloaded = Vec::new();
+        for pld in plds {
+            let keys: Vec<_> = inner
+                .ledger
+                .range(
+                    RowKey {
+                        pld: *pld,
+                        ..RowKey::default()
+                    }..,
+                )
+                .take_while(|(key, _)| key.pld == *pld)
+                .map(|(key, entry)| (*key, entry.lease.is_some()))
+                .collect();
+            // A domain with anything in flight is left whole. Dropping half of
+            // it would leave the completion with nowhere to land, and dropping
+            // the leased rows too would lose a fetch that has already been
+            // paid for.
+            if keys.iter().any(|(_, leased)| *leased) {
+                continue;
+            }
+            for (key, _) in &keys {
+                inner.ledger.remove(key);
+            }
+            inner.resident.remove(pld);
+            unloaded.push(*pld);
+        }
+        Ok(unloaded)
     }
 
     async fn put_shards(&self, shards: &[Shard]) -> Result<()> {

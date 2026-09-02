@@ -54,7 +54,7 @@
 
 use std::time::Duration;
 
-use umi_types::{HostId, PldId, Ulid};
+use umi_types::{HostId, PldId, Ulid, UrlKey};
 
 pub mod conformance;
 pub mod freshness;
@@ -76,7 +76,7 @@ pub use types::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     ExcludeReason, FailureKind, FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest,
     LedgerRow, NackReason, Priority, RemoteCopy, Revalidator, RobotsRef, SegmentQuery, SegmentRow,
-    Shard, StateStats, Stream, SupervisionRow, TierPolicy, UrlState,
+    Shard, SpillRow, StateStats, Stream, SupervisionRow, TierPolicy, UrlState,
 };
 
 /// The batch size the whole design is tuned around, from doc 08.5.
@@ -185,7 +185,7 @@ pub type Result<T> = std::result::Result<T, StateError>;
 
 /// The state layer.
 ///
-/// Nineteen methods, all batched, all taking time as an argument. Implement it
+/// Twenty one methods, all batched, all taking time as an argument. Implement it
 /// and then run [`conformance::check`] against it: the suite is the definition
 /// of what these doc comments mean, and a backend that has not been through it
 /// has not implemented this trait, it has implemented something that compiles.
@@ -492,6 +492,58 @@ pub trait State: Send + Sync + 'static {
     /// Whatever the store reports.
     async fn resident(&self) -> Result<Vec<PldId>>;
 
+    /// Read one domain's rows out, in key order, so they can be written into a
+    /// frontier segment.
+    ///
+    /// The read half of doc 08.6's evict, and the one place the trait hands
+    /// back whole rows. That is not a hole in the "no `get(url)`" rule next
+    /// door: this is a sequential walk of one domain's contiguous key range,
+    /// which is the shape the ledger is stored in, and it is called once per
+    /// eviction rather than once per URL.
+    ///
+    /// `after` is where to carry on from, exclusive, so a domain larger than
+    /// one batch is read in pieces without holding a cursor across calls. The
+    /// answer is in key order and no longer than `limit`, and a short answer is
+    /// the end of the domain.
+    ///
+    /// The URL text and the ETag come back resolved rather than as references,
+    /// because the interning pool is local and the segment this is going into
+    /// is not. A caller that wrote `etag_ref` into a published file would be
+    /// writing an index into a table nobody else has.
+    ///
+    /// Nothing is changed by this call. Evicting is publish, check the read
+    /// back digest, move the index, then [`unload`](State::unload), and a read
+    /// that mutated would make the first three steps unrepeatable after a
+    /// crash.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn spill(&self, pld: PldId, after: Option<UrlKey>, limit: usize)
+    -> Result<Vec<SpillRow>>;
+
+    /// Drop a domain's local rows, because they are safely on the hub.
+    ///
+    /// The last step of an eviction and the only one that loses anything. The
+    /// caller is asserting that every row it read with [`spill`](State::spill)
+    /// is in a published file whose read back digest matched, which is doc
+    /// 12.7's fourth condition applied to state instead of to pages, and this
+    /// call cannot check that for itself.
+    ///
+    /// A domain with a lease in flight is left alone, because dropping its rows
+    /// would strand the completion, and the returned list is what was actually
+    /// unloaded so the caller can tell. The seen set is not touched: it is the
+    /// one structure doc 08.6 keeps local at any size, and dropping
+    /// fingerprints would mean re-admitting every URL the next time a page
+    /// linked to one.
+    ///
+    /// **Durability: durable.**
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>>;
+
     /// Record where a domain's rows went when they were evicted.
     ///
     /// Doc 08.6's local index, one entry per domain. An entry for a domain that
@@ -654,6 +706,19 @@ impl<T: State + ?Sized> State for std::sync::Arc<T> {
 
     async fn evict(&self, plds: &[PldId]) -> Result<EvictReport> {
         (**self).evict(plds).await
+    }
+
+    async fn spill(
+        &self,
+        pld: PldId,
+        after: Option<UrlKey>,
+        limit: usize,
+    ) -> Result<Vec<SpillRow>> {
+        (**self).spill(pld, after, limit).await
+    }
+
+    async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>> {
+        (**self).unload(plds).await
     }
 
     async fn put_shards(&self, shards: &[Shard]) -> Result<()> {

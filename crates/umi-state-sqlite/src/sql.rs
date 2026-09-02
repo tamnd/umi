@@ -645,3 +645,57 @@ pub const SELECT_SHARD: &str = concat!(shard_columns!(), " WHERE pld = ?1");
 
 /// Forget where a domain's rows were, because a warm has brought them back.
 pub const DELETE_SHARD: &str = "DELETE FROM shards WHERE pld = ?1";
+
+/// One domain's rows on their way out to a frontier segment.
+///
+/// In key order, which is the order the ledger is stored in, so this is a walk
+/// of one contiguous range rather than a scan with a filter. The `url_key > ?2`
+/// is the cursor: a domain larger than one batch is read in pieces without
+/// holding a statement open across calls, and the comparison is on the key
+/// alone because everything in the range already shares a domain.
+///
+/// The ETag comes back as text rather than as `etag_ref`, because the pool that
+/// index points into is local and the file these rows are going into is not.
+pub const SPILL_LEDGER: &str = "
+SELECT ledger.pld            AS pld,
+       ledger.host           AS host,
+       ledger.url_key        AS url_key,
+       ledger.url            AS url,
+       ledger.url_key_full   AS url_key_full,
+       ledger.depth          AS depth,
+       ledger.priority       AS priority,
+       ledger.state          AS state,
+       ledger.next_due_ms    AS next_due_ms,
+       ledger.last_fetch_ms  AS last_fetch_ms,
+       ledger.last_change_ms AS last_change_ms,
+       ledger.fetch_count    AS fetch_count,
+       ledger.change_count   AS change_count,
+       ledger.content_hash   AS content_hash,
+       ledger.etag_ref       AS etag_ref,
+       ledger.last_mod_ms    AS last_mod_ms,
+       ledger.status         AS status,
+       ledger.tier_used      AS tier_used,
+       ledger.fail_streak    AS fail_streak,
+       ledger.observed_secs  AS observed_secs,
+       etags.etag            AS etag
+  FROM ledger
+  LEFT JOIN etags ON etags.id = ledger.etag_ref
+ WHERE ledger.pld = ?1 AND ledger.url_key > ?2
+ ORDER BY ledger.host, ledger.url_key
+ LIMIT ?3";
+
+/// Whether a domain has anything in flight.
+///
+/// A domain with a live lease is not unloaded, because the completion would
+/// have nowhere to land. `lease_id IS NOT NULL` and not an expiry comparison,
+/// deliberately: an expired lease is one `release` has not got to yet and the
+/// row is still spoken for until it does.
+pub const LEDGER_PLD_LEASED: &str =
+    "SELECT 1 FROM ledger WHERE pld = ?1 AND lease_id IS NOT NULL LIMIT 1";
+
+/// Drop a domain's local rows once they are safely on the hub.
+///
+/// The seen set is untouched and that is the whole point of doc 08.6's split:
+/// fingerprints stay local at any size, so an unloaded domain still dedups
+/// every link that points into it without warming anything.
+pub const UNLOAD_LEDGER: &str = "DELETE FROM ledger WHERE pld = ?1";

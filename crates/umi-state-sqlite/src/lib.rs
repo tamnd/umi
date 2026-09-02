@@ -72,10 +72,10 @@ use umi_state::{
     AdmitReport, BlockReport, BlockRow, CLASSES, Candidate, Checkpoint, DAILY_UNDER_MS, Discovery,
     EvictReport, FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow, Lease, LeaseId, LeaseRequest,
     LedgerRow, NackReason, Priority, REALTIME_UNDER_MS, RefreshClass, Result, Revalidator,
-    SegmentQuery, SegmentRow, Shard, State, StateError, StateStats, SupervisionRow, TierPolicy,
-    UrlState, WEEKLY_UNDER_MS, next_due_dated, retry_after_ms,
+    SegmentQuery, SegmentRow, Shard, SpillRow, State, StateError, StateStats, SupervisionRow,
+    TierPolicy, UrlState, WEEKLY_UNDER_MS, next_due_dated, retry_after_ms,
 };
-use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
+use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKey, UrlKeyFull};
 
 mod row;
 mod schema;
@@ -1713,6 +1713,71 @@ impl State for SqliteState {
                 }
             }
             Ok(report)
+        })
+    }
+
+    async fn spill(
+        &self,
+        pld: PldId,
+        after: Option<UrlKey>,
+        limit: usize,
+    ) -> Result<Vec<SpillRow>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        blocking(|| {
+            let guard = self.lock();
+            // A url key is a fixed width blob and SQLite compares blobs by
+            // `memcmp`, so an all zero key is below every real one and stands
+            // in for "start at the beginning". That saves a second statement
+            // for the first page of every domain, which would otherwise be the
+            // only difference between the two.
+            let from = after.map_or_else(|| vec![0u8; UrlKey::LEN], |key| key.as_bytes().to_vec());
+            let mut stmt = guard.conn.prepare_cached(sql::SPILL_LEDGER).state()?;
+            let found = stmt
+                .query_map(
+                    params![
+                        &pld.as_bytes()[..],
+                        from,
+                        i64::try_from(limit).unwrap_or(i64::MAX)
+                    ],
+                    row::spill,
+                )
+                .state()?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            found.state()
+        })
+    }
+
+    async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>> {
+        if plds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        blocking(|| {
+            let mut guard = self.lock();
+            let conn = &mut guard.conn;
+            // Durable. This is the one call in the trait that deletes rows the
+            // crawl still wants, on the caller's word that they are on the hub,
+            // so a delete a crash can undo would leave the ledger and the index
+            // both claiming the same domain.
+            set_sync(conn, Sync::Durable)?;
+            let tx = conn.transaction().state()?;
+            let mut unloaded = Vec::new();
+            {
+                let mut leased = tx.prepare_cached(sql::LEDGER_PLD_LEASED).state()?;
+                let mut drop_rows = tx.prepare_cached(sql::UNLOAD_LEDGER).state()?;
+                for pld in plds {
+                    if leased.exists(params![&pld.as_bytes()[..]]).state()? {
+                        continue;
+                    }
+                    drop_rows.execute(params![&pld.as_bytes()[..]]).state()?;
+                    unloaded.push(*pld);
+                }
+            }
+            tx.commit().state()?;
+            Ok(unloaded)
         })
     }
 

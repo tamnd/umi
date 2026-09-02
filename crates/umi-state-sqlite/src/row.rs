@@ -21,10 +21,10 @@
 use rusqlite::Row;
 use rusqlite::types::Type;
 use umi_state::{
-    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Shard, Stream,
-    SupervisionRow, TierPolicy, UrlState,
+    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Shard, SpillRow,
+    Stream, SupervisionRow, TierPolicy, UrlState,
 };
-use umi_types::{Digest, HostId, PldId, Tier, Ulid, UrlKey, UrlKeyFull};
+use umi_types::{Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKey, UrlKeyFull};
 
 /// A column held something this build cannot read back.
 #[derive(Debug)]
@@ -277,6 +277,20 @@ fn stream(row: &Row<'_>, column: &str) -> rusqlite::Result<Stream> {
         .ok()
         .and_then(Stream::from_u8)
         .ok_or_else(|| bad(column, format!("{raw} is not a stream"), Type::Integer))
+}
+
+/// Read one row on its way out to a frontier segment.
+pub fn spill(row: &Row<'_>) -> rusqlite::Result<SpillRow> {
+    Ok(SpillRow {
+        key: RowKey {
+            pld: pld(row, "pld")?,
+            host: host(row, "host")?,
+            url: url_key(row, "url_key")?,
+        },
+        url: row.get("url")?,
+        row: ledger(row)?,
+        etag: row.get("etag")?,
+    })
 }
 
 /// Read one entry of doc 08.6's local index.

@@ -625,6 +625,19 @@ impl State for SlowLease {
         self.inner.evict(plds).await
     }
 
+    async fn spill(
+        &self,
+        pld: umi_types::PldId,
+        after: Option<umi_types::UrlKey>,
+        limit: usize,
+    ) -> umi_state::Result<Vec<umi_state::SpillRow>> {
+        self.inner.spill(pld, after, limit).await
+    }
+
+    async fn unload(&self, plds: &[umi_types::PldId]) -> umi_state::Result<Vec<umi_types::PldId>> {
+        self.inner.unload(plds).await
+    }
+
     async fn put_shards(&self, shards: &[umi_state::Shard]) -> umi_state::Result<()> {
         self.inner.put_shards(shards).await
     }
