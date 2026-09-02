@@ -12,7 +12,7 @@ use arrow::datatypes::{UInt8Type, UInt16Type, UInt64Type};
 use umi_state::{LedgerRow, Priority, SpillRow, UrlState};
 use umi_types::{HostId, PldId, RowKey, Tier, UrlKey, UrlKeyFull};
 
-use super::frontier::FrontierBuilder;
+use super::frontier::{FrontierBuilder, read_frontier};
 
 /// The moment every row in this file is dated from, since nothing may read a
 /// clock.
@@ -169,4 +169,94 @@ fn rows_go_in_until_the_cap_and_the_builder_says_so() {
     assert_eq!(builder.rows(), 1);
     assert!(!builder.is_empty());
     assert!(!builder.is_full());
+}
+
+#[test]
+fn a_row_survives_the_round_trip_field_for_field() {
+    // The whole reason the reader is written as an inverse. A builder that
+    // gains a column and a reader that does not is a warm that silently drops
+    // a field, and for `observed_secs` that means doc 09.5's refresh estimator
+    // restarting on every row it touches.
+    let rows = [pending(1), fetched(2), pending(3)];
+    let back = read_frontier(&batch(&rows)).expect("read");
+
+    assert_eq!(back.len(), rows.len());
+    for (now, was) in back.iter().zip(rows.iter()) {
+        assert_eq!(now.key, was.key);
+        assert_eq!(now.url, was.url);
+        assert_eq!(now.etag, was.etag);
+        assert_eq!(now.row, was.row);
+    }
+}
+
+#[test]
+fn a_null_reads_back_as_the_zero_the_local_store_keeps() {
+    // The two conventions meeting, in the direction a warm goes. Nothing was
+    // ever fetched at the epoch, so a null timestamp and a zero timestamp mean
+    // the same thing and the round trip is exact either way.
+    let row = pending(4);
+    let back = read_frontier(&batch(&[row.clone()])).expect("read");
+    let got = &back[0];
+
+    assert_eq!(got.row.last_fetch_ms, 0);
+    assert_eq!(got.row.last_change_ms, 0);
+    assert_eq!(got.row.last_mod_ms, 0);
+    assert_eq!(got.row.status, 0);
+    assert_eq!(got.row.content_hash, [0u8; 8]);
+    assert_eq!(got.row.tier_used, Tier::default());
+    assert_eq!(got.etag, None);
+    assert_eq!(got.row, row.row);
+}
+
+#[test]
+fn the_etag_comes_back_as_text_and_not_as_a_pool_index() {
+    // `etag_ref` indexes a pool belonging to whichever store wrote the file, so
+    // carrying the number across would point at some other store's ETag. The
+    // reader always writes the sentinel and leaves the text for `restore` to
+    // re-intern.
+    let mut row = fetched(5);
+    row.row.etag_ref = 4242;
+    let back = read_frontier(&batch(&[row])).expect("read");
+
+    assert_eq!(back[0].row.etag_ref, LedgerRow::NO_ETAG);
+    assert_eq!(back[0].etag.as_deref(), Some("W/\"abc\""));
+}
+
+#[test]
+fn a_batch_of_some_other_stream_is_refused() {
+    // A warm reads bytes off a network. A shard entry pointing at a file of
+    // pages should say so rather than decode twenty columns of the wrong thing.
+    let pages = umi_file::sample::batch(umi_file::StreamKind::Pages, 2);
+    let failure = read_frontier(&pages).expect_err("not a frontier batch");
+    assert!(
+        matches!(failure, crate::CrawlError::Frontier(_)),
+        "{failure}"
+    );
+}
+
+#[test]
+fn a_state_byte_the_enum_does_not_define_is_refused() {
+    // Same reason. The column is a u8 and the enum is not, so a file written by
+    // a future version, or a corrupt one, has a byte here that means nothing to
+    // this build, and guessing at it would put a row into the wrong queue.
+    use arrow::array::{ArrayRef, UInt8Array};
+
+    let good = batch(&[pending(6)]);
+    let mut columns: Vec<ArrayRef> = good.columns().to_vec();
+    columns[7] = std::sync::Arc::new(UInt8Array::from(vec![250u8]));
+    let broken = arrow::record_batch::RecordBatch::try_new(good.schema(), columns).expect("batch");
+
+    let failure = read_frontier(&broken).expect_err("250 is not a url state");
+    assert!(
+        matches!(failure, crate::CrawlError::Frontier(_)),
+        "{failure}"
+    );
+}
+
+#[test]
+fn an_empty_batch_reads_back_as_no_rows() {
+    // A domain with nothing in it is not an error, because `spill_into` can be
+    // handed one and the caller decides what an empty answer means.
+    let back = read_frontier(&batch(&[])).expect("read");
+    assert!(back.is_empty());
 }

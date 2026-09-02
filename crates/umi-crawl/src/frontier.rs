@@ -26,12 +26,15 @@
 use std::sync::Arc;
 
 use arrow::array::{
-    ArrayRef, FixedSizeBinaryBuilder, RecordBatch, StringBuilder, UInt8Builder, UInt16Builder,
-    UInt32Builder, UInt64Builder,
+    Array, ArrayRef, FixedSizeBinaryArray, FixedSizeBinaryBuilder, RecordBatch, StringArray,
+    StringBuilder, UInt8Array, UInt8Builder, UInt16Array, UInt16Builder, UInt32Array,
+    UInt32Builder, UInt64Array, UInt64Builder,
 };
 use umi_file::StreamKind;
-use umi_state::{SpillRow, UrlState};
-use umi_types::{HostId, PldId, UrlKey, UrlKeyFull};
+use umi_state::{LedgerRow, Priority, SpillRow, UrlState};
+use umi_types::{HostId, PldId, RowKey, Tier, UrlKey, UrlKeyFull};
+
+use crate::CrawlError;
 
 /// [`SpillRow`]s into doc 10.5's frontier batch.
 ///
@@ -230,4 +233,197 @@ const FIXED_BYTES: usize = PldId::LEN + HostId::LEN + UrlKey::LEN + UrlKeyFull::
 /// there would read as the Unix epoch.
 const fn when(ms: u64) -> Option<u64> {
     if ms == 0 { None } else { Some(ms) }
+}
+
+/// A published frontier batch back into [`SpillRow`]s, for a warm.
+///
+/// The inverse of [`FrontierBuilder`], and the reason it is written as an
+/// inverse rather than as a fresh parse is that the two have to agree column
+/// for column forever. A builder that gains a column and a reader that does not
+/// is a warm that silently drops a field, which for `observed_secs` means doc
+/// 09.5's refresh estimator quietly restarts on a hundred million rows.
+///
+/// The nulls turn back into the local store's zeros. That direction is lossless
+/// where the other one is not quite: the file distinguishes "never fetched"
+/// from "fetched at the epoch" and the fixed width row does not, but nothing
+/// was ever fetched at the epoch, so the round trip through a file and back is
+/// exact for every row a store can hold.
+///
+/// `etag_ref` comes back as [`LedgerRow::NO_ETAG`] on every row no matter what
+/// the file says, because it is an index into a pool that is local to the store
+/// that wrote it. The text is carried in [`SpillRow::etag`] and
+/// [`restore`](umi_state::State::restore) re-interns it.
+///
+/// # Errors
+///
+/// [`CrawlError::Frontier`] if the batch is not a frontier batch: a column
+/// missing, a column of the wrong type, or a byte in the state or tier column
+/// that is not one of the values those enums define. A published file is bytes
+/// off a network, so none of that is an assertion.
+pub fn read_frontier(batch: &RecordBatch) -> Result<Vec<SpillRow>, CrawlError> {
+    let schema = StreamKind::Frontier.arrow();
+    if batch.schema() != schema {
+        return Err(CrawlError::Frontier(format!(
+            "this is not a frontier batch: {} columns against {}",
+            batch.num_columns(),
+            schema.fields().len()
+        )));
+    }
+
+    let pld_id = fixed(batch, 0, PldId::LEN)?;
+    let host_id = fixed(batch, 1, HostId::LEN)?;
+    let url_key = fixed(batch, 2, UrlKey::LEN)?;
+    let url_key_full = fixed(batch, 3, UrlKeyFull::LEN)?;
+    let url = text(batch, 4)?;
+    let depth = u8s(batch, 5)?;
+    let priority = u16s(batch, 6)?;
+    let state = u8s(batch, 7)?;
+    let next_due_ms = u64s(batch, 8)?;
+    let last_fetch_ms = u64s(batch, 9)?;
+    let last_change_ms = u64s(batch, 10)?;
+    let fetch_count = u32s(batch, 11)?;
+    let change_count = u32s(batch, 12)?;
+    let observed_secs = u32s(batch, 13)?;
+    let content_hash = fixed(batch, 14, 8)?;
+    let etag = text(batch, 15)?;
+    let last_mod_ms = u64s(batch, 16)?;
+    let status = u16s(batch, 17)?;
+    let tier_used = u8s(batch, 18)?;
+    let fail_streak = u8s(batch, 19)?;
+
+    let mut rows = Vec::with_capacity(batch.num_rows());
+    for i in 0..batch.num_rows() {
+        // The four keys and the url are the columns a row cannot be without,
+        // because they are what a row is. The rest have a documented zero.
+        let key = RowKey {
+            pld: PldId::from_bytes(eight(pld_id.value(i), "pld_id")?),
+            host: HostId::from_bytes(eight(host_id.value(i), "host_id")?),
+            url: UrlKey::from_bytes(ten(url_key.value(i))?),
+        };
+        let state_byte = state.value(i);
+        let row = LedgerRow {
+            url_key_full: UrlKeyFull::from_bytes(sixteen(url_key_full.value(i))?),
+            host_id: key.host,
+            depth: depth.value(i),
+            priority: Priority::from_raw(priority.value(i)),
+            state: UrlState::from_u8(state_byte)
+                .ok_or_else(|| CrawlError::Frontier(format!("{state_byte} is not a url state")))?,
+            next_due_ms: next_due_ms.value(i),
+            last_fetch_ms: or_zero(last_fetch_ms, i),
+            last_change_ms: or_zero(last_change_ms, i),
+            fetch_count: fetch_count.value(i),
+            change_count: change_count.value(i),
+            observed_secs: observed_secs.value(i),
+            content_hash: if content_hash.is_null(i) {
+                [0u8; 8]
+            } else {
+                eight(content_hash.value(i), "content_hash")?
+            },
+            // Always the sentinel. The pool this indexed belongs to whichever
+            // store wrote the file, and the text is in `etag` beside it.
+            etag_ref: LedgerRow::NO_ETAG,
+            last_mod_ms: or_zero(last_mod_ms, i),
+            status: if status.is_null(i) {
+                0
+            } else {
+                status.value(i)
+            },
+            tier_used: if tier_used.is_null(i) {
+                Tier::default()
+            } else {
+                let byte = tier_used.value(i);
+                Tier::from_u8(byte)
+                    .ok_or_else(|| CrawlError::Frontier(format!("{byte} is not a tier")))?
+            },
+            fail_streak: fail_streak.value(i),
+        };
+        rows.push(SpillRow {
+            key,
+            url: url.value(i).to_owned(),
+            row,
+            etag: (!etag.is_null(i)).then(|| etag.value(i).to_owned()),
+        });
+    }
+    Ok(rows)
+}
+
+/// A timestamp column's value, with a null reading as the store's zero.
+fn or_zero(column: &UInt64Array, i: usize) -> u64 {
+    if column.is_null(i) {
+        0
+    } else {
+        column.value(i)
+    }
+}
+
+/// One fixed width binary column, checked for width as well as for type.
+///
+/// The width matters on its own. Two of these columns are eight bytes and
+/// swapping them would pass a type check and put host ids in the pld column,
+/// which is the failure the builder's tests exist to catch on the way out.
+fn fixed(
+    batch: &RecordBatch,
+    at: usize,
+    width: usize,
+) -> Result<&FixedSizeBinaryArray, CrawlError> {
+    let column = batch
+        .column(at)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .ok_or_else(|| CrawlError::Frontier(format!("column {at} is not fixed width binary")))?;
+    if column.value_length() != width as i32 {
+        return Err(CrawlError::Frontier(format!(
+            "column {at} is {} bytes wide and should be {width}",
+            column.value_length()
+        )));
+    }
+    Ok(column)
+}
+
+/// One string column.
+fn text(batch: &RecordBatch, at: usize) -> Result<&StringArray, CrawlError> {
+    batch
+        .column(at)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| CrawlError::Frontier(format!("column {at} is not a string")))
+}
+
+/// The four scalar column readers, which differ only in width.
+macro_rules! scalar {
+    ($name:ident, $array:ty, $what:literal) => {
+        fn $name(batch: &RecordBatch, at: usize) -> Result<&$array, CrawlError> {
+            batch
+                .column(at)
+                .as_any()
+                .downcast_ref::<$array>()
+                .ok_or_else(|| CrawlError::Frontier(format!("column {at} is not {}", $what)))
+        }
+    };
+}
+
+scalar!(u8s, UInt8Array, "a u8");
+scalar!(u16s, UInt16Array, "a u16");
+scalar!(u32s, UInt32Array, "a u32");
+scalar!(u64s, UInt64Array, "a u64");
+
+/// Exactly eight bytes, named so the error says which column was short.
+fn eight(bytes: &[u8], what: &str) -> Result<[u8; 8], CrawlError> {
+    bytes
+        .try_into()
+        .map_err(|_| CrawlError::Frontier(format!("{what} is {} bytes and not 8", bytes.len())))
+}
+
+/// Exactly ten bytes, the url key.
+fn ten(bytes: &[u8]) -> Result<[u8; 10], CrawlError> {
+    bytes
+        .try_into()
+        .map_err(|_| CrawlError::Frontier(format!("url_key is {} bytes and not 10", bytes.len())))
+}
+
+/// Exactly sixteen bytes, the full url fingerprint.
+fn sixteen(bytes: &[u8]) -> Result<[u8; 16], CrawlError> {
+    bytes.try_into().map_err(|_| {
+        CrawlError::Frontier(format!("url_key_full is {} bytes and not 16", bytes.len()))
+    })
 }

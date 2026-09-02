@@ -443,6 +443,13 @@ pub enum CrawlError {
     /// The sink.
     #[error("sink: {0}")]
     Sink(String),
+    /// A frontier batch that will not read back as ledger rows.
+    ///
+    /// Its own variant rather than a `Sink` because it comes from the other
+    /// direction. A published file is bytes off a network and a warm has to be
+    /// able to say that they are not the bytes it asked for.
+    #[error("frontier: {0}")]
+    Frontier(String),
 }
 
 /// How the loop behaves.

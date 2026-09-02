@@ -68,7 +68,7 @@ pub use clock::{Clock, FixedClock, SystemClock};
 pub use digest::extract_digest;
 pub use evict::spill_into;
 pub use fetch::Fetch;
-pub use frontier::FrontierBuilder;
+pub use frontier::{FrontierBuilder, read_frontier};
 pub use ledger::{Recorded, SupervisedLedger};
 pub use page::{Crawled, PageBuilder, PageRow, Snippet, SnippetKind};
 pub use render::{RenderBudget, RenderPolicy, Slot};
