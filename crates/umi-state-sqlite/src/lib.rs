@@ -1875,6 +1875,21 @@ impl State for SqliteState {
         })
     }
 
+    async fn cold(&self, limit: usize) -> Result<Vec<Shard>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        blocking(|| {
+            let guard = self.lock();
+            let mut stmt = guard.conn.prepare_cached(sql::SELECT_COLD).state()?;
+            let found = stmt
+                .query_map(params![limit as i64], row::shard)
+                .state()?
+                .collect::<rusqlite::Result<Vec<_>>>();
+            found.state()
+        })
+    }
+
     async fn shards(&self, plds: &[PldId]) -> Result<Vec<Shard>> {
         if plds.is_empty() {
             return Ok(Vec::new());

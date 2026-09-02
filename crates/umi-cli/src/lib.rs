@@ -26,10 +26,13 @@ pub mod rdns;
 pub mod robots;
 pub mod supervise;
 pub mod verify;
+pub mod warm;
 
 #[cfg(test)]
 mod evict_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod warm_tests;
 
 pub use error::Error;

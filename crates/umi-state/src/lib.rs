@@ -608,6 +608,25 @@ pub trait State: Send + Sync + 'static {
     /// Whatever the store reports.
     async fn shards(&self, plds: &[PldId]) -> Result<Vec<Shard>>;
 
+    /// The domains that are cold, oldest eviction first, at most `limit`.
+    ///
+    /// The mirror of [`resident`](State::resident), and the reason it exists is
+    /// that nothing else can answer it. [`shards`](State::shards) asks about
+    /// domains the caller already knows the names of, and a warm starts from
+    /// the other end: it has disk to spare and wants to know what to pull back.
+    ///
+    /// Oldest first because that is the order an eviction ran in, so a warm
+    /// that keeps up with an evictor undoes its work in the same order and a
+    /// warm that does not keeps the newest evictions cold, which are the ones
+    /// most likely to be evicted again. It is not a claim about which domain
+    /// the scheduler wants next. A scheduler that knows names calls
+    /// [`shards`](State::shards) instead.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn cold(&self, limit: usize) -> Result<Vec<Shard>>;
+
     /// Forget where a domain's rows were, because they are local again.
     ///
     /// The other half of a warm. The published file is untouched and stays
@@ -760,6 +779,10 @@ impl<T: State + ?Sized> State for std::sync::Arc<T> {
 
     async fn shards(&self, plds: &[PldId]) -> Result<Vec<Shard>> {
         (**self).shards(plds).await
+    }
+
+    async fn cold(&self, limit: usize) -> Result<Vec<Shard>> {
+        (**self).cold(limit).await
     }
 
     async fn clear_shards(&self, plds: &[PldId]) -> Result<()> {

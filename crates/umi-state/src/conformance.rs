@@ -229,6 +229,8 @@ where
     run!(restoring_a_row_that_is_already_local_keeps_the_local_one);
     run!(a_warmed_domain_is_resident_and_leasable_again);
     run!(a_shard_entry_round_trips);
+    run!(the_cold_list_is_oldest_eviction_first_and_stops_at_the_limit);
+    run!(a_domain_that_was_warmed_is_not_cold_any_more);
     run!(an_unevicted_domain_has_no_shard_entry);
     run!(evicting_a_domain_again_replaces_its_entry);
     run!(clearing_a_shard_entry_makes_the_domain_look_local_again);
@@ -2439,6 +2441,90 @@ async fn a_checkpoint_is_stamped_with_the_time_it_was_given(state: &dyn State) -
         checkpoint.taken_ms,
         T0,
         "the checkpoint was stamped with a time nobody passed in"
+    );
+    Ok(())
+}
+
+async fn the_cold_list_is_oldest_eviction_first_and_stops_at_the_limit(
+    state: &dyn State,
+) -> Outcome {
+    // What a warm starts from. The order has to be the same every time, because
+    // a warm that stops at a limit and runs again must carry on rather than
+    // take a different slice of the same set.
+    let plds = [
+        PldId::derive(b"third.example"),
+        PldId::derive(b"first.example"),
+        PldId::derive(b"second.example"),
+    ];
+    // Written newest first, so an answer in insertion order is not an answer in
+    // eviction order and the test can tell them apart.
+    for (segment, pld) in [3u8, 1, 2].into_iter().zip(plds) {
+        state
+            .put_shards(&[shard(pld, segment, 0, 1)])
+            .await
+            .map_err(|e| format!("put_shards failed: {e}"))?;
+    }
+
+    let cold = state
+        .cold(10)
+        .await
+        .map_err(|e| format!("cold failed: {e}"))?;
+    ensure_eq!(cold.len(), 3, "three domains went in");
+    let order: Vec<u64> = cold.iter().map(|shard| shard.evicted_at_ms).collect();
+    let mut sorted = order.clone();
+    sorted.sort_unstable();
+    ensure_eq!(order, sorted, "the cold list is not in eviction order");
+
+    let two = state
+        .cold(2)
+        .await
+        .map_err(|e| format!("cold failed: {e}"))?;
+    ensure_eq!(two.len(), 2, "the limit was not honoured");
+    ensure_eq!(
+        two[0],
+        cold[0],
+        "a limited answer is not a prefix of the full one, so a warm that \
+         resumes would skip a domain"
+    );
+    ensure_eq!(two[1], cold[1], "the same, for the second entry");
+
+    let none = state
+        .cold(0)
+        .await
+        .map_err(|e| format!("cold failed: {e}"))?;
+    ensure!(none.is_empty(), "a limit of zero asked for nothing");
+    Ok(())
+}
+
+async fn a_domain_that_was_warmed_is_not_cold_any_more(state: &dyn State) -> Outcome {
+    // The pointer is what makes a domain cold, so clearing it is what makes it
+    // warm. A domain that stayed in this list after a warm would be pulled down
+    // off the hub again on the next run and restored over rows already local.
+    let pld = PldId::derive(b"comesback.example");
+    state
+        .put_shards(&[shard(pld, 5, 2, 3)])
+        .await
+        .map_err(|e| format!("put_shards failed: {e}"))?;
+    let cold = state
+        .cold(100)
+        .await
+        .map_err(|e| format!("cold failed: {e}"))?;
+    ensure!(
+        cold.iter().any(|shard| shard.pld == pld),
+        "an evicted domain is not in the cold list"
+    );
+
+    state
+        .clear_shards(&[pld])
+        .await
+        .map_err(|e| format!("clear_shards failed: {e}"))?;
+    let cold = state
+        .cold(100)
+        .await
+        .map_err(|e| format!("cold failed: {e}"))?;
+    ensure!(
+        !cold.iter().any(|shard| shard.pld == pld),
+        "a warmed domain is still cold, so the next warm reads it down again"
     );
     Ok(())
 }
