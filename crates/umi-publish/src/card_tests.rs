@@ -211,3 +211,30 @@ fn the_card_is_written_the_way_the_rest_of_the_project_is() {
         );
     }
 }
+
+#[test]
+fn the_robots_card_says_how_many_rows_are_a_second_answer_for_the_same_host() {
+    // The reader who counts rows and calls it a host count is off by 23
+    // percent, and the reader who takes any row for the current answer gets a
+    // stale one. Both are avoidable by saying the number and showing the query,
+    // and neither is avoidable by fixing the files, because a published file is
+    // never rewritten.
+    let card = general(Family::Robots);
+    assert!(card.contains("more than once"), "{card}");
+    assert!(
+        card.contains("do not rewrite a published file"),
+        "the card does not say why the duplicates are still there",
+    );
+    assert!(
+        card.contains("QUALIFY row_number() OVER (PARTITION BY host ORDER BY fetched_at_ms DESC)"),
+        "the card does not show how to take one row per host",
+    );
+
+    // And it no longer explains them as history, which is what they were
+    // assumed to be until the corpus was counted. Every duplicate in it was
+    // written inside a single day by two runs that overlapped.
+    assert!(
+        !card.contains("keeps history rather than replacing rows"),
+        "{card}"
+    );
+}
