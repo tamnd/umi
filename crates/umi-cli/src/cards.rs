@@ -17,7 +17,7 @@
 //! guessed at family from a name it did not recognise would put a robots schema
 //! on somebody else's dataset.
 
-use umi_publish::{Corpus, Family, Hub, Upload, card};
+use umi_publish::{Corpus, Hub, Upload, card};
 
 use crate::Error;
 
@@ -79,17 +79,21 @@ async fn refresh(
     // worth an error. The same repository turning up in a listing of the whole
     // organisation is not a mistake, it is `ccrawl-domains`, and it is skipped.
     if let (Some(name), [only]) = (target, repos.as_slice())
-        && Family::of_repo(only).is_none()
+        && Corpus::of_repo(org, only).is_none()
     {
         return Err(Error::Missing(format!(
             "{name} is not one of umi's dataset families, so there is no card to write for it"
         )));
     }
 
-    let corpus = Corpus::new(org);
     let mut report = Report::default();
     for repo in repos {
-        let Some(family) = Family::of_repo(&repo) else {
+        // The corpus and not just the family, because a focused crawl's
+        // repository needs its scope back to say which scope it is and that
+        // the rows in it are not an unbiased sample of the web. Writing the
+        // general card over one of those would delete that warning, which is
+        // the worst thing this command could do.
+        let Some((corpus, family)) = Corpus::of_repo(org, &repo) else {
             report.skipped.push(repo);
             continue;
         };
