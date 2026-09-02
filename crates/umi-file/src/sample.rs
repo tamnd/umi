@@ -351,6 +351,16 @@ pub fn frontier(rows: usize) -> RecordBatch {
         Arc::new(UInt32Array::from_iter_values(
             (0..rows).map(|i| u32::from(fetched(i) && i % 40 == 0)),
         )),
+        // Zero on a row nothing has fetched, and a few days on one that has.
+        // Not a constant, because this column exists to be compressed well and
+        // a constant would make it look free when it is not.
+        Arc::new(UInt32Array::from_iter_values((0..rows).map(|i| {
+            if fetched(i) {
+                86_400 * (1 + (i % 7) as u32)
+            } else {
+                0
+            }
+        }))),
         fixed_opt(rows, 8, |i| {
             fetched(i).then(|| {
                 (i as u64)

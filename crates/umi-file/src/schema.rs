@@ -292,6 +292,17 @@ fn frontier() -> SchemaRef {
         ok("last_change_ms", DataType::UInt64),
         nn("fetch_count", DataType::UInt32),
         nn("change_count", DataType::UInt32),
+        // How long this url has been watched for, summed over the intervals we
+        // actually served. It is here because it is the denominator of the
+        // change rate estimator and the two counters above are only the
+        // numerator: a url that changed twice in a week and one that changed
+        // twice in a year carry the same `change_count` and want completely
+        // different refetch intervals. A spill and a warm that dropped it would
+        // hand the row back with the estimator reset, so the site would go back
+        // to the default schedule every time it fell out of the cache, and a
+        // domain that falls out of the cache often is exactly the one we can
+        // least afford to refetch on a guess.
+        nn("observed_secs", DataType::UInt32),
         ok("content_hash", fixed(8)),
         ok("etag", utf8()),
         ok("last_mod_ms", DataType::UInt64),
