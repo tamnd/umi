@@ -684,6 +684,34 @@ SELECT ledger.pld            AS pld,
  ORDER BY ledger.host, ledger.url_key
  LIMIT ?3";
 
+/// Put a whole row back, because a warm read it out of a published file.
+///
+/// [`INSERT_LEDGER`] cannot be reused here even though the column lists nearly
+/// match. That one leaves `observed_secs` and `refresh_class` to their defaults
+/// because a candidate has neither, and this one has to carry `observed_secs`
+/// across: it is the window doc 09.5's estimator has measured, and dropping it
+/// would make every warmed row look freshly discovered and start the estimate
+/// again from nothing.
+///
+/// `OR IGNORE` for the same reason as the admission next door, and for a
+/// different meaning. There it keeps the older row, which is the one with the
+/// history. Here it keeps the newer one, because a local row for a domain that
+/// was cold can only have been written after the eviction.
+///
+/// `refresh_class` is still left out. The class is a function of the row's own
+/// history, so it is recomputed on the next completion, and the published file
+/// has no column for it.
+pub const RESTORE_LEDGER: &str = "
+INSERT OR IGNORE INTO ledger (
+    pld, host, url_key, url, url_key_full, depth, priority, state,
+    next_due_ms, last_fetch_ms, last_change_ms, fetch_count, change_count,
+    content_hash, etag_ref, last_mod_ms, status, tier_used, fail_streak,
+    observed_secs
+) VALUES (
+    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
+)";
+
 /// Whether a domain has anything in flight.
 ///
 /// A domain with a live lease is not unloaded, because the completion would

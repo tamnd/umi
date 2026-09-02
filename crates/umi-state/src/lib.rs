@@ -544,6 +544,35 @@ pub trait State: Send + Sync + 'static {
     /// Whatever the store reports.
     async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>>;
 
+    /// Put whole rows back, because a warm read them out of a published file.
+    ///
+    /// The mirror of [`spill`](State::spill) and the only write path that sets
+    /// a row's fetch history directly. [`admit`](State::admit) cannot do this
+    /// job: it takes a candidate, which is a URL somebody found, and every row
+    /// it writes starts pending with no history. A warmed row has been fetched
+    /// before, and losing that would refetch a hundred million pages that had
+    /// not changed and reset every refresh interval doc 09 had learned.
+    ///
+    /// A row already local wins. The only way one can exist for a domain that
+    /// was cold is that something wrote it after the eviction, so it is the
+    /// newer of the two, and the answer is how many rows actually became local
+    /// rather than how many were offered. That makes a warm safe to repeat: the
+    /// second one restores nothing and reports nothing.
+    ///
+    /// The ETag arrives as text and goes back into the local pool, which is why
+    /// [`spill`](State::spill) resolves it on the way out. The seen set is not
+    /// touched, because it never left.
+    ///
+    /// **Durability: durable.** The caller clears the shard entry once this
+    /// returns, and a warm that a crash can undo after the pointer is gone
+    /// leaves a domain that is neither local nor findable, which is the same
+    /// hole an eviction in the wrong order leaves.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn restore(&self, rows: &[SpillRow]) -> Result<usize>;
+
     /// Record where a domain's rows went when they were evicted.
     ///
     /// Doc 08.6's local index, one entry per domain. An entry for a domain that
@@ -719,6 +748,10 @@ impl<T: State + ?Sized> State for std::sync::Arc<T> {
 
     async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>> {
         (**self).unload(plds).await
+    }
+
+    async fn restore(&self, rows: &[SpillRow]) -> Result<usize> {
+        (**self).restore(rows).await
     }
 
     async fn put_shards(&self, shards: &[Shard]) -> Result<()> {

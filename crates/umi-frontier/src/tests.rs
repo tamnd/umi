@@ -497,6 +497,10 @@ impl State for Counted {
         self.inner.spill(pld, after, limit).await
     }
 
+    async fn restore(&self, rows: &[SpillRow]) -> Result<usize> {
+        self.inner.restore(rows).await
+    }
+
     async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>> {
         self.inner.unload(plds).await
     }

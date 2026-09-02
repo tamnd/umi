@@ -1750,6 +1750,66 @@ impl State for SqliteState {
         })
     }
 
+    async fn restore(&self, rows: &[SpillRow]) -> Result<usize> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        blocking(|| {
+            let mut guard = self.lock();
+            let conn = &mut guard.conn;
+            // Durable, because the caller clears the shard entry once this
+            // returns. A warm a crash can undo after the pointer is gone leaves
+            // a domain that is neither local nor findable, which is the hole an
+            // eviction in the wrong order leaves and the same one this ordering
+            // exists to close.
+            set_sync(conn, Sync::Durable)?;
+            let tx = conn.transaction().state()?;
+            let mut restored = 0;
+            {
+                let mut put = tx.prepare_cached(sql::RESTORE_LEDGER).state()?;
+                for spill in rows {
+                    // Interned before the insert rather than inside it, because
+                    // the pool is a separate table and an ETag that lands for a
+                    // row `OR IGNORE` then drops is a few bytes of pool, not a
+                    // wrong answer. The reverse, a row pointing at an id that
+                    // was never written, would be.
+                    let etag_ref = match spill.etag.as_deref() {
+                        Some(etag) => intern_etag(&tx, etag)?,
+                        None => LedgerRow::NO_ETAG,
+                    };
+                    let row = &spill.row;
+                    restored += put
+                        .execute(params![
+                            &spill.key.pld.as_bytes()[..],
+                            &spill.key.host.as_bytes()[..],
+                            &spill.key.url.as_bytes()[..],
+                            spill.url,
+                            &row.url_key_full.as_bytes()[..],
+                            i64::from(row.depth),
+                            i64::from(row.priority.raw()),
+                            i64::from(row.state as u8),
+                            row::to_ms(row.next_due_ms),
+                            row::to_ms(row.last_fetch_ms),
+                            row::to_ms(row.last_change_ms),
+                            i64::from(row.fetch_count),
+                            i64::from(row.change_count),
+                            &row.content_hash[..],
+                            i64::from(etag_ref),
+                            row::to_ms(row.last_mod_ms),
+                            i64::from(row.status),
+                            i64::from(row.tier_used.as_u8()),
+                            i64::from(row.fail_streak),
+                            i64::from(row.observed_secs),
+                        ])
+                        .state()?;
+                }
+            }
+            tx.commit().state()?;
+            Ok(restored)
+        })
+    }
+
     async fn unload(&self, plds: &[PldId]) -> Result<Vec<PldId>> {
         if plds.is_empty() {
             return Ok(Vec::new());
