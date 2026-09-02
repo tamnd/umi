@@ -13,7 +13,9 @@
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use umi_cli::{Error, block, config, crawl, doctor, get, inspect, robots, supervise, verify};
+use umi_cli::{
+    Error, block, cards, config, crawl, doctor, get, inspect, robots, supervise, verify,
+};
 use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
 
@@ -168,6 +170,19 @@ enum Command {
     Publish {
         /// The crawl directory.
         dir: String,
+    },
+    /// Rewrite the dataset card on repositories that already have one.
+    ///
+    /// A card is written when a repository is created and not again, so an
+    /// improvement to the generator reaches nothing already published. This is
+    /// the pass that carries it across. Run it by hand and rarely.
+    Cards {
+        /// One repository, with or without the organisation on it. Left out,
+        /// every umi repository in the organisation.
+        repo: Option<String>,
+        /// Say what would be written without writing it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Re verify manifests, signatures and digests.
     Verify {
@@ -589,6 +604,33 @@ fn run(command: &Command) -> Result<(), Error> {
         Command::Verify { target, full } => {
             let config = load(command)?;
             verify::run(target, token(&config)?, *full, &config.org.value)
+        }
+        Command::Cards { repo, dry_run } => {
+            let config = load(command)?;
+            // The same extractor string the publisher stamps into a manifest,
+            // because the card quotes it and a card that disagreed with the
+            // manifests underneath it would be worse than no card.
+            let extractor = umi_publish::PublishConfig::default().extractor;
+            let report = cards::run(
+                repo.as_deref(),
+                token(&config)?,
+                &config.org.value,
+                &extractor,
+                *dry_run,
+            )?;
+            for name in &report.written {
+                println!(
+                    "{name}: card {}",
+                    if *dry_run { "would change" } else { "written" }
+                );
+            }
+            println!(
+                "{} written, {} already current, {} not umi's",
+                report.written.len(),
+                report.unchanged.len(),
+                report.skipped.len()
+            );
+            Ok(())
         }
         Command::Publish { dir } => {
             match crawl::Publishing::resolve(&load(command)?, true)? {

@@ -99,6 +99,29 @@ impl Family {
     pub const fn is_sliced(self) -> bool {
         !matches!(self, Self::Robots)
     }
+
+    /// The family a repository belongs to, read off its name.
+    ///
+    /// Takes the name with or without the organisation on it. `None` for a
+    /// repository in the organisation that umi did not publish, which is a
+    /// case worth having rather than guessing at: an organisation holds
+    /// things like `ccrawl-domains` that are nothing to do with a stream and
+    /// must not have a card written over them.
+    ///
+    /// A sliced family needs the separator in the test. Without it
+    /// `umi-pages-of-something` and `umi-pagesomething` would both come back
+    /// as pages, and a repository whose name merely starts with the same
+    /// letters is not a member of the family.
+    #[must_use]
+    pub fn of_repo(name: &str) -> Option<Self> {
+        let bare = name.rsplit('/').next().unwrap_or(name);
+        [Self::Pages, Self::Receipts, Self::Robots, Self::Frontier]
+            .into_iter()
+            .find(|family| {
+                let stem = family.stem();
+                bare == stem || (family.is_sliced() && bare.starts_with(&format!("{stem}-")))
+            })
+    }
 }
 
 /// An ISO 8601 week: the year the week belongs to, which is not always the year
@@ -510,5 +533,29 @@ mod tests {
         }
         assert!(Family::of(umi_file::StreamKind::Pages).is_sliced());
         assert!(!Family::of(umi_file::StreamKind::Robots).is_sliced());
+    }
+
+    #[test]
+    fn a_repository_name_reads_back_to_the_family_that_made_it() {
+        for (name, want) in [
+            ("umi-robots", Some(Family::Robots)),
+            ("open-index/umi-robots", Some(Family::Robots)),
+            ("umi-pages-2026w14-00", Some(Family::Pages)),
+            ("open-index/umi-receipts-2026w14-07", Some(Family::Receipts)),
+            ("umi-frontier-2026w14-00", Some(Family::Frontier)),
+            // Nothing umi published, and writing a card over it would be
+            // vandalism rather than a refresh.
+            ("ccrawl-domains", None),
+            ("umi-meta", None),
+            // Robots is not sliced, so a name that looks like a slice of it
+            // is not one.
+            ("umi-robots-2026w14-00", None),
+            // The separator has to be there. These are different projects
+            // that happen to start with the same letters.
+            ("umi-pagesomething", None),
+            ("umi-page", None),
+        ] {
+            assert_eq!(Family::of_repo(name), want, "name {name:?}");
+        }
     }
 }
