@@ -625,6 +625,18 @@ impl State for SlowLease {
         self.inner.evict(plds).await
     }
 
+    async fn put_shards(&self, shards: &[umi_state::Shard]) -> umi_state::Result<()> {
+        self.inner.put_shards(shards).await
+    }
+
+    async fn shards(&self, plds: &[umi_types::PldId]) -> umi_state::Result<Vec<umi_state::Shard>> {
+        self.inner.shards(plds).await
+    }
+
+    async fn clear_shards(&self, plds: &[umi_types::PldId]) -> umi_state::Result<()> {
+        self.inner.clear_shards(plds).await
+    }
+
     async fn resident(&self) -> umi_state::Result<Vec<umi_types::PldId>> {
         self.inner.resident().await
     }

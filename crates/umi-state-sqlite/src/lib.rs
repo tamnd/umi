@@ -72,8 +72,8 @@ use umi_state::{
     AdmitReport, BlockReport, BlockRow, CLASSES, Candidate, Checkpoint, DAILY_UNDER_MS, Discovery,
     EvictReport, FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow, Lease, LeaseId, LeaseRequest,
     LedgerRow, NackReason, Priority, REALTIME_UNDER_MS, RefreshClass, Result, Revalidator,
-    SegmentQuery, SegmentRow, State, StateError, StateStats, SupervisionRow, TierPolicy, UrlState,
-    WEEKLY_UNDER_MS, next_due_dated, retry_after_ms,
+    SegmentQuery, SegmentRow, Shard, State, StateError, StateStats, SupervisionRow, TierPolicy,
+    UrlState, WEEKLY_UNDER_MS, next_due_dated, retry_after_ms,
 };
 use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKeyFull};
 
@@ -1713,6 +1713,93 @@ impl State for SqliteState {
                 }
             }
             Ok(report)
+        })
+    }
+
+    async fn put_shards(&self, shards: &[Shard]) -> Result<()> {
+        if shards.is_empty() {
+            return Ok(());
+        }
+
+        blocking(|| {
+            let mut guard = self.lock();
+            let conn = &mut guard.conn;
+            // Durable, for the same reason `put_segment` next door is. An entry
+            // a crash can lose is a backlog nobody can find again, and unlike a
+            // lost admission there is nothing that rediscovers it: the rows are
+            // gone from the ledger and the file they went into is one of
+            // hundreds of thousands. There are a few of these a minute at most,
+            // so the fsync costs nothing that matters.
+            set_sync(conn, Sync::Durable)?;
+            let tx = conn.transaction().state()?;
+            {
+                let mut put = tx.prepare_cached(sql::PUT_SHARD).state()?;
+                for shard in shards {
+                    put.execute(params![
+                        &shard.pld.as_bytes()[..],
+                        &shard.segment.as_bytes()[..],
+                        i64::from(shard.first_group),
+                        i64::from(shard.last_group),
+                        row::to_ms(shard.rows),
+                        row::to_ms(shard.evicted_at_ms),
+                    ])
+                    .state()?;
+                }
+            }
+            tx.commit().state()
+        })
+    }
+
+    async fn shards(&self, plds: &[PldId]) -> Result<Vec<Shard>> {
+        if plds.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // A statement per domain rather than one `IN` list. The batch here is
+        // the set of domains a scheduler is about to work, which is hundreds
+        // and not thousands, and each of these is a single primary key lookup
+        // against a table small enough to be in page cache. An `IN` list would
+        // mean rebuilding the statement for every distinct batch size and
+        // losing the prepared statement cache, which costs more than the
+        // lookups do.
+        blocking(|| {
+            let guard = self.lock();
+            let mut stmt = guard.conn.prepare_cached(sql::SELECT_SHARD).state()?;
+            let mut found = Vec::new();
+            for pld in plds {
+                if let Some(shard) = stmt
+                    .query_row(params![&pld.as_bytes()[..]], row::shard)
+                    .optional()
+                    .state()?
+                {
+                    found.push(shard);
+                }
+            }
+            Ok(found)
+        })
+    }
+
+    async fn clear_shards(&self, plds: &[PldId]) -> Result<()> {
+        if plds.is_empty() {
+            return Ok(());
+        }
+
+        blocking(|| {
+            let mut guard = self.lock();
+            let conn = &mut guard.conn;
+            // Durable, and this is the half that matters more than the write.
+            // A crash between the rows coming back into the ledger and the
+            // entry going away leaves a domain whose rows are both local and
+            // pointed at, so the next warm loads them a second time.
+            set_sync(conn, Sync::Durable)?;
+            let tx = conn.transaction().state()?;
+            {
+                let mut clear = tx.prepare_cached(sql::DELETE_SHARD).state()?;
+                for pld in plds {
+                    clear.execute(params![&pld.as_bytes()[..]]).state()?;
+                }
+            }
+            tx.commit().state()
         })
     }
 

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use umi_state::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, MemoryState, NackReason,
-    Pace, Result, Revalidator, SegmentQuery, SegmentRow, State, StateStats, SupervisionRow,
+    Pace, Result, Revalidator, SegmentQuery, SegmentRow, Shard, State, StateStats, SupervisionRow,
 };
 use umi_types::{HostId, PldId, RowKey, Tier, Ulid};
 
@@ -485,6 +485,18 @@ impl State for Counted {
 
     async fn evict(&self, plds: &[PldId]) -> Result<EvictReport> {
         self.inner.evict(plds).await
+    }
+
+    async fn put_shards(&self, shards: &[Shard]) -> Result<()> {
+        self.inner.put_shards(shards).await
+    }
+
+    async fn shards(&self, plds: &[PldId]) -> Result<Vec<Shard>> {
+        self.inner.shards(plds).await
+    }
+
+    async fn clear_shards(&self, plds: &[PldId]) -> Result<()> {
+        self.inner.clear_shards(plds).await
     }
 
     async fn resident(&self) -> Result<Vec<PldId>> {

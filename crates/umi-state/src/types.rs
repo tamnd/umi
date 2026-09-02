@@ -1211,6 +1211,43 @@ pub struct EvictReport {
     pub bytes_written: u64,
 }
 
+/// Where one domain's evicted rows went, which is doc 08.6's local index.
+///
+/// One of these per domain that has been evicted and not warmed back, and that
+/// is the whole cold tier as far as a coordinator is concerned. A hundred
+/// million domains at this size is a few gigabytes, which is the sense in which
+/// doc 08.6 calls it small: it is small next to the two terabytes of ledger it
+/// stands in for, not small in absolute terms.
+///
+/// It does not carry the repository or the path. Those are on the
+/// [`SegmentRow`] the [`segment`](crate::State::segment) id points at, and
+/// copying them here would be a second place the location of a published file
+/// lives, which is the kind of duplicate that survives right up until a
+/// repository is renamed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Shard {
+    /// The registrable domain whose rows these are.
+    pub pld: PldId,
+    /// The frontier segment holding them.
+    pub segment: Ulid,
+    /// The first row group of that file the domain's rows appear in.
+    ///
+    /// A range and not a single group because a domain can be larger than a
+    /// row group, and doc 08.6's warm is a ranged GET over exactly this range.
+    /// Eviction writes in key order and doc 08.2's key starts with the pay
+    /// level domain, so the range is contiguous by construction.
+    pub first_group: u32,
+    /// The last row group, inclusive. Equal to `first_group` for the ordinary
+    /// domain that fits in one.
+    pub last_group: u32,
+    /// How many ledger rows went out, which is what a hit rate is measured
+    /// against and what compaction reads to work out a file's live fraction.
+    pub rows: u64,
+    /// When the eviction that wrote this entry finished, in milliseconds since
+    /// the Unix epoch.
+    pub evicted_at_ms: u64,
+}
+
 /// A consistent point in time snapshot, for publishing and for analytics.
 ///
 /// The snapshot is what `umi checkpoint --format duckdb` attaches to and what

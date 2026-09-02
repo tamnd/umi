@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 9;
+pub const SCHEMA_VERSION: u32 = 10;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,7 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -524,3 +524,37 @@ CREATE INDEX ledger_ready
     r";
 "
 );
+
+/// Version 10: doc 08.6's local index, which is the map from a pay level
+/// domain to the published file and row group its evicted rows are in.
+///
+/// One row per evicted domain and no history. The index is what makes a version
+/// current, so an eviction replaces the entry rather than appending to it, and
+/// the rows the old entry pointed at stay in the file they were written to
+/// because nothing published is ever deleted. That is the rollback window, and
+/// it lasts as long as the file does.
+///
+/// There is no foreign key to `segments` and the `PRAGMA foreign_keys = OFF`
+/// next door is why: the segment row is written first, by a different call, and
+/// a constraint here would turn an ordering the code already gets right into a
+/// second thing to get right. What it would buy is catching a dangling id, and
+/// a dangling id is caught anyway by the warm that goes looking for the file.
+///
+/// The `shards_segment` index is for compaction rather than for warming. Doc
+/// 08.6's forget reads the live rows out of the files with the worst live
+/// fraction, and the live fraction of a file is the sum of `rows` over the
+/// entries still pointing at it against the row count on the segment, which is
+/// a query by segment and not by domain.
+const V10: &str = r"
+CREATE TABLE shards (
+    pld           BLOB PRIMARY KEY,
+    segment       BLOB    NOT NULL,
+    first_group   INTEGER NOT NULL,
+    last_group    INTEGER NOT NULL,
+    rows          INTEGER NOT NULL,
+    evicted_at_ms INTEGER NOT NULL,
+    CHECK (last_group >= first_group)
+) WITHOUT ROWID;
+
+CREATE INDEX shards_segment ON shards (segment);
+";

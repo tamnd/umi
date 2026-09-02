@@ -76,7 +76,7 @@ pub use types::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     ExcludeReason, FailureKind, FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest,
     LedgerRow, NackReason, Priority, RemoteCopy, Revalidator, RobotsRef, SegmentQuery, SegmentRow,
-    StateStats, Stream, SupervisionRow, TierPolicy, UrlState,
+    Shard, StateStats, Stream, SupervisionRow, TierPolicy, UrlState,
 };
 
 /// The batch size the whole design is tuned around, from doc 08.5.
@@ -185,7 +185,7 @@ pub type Result<T> = std::result::Result<T, StateError>;
 
 /// The state layer.
 ///
-/// Sixteen methods, all batched, all taking time as an argument. Implement it
+/// Nineteen methods, all batched, all taking time as an argument. Implement it
 /// and then run [`conformance::check`] against it: the suite is the definition
 /// of what these doc comments mean, and a backend that has not been through it
 /// has not implemented this trait, it has implemented something that compiles.
@@ -492,6 +492,58 @@ pub trait State: Send + Sync + 'static {
     /// Whatever the store reports.
     async fn resident(&self) -> Result<Vec<PldId>>;
 
+    /// Record where a domain's rows went when they were evicted.
+    ///
+    /// Doc 08.6's local index, one entry per domain. An entry for a domain that
+    /// already has one replaces it, because the index is what makes a version
+    /// current: the older rows stay in the file they were written to, nothing
+    /// points at them any more, and the file they are in is the rollback window
+    /// for as long as it exists.
+    ///
+    /// Writing an entry is not what makes an eviction safe. The order doc 08.6
+    /// asks for is publish, check the read back digest, move the index, then
+    /// drop the local rows, so a caller that writes an entry before the segment
+    /// is on the hub has written a pointer to a file the hub has never heard
+    /// of.
+    ///
+    /// **Durability: durable.** The index is the only thing standing between a
+    /// restart and a backlog nobody can find again.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn put_shards(&self, shards: &[Shard]) -> Result<()>;
+
+    /// Where the named domains' rows are, for the ones that have been evicted.
+    ///
+    /// Only the ones that have an entry, in the order they were asked for, so a
+    /// shorter answer than the question is the normal case and means the rest
+    /// are local or unknown. A domain that has never had a URL admitted and one
+    /// whose rows are all resident look the same here, which is correct: both
+    /// have nothing to fetch back.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn shards(&self, plds: &[PldId]) -> Result<Vec<Shard>>;
+
+    /// Forget where a domain's rows were, because they are local again.
+    ///
+    /// The other half of a warm. The published file is untouched and stays
+    /// where it is, doc 12's rule holding here as everywhere else. What goes is
+    /// the pointer, so that the next eviction writes a fresh one and a read of
+    /// the index never hands back a range whose rows are also in the ledger.
+    ///
+    /// Domains with no entry are skipped rather than reported, in keeping with
+    /// [`warm`](State::warm) treating an already resident domain as a no op.
+    ///
+    /// **Durability: durable.**
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn clear_shards(&self, plds: &[PldId]) -> Result<()>;
+
     /// Take a consistent point in time snapshot, for publishing and analytics.
     ///
     /// The snapshot is a value nothing further mutates. It is what
@@ -602,6 +654,18 @@ impl<T: State + ?Sized> State for std::sync::Arc<T> {
 
     async fn evict(&self, plds: &[PldId]) -> Result<EvictReport> {
         (**self).evict(plds).await
+    }
+
+    async fn put_shards(&self, shards: &[Shard]) -> Result<()> {
+        (**self).put_shards(shards).await
+    }
+
+    async fn shards(&self, plds: &[PldId]) -> Result<Vec<Shard>> {
+        (**self).shards(plds).await
+    }
+
+    async fn clear_shards(&self, plds: &[PldId]) -> Result<()> {
+        (**self).clear_shards(plds).await
     }
 
     async fn resident(&self) -> Result<Vec<PldId>> {
