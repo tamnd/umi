@@ -6,10 +6,10 @@
 //! is `umi-fetch` and has its own suite.
 
 use std::collections::HashSet;
-
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use super::{Admit, Again, Counts, Options, Source, host_of, hosts_in, progress};
+use super::{Admit, Again, Counts, Known, Options, Source, host_of, hosts_in, progress};
 
 #[test]
 fn a_list_written_by_a_person_still_reads_as_hosts() {
@@ -43,7 +43,7 @@ fn a_list_written_by_a_person_still_reads_as_hosts() {
 
 #[test]
 fn the_same_site_is_only_asked_once() {
-    let mut admit = Admit::new(&Options::default(), HashSet::new());
+    let mut admit = Admit::new(&Options::default(), HashSet::new(), Known::none());
     assert_eq!(admit.take("example.com").as_deref(), Some("example.com"));
     assert_eq!(
         admit.take("https://EXAMPLE.com/robots.txt"),
@@ -71,7 +71,7 @@ fn skip_and_limit_carve_the_list_into_runs_that_do_not_overlap() {
     };
 
     let taken = |options: &Options| {
-        let mut admit = Admit::new(options, HashSet::new());
+        let mut admit = Admit::new(options, HashSet::new(), Known::none());
         let mut got = Vec::new();
         for line in list {
             if let Some(host) = admit.take(line) {
@@ -95,7 +95,7 @@ fn skip_and_limit_carve_the_list_into_runs_that_do_not_overlap() {
 #[test]
 fn a_blocked_domain_is_not_asked_and_neither_is_anything_under_it() {
     let blocked = HashSet::from(["blocked.example".to_owned()]);
-    let mut admit = Admit::new(&Options::default(), blocked);
+    let mut admit = Admit::new(&Options::default(), blocked, Known::none());
     assert_eq!(admit.take("blocked.example"), None);
     assert_eq!(
         admit.take("shop.eu.blocked.example"),
@@ -224,6 +224,7 @@ fn the_run_says_how_much_the_second_ask_is_recovering() {
         &crate::crawl::Summary::default(),
         &Counts::default(),
         &again,
+        &Known::none(),
         1000,
         2000,
     );
@@ -239,8 +240,74 @@ fn the_run_says_how_much_the_second_ask_is_recovering() {
         &crate::crawl::Summary::default(),
         &Counts::default(),
         &Again::default(),
+        &Known::none(),
         1000,
         2000,
     );
     assert!(quiet.contains("0 of 0 second asks answered"), "{quiet}");
+}
+
+#[test]
+fn a_host_the_corpus_already_answers_for_is_not_asked_again() {
+    // The 23.1 percent. Two runs whose bands overlap used to ask the same hosts
+    // and publish two rows for each of them, and the only thing that ever told
+    // them apart was which run happened to be running.
+    let known = Known::of(&["b.com", "d.com"]);
+    let mut admit = Admit::new(&Options::default(), HashSet::new(), Arc::clone(&known));
+    let asked: Vec<String> = ["a.com", "b.com", "c.com", "d.com", "e.com"]
+        .into_iter()
+        .filter_map(|line| admit.take(line))
+        .collect();
+    assert_eq!(asked, ["a.com", "c.com", "e.com"]);
+    assert_eq!(known.skipped.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn the_limit_still_counts_hosts_asked_and_not_hosts_read() {
+    // The reason the check goes after the limit and not before it. A run told
+    // to fetch three hosts should fetch three hosts, and a corpus that already
+    // covers the front of the list should make it read further rather than
+    // finish early with one.
+    let known = Known::of(&["a.com", "b.com", "c.com"]);
+    let options = Options {
+        limit: Some(3),
+        ..Options::default()
+    };
+    let mut admit = Admit::new(&options, HashSet::new(), known);
+    let lines = [
+        "a.com", "b.com", "c.com", "d.com", "e.com", "f.com", "g.com",
+    ];
+    let asked: Vec<String> = lines
+        .into_iter()
+        .filter_map(|line| admit.take(line))
+        .collect();
+    assert_eq!(asked, ["d.com", "e.com", "f.com"]);
+    assert!(admit.done());
+}
+
+#[test]
+fn a_run_with_no_corpus_to_read_says_nothing_about_one() {
+    // Two counters that never move are worse than no counters, so the line only
+    // carries them when there is a list behind them.
+    let plain = progress(
+        &crate::crawl::Summary::default(),
+        &Counts::default(),
+        &Again::default(),
+        &Known::none(),
+        0,
+        1000,
+    );
+    assert!(!plain.contains("already answered"), "{plain}");
+
+    let known = Known::of(&["a.com"]);
+    known.skipped.store(41, Ordering::Relaxed);
+    let with = progress(
+        &crate::crawl::Summary::default(),
+        &Counts::default(),
+        &Again::default(),
+        &known,
+        0,
+        1000,
+    );
+    assert!(with.contains("41 already answered"), "{with}");
 }

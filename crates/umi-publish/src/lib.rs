@@ -81,7 +81,7 @@ pub use hub::{Commit, Hub, HubConfig, Remote, Retry, Upload, Who};
 pub use keys::{Role, SigningKey, VerifyingKey};
 pub use manifest::{FileEntry, Manifest, Verification};
 pub use pipeline::{PublishConfig, Published, Publisher, stream_kind, stream_of};
-pub use remote::{HubFile, Ranges, footer, read_row_groups};
+pub use remote::{HubFile, Ranges, footer, read_column, read_row_groups};
 pub use repo::{Corpus, Family, Location, locate};
 pub use supervised::{SupervisedEntry, publish_supervised, published_supervised};
 pub use verify::{Report, verify};

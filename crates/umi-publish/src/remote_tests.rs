@@ -16,7 +16,7 @@ use parquet::file::metadata::ParquetMetaData;
 use umi_file::{Create, Segment, SegmentWriter, StreamKind, WriterConfig, sample};
 
 use crate::convert::convert;
-use crate::remote::{PROBE, Ranges, decode, footer, read_row_groups, span};
+use crate::remote::{PROBE, Ranges, decode, footer, read_column, read_row_groups, span};
 use crate::{Error, Result};
 
 const T0: u64 = sample::T0;
@@ -289,5 +289,72 @@ async fn the_spans_of_two_ranges_do_not_overlap() {
     assert!(
         first.end <= second.start,
         "{first:?} and {second:?} overlap, so a warm reads its neighbour too"
+    );
+}
+
+#[tokio::test]
+async fn one_column_reads_back_every_row_of_it_and_none_of_the_others() {
+    // What `umi robots --known` is built on. The corpus is the source of truth
+    // for which hosts have an answer, and the only column that says so is the
+    // one with the hostname in it, so a run that had to download the bodies to
+    // find that out would be reading fifty times what it needs.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, _) = parquet(dir.path(), 2000);
+    let source = LocalFile::open(&path);
+    let metadata = metadata(&source).await;
+
+    let batches = read_column(&source, &metadata, "url").await.expect("read");
+    let read = joined(&batches);
+    assert_eq!(read.num_columns(), 1, "other columns came back too");
+    assert_eq!(read.num_rows(), 2000);
+
+    let all = whole(&path);
+    let want = all.column_by_name("url").expect("url column");
+    assert_eq!(read.column(0), want);
+}
+
+#[tokio::test]
+async fn a_column_read_is_one_request_a_row_group_and_a_fraction_of_the_bytes() {
+    // Both halves of the trade. More requests than reading the file, because a
+    // column of two row groups is two places in the file, and far fewer bytes,
+    // because everything between those places stays where it is.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, _) = parquet(dir.path(), 20_000);
+    let source = LocalFile::open(&path);
+    let metadata = metadata(&source).await;
+    let groups = metadata.num_row_groups();
+
+    source.reads.lock().expect("reads").clear();
+    read_column(&source, &metadata, "url").await.expect("read");
+    let reads = source.reads.lock().expect("reads").clone();
+    assert_eq!(
+        reads.len(),
+        groups,
+        "{} reads for {groups} row groups",
+        reads.len()
+    );
+
+    let bytes: u64 = reads.iter().map(|(_, len)| len).sum();
+    assert!(
+        bytes < source.size() / 4,
+        "the column read {bytes} bytes of a {} byte file, which is not a saving",
+        source.size(),
+    );
+}
+
+#[tokio::test]
+async fn a_column_that_is_not_there_says_so_rather_than_reading_the_wrong_one() {
+    // A silent wrong answer here is the worst outcome available: a run would
+    // build its list of already answered hosts out of some other column and
+    // then skip nothing, or skip the wrong things, without any sign of it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (path, _) = parquet(dir.path(), 400);
+    let source = LocalFile::open(&path);
+    let metadata = metadata(&source).await;
+
+    let failed = read_column(&source, &metadata, "host").await;
+    assert!(
+        matches!(&failed, Err(Error::Parquet(text)) if text.contains("host")),
+        "{failed:?}",
     );
 }
