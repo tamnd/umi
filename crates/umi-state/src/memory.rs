@@ -973,6 +973,18 @@ impl State for MemoryState {
             .collect())
     }
 
+    async fn cold(&self, limit: usize) -> Result<Vec<Shard>> {
+        let inner = self.lock();
+        let mut found: Vec<Shard> = inner.shards.values().copied().collect();
+        // By eviction time and then by domain, because the map is in key order
+        // and a plain sort by time would leave domains evicted in the same
+        // millisecond in whatever order the map happened to hold them. A stable
+        // answer is what makes a repeated warm resumable.
+        found.sort_by_key(|shard| (shard.evicted_at_ms, shard.pld));
+        found.truncate(limit);
+        Ok(found)
+    }
+
     async fn clear_shards(&self, plds: &[PldId]) -> Result<()> {
         let mut inner = self.lock();
         for pld in plds {

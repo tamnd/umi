@@ -650,6 +650,10 @@ impl State for SlowLease {
         self.inner.shards(plds).await
     }
 
+    async fn cold(&self, limit: usize) -> umi_state::Result<Vec<umi_state::Shard>> {
+        self.inner.cold(limit).await
+    }
+
     async fn clear_shards(&self, plds: &[umi_types::PldId]) -> umi_state::Result<()> {
         self.inner.clear_shards(plds).await
     }

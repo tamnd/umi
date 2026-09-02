@@ -644,6 +644,14 @@ INSERT OR REPLACE INTO shards (
 pub const SELECT_SHARD: &str = concat!(shard_columns!(), " WHERE pld = ?1");
 
 /// Forget where a domain's rows were, because a warm has brought them back.
+/// The cold domains, oldest eviction first.
+///
+/// The tie break on `pld` is not decoration. An eviction writes a thousand
+/// shard rows with the same `evicted_at_ms`, so ordering by time alone leaves
+/// a whole run in whatever order the index walks, and a warm that stops at a
+/// limit would take a different thousand every time it ran.
+pub const SELECT_COLD: &str = concat!(shard_columns!(), " ORDER BY evicted_at_ms, pld LIMIT ?1");
+
 pub const DELETE_SHARD: &str = "DELETE FROM shards WHERE pld = ?1";
 
 /// One domain's rows on their way out to a frontier segment.

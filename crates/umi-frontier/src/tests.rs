@@ -513,6 +513,10 @@ impl State for Counted {
         self.inner.shards(plds).await
     }
 
+    async fn cold(&self, limit: usize) -> Result<Vec<Shard>> {
+        self.inner.cold(limit).await
+    }
+
     async fn clear_shards(&self, plds: &[PldId]) -> Result<()> {
         self.inner.clear_shards(plds).await
     }

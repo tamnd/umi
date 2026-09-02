@@ -15,6 +15,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use umi_cli::{
     Error, block, cards, config, crawl, doctor, evict, get, inspect, robots, supervise, verify,
+    warm,
 };
 use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
@@ -185,6 +186,23 @@ enum Command {
         #[arg(long, default_value_t = evict::DOMAINS)]
         limit: usize,
         /// Say how many domains would move and move none of them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Bring the backlog back off the hub, doc 08.6's warm.
+    ///
+    /// The other direction from evict. A domain that was spilled into a
+    /// published frontier file is a pointer to a row group range, and this
+    /// reads that range back and puts the ledger rows where they were. The
+    /// published file is untouched: what goes is the pointer, so the domain is
+    /// local again and the next eviction writes a fresh one.
+    Warm {
+        /// The crawl directory.
+        dir: String,
+        /// How many domains to bring back.
+        #[arg(long, default_value_t = warm::DOMAINS)]
+        limit: usize,
+        /// Say how many domains would come back and bring none of them.
         #[arg(long)]
         dry_run: bool,
     },
@@ -692,6 +710,30 @@ fn run(command: &Command) -> Result<(), Error> {
             None => Err(Error::Missing(
                 "umi evict needs publish.token and publish.key".to_owned(),
             )),
+        },
+        Command::Warm {
+            dir,
+            limit,
+            dry_run,
+        } => match crawl::Publishing::resolve(&load(command)?, true)? {
+            Some(publishing) => {
+                let warmed = warm::warm(
+                    &warm::Options {
+                        dir: std::path::PathBuf::from(dir),
+                        limit: *limit,
+                        dry_run: *dry_run,
+                    },
+                    &publishing,
+                )?;
+                println!(
+                    "{} domains and {} rows from {} files",
+                    warmed.domains, warmed.rows, warmed.files
+                );
+                Ok(())
+            }
+            // A warm reads from the hub and nowhere else, because the hub is
+            // where the rows went. Without a token there is nothing to read.
+            None => Err(Error::Missing("umi warm needs publish.token".to_owned())),
         },
         Command::Block {
             domain,

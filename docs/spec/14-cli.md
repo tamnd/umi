@@ -43,6 +43,7 @@ umi checkpoint                write a portable state checkpoint, doc 8.5
 
 umi publish <dir>             push through the doc 12 pipeline
 umi evict <dir>               move the backlog to the hub and free the disk, doc 8.6
+umi warm <dir>                bring the backlog back off the hub, doc 8.6
 umi verify <repo|dir>         re verify manifests, signatures and digests
 umi manifest <repo>           print or validate a manifest chain
 
@@ -56,7 +57,7 @@ umi peers                     coordinator peering state
 umi fetchers                  connected fetchers, reputation, rates, doc 06
 ```
 
-Twenty eight commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
+Twenty nine commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
 
 `--publish` is a flag on all three of `crawl`, `resume` and `watch`, and it means the same thing on each one. A crawl started with it and resumed without it keeps its next segments locally, which is deliberate: the flag is the operator saying what this run should do, not a property the directory remembers, because the two things it needs are secrets and secrets do not belong in a directory that gets moved around.
 
@@ -161,6 +162,24 @@ A domain with a lease in flight is kept, because dropping it would leave the com
 `--limit` is how many domains to move and defaults to a thousand, which is a segment or two and a few minutes of uploading. A scheduler under disk pressure calls this repeatedly rather than once, because a run that goes wrong should have gone wrong on a thousand domains rather than on the whole store. `--dry-run` says how many would move and moves none.
 
 This is the bulk operation. `umi state evict <pld>` next to it is the single domain one, for looking at a specific site, and it is the same five steps with a list of one.
+
+### `umi warm`
+
+```
+umi warm ./example.com
+umi warm ./example.com --limit 5000
+umi warm ./example.com --dry-run
+```
+
+The other direction. An eviction left a pointer saying which published file a domain went into and which row groups it occupies, and this reads that range back and puts the ledger rows where they were. It is what makes the offload a cache rather than a one way trip, and it is the reason doc 8.6 is willing to delete local rows at all.
+
+Three steps in this order: read the rows, restore them, then drop the pointer. Same argument as the eviction, run backwards. The rows have to be local before the pointer goes, because a crash in between would leave a domain that is neither local nor findable. A crash the other way leaves a domain that is both local and pointed at, and the next warm restores rows that are already there, which is a restore that reports nothing and changes nothing.
+
+The work is grouped by file and not by domain, because a Parquet file is opened by reading its footer and a frontier footer carries statistics for twenty columns of every row group in the file. It measures at roughly 1.9 kilobytes per row group, so a file holding a thousand evicted domains has a footer of about two megabytes against ten kilobytes of rows for any one of them. Warming a hundred domains that were evicted together is one footer read and a hundred ranged reads. Warming them one at a time would be two hundred requests with half the bytes spent reading the same footer over and over.
+
+Nothing published is touched. The file stays exactly where it is, which is doc 12's rule about published files, and what goes is only the local pointer. The cost of that is dead rows accumulating in old frontier files, and doc 8.6 says compaction collects them later rather than a delete collecting them now.
+
+`--limit` defaults to the same thousand `umi evict` moves, so a warm and an eviction called in turn move the same amount of work in each direction and neither runs away from the other. The cold list comes back oldest eviction first, so a run that stops at the limit and runs again carries on rather than taking the same thousand twice. `--dry-run` says how many domains in how many files would come back and brings none of them. A store with nothing evicted is exit 3 and not a failure, because a warm that found nothing cold is not a warm that went wrong.
 
 ### `umi resume` and `umi watch`
 
