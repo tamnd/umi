@@ -18,6 +18,9 @@ arrow = { workspace = true }
 # preupload sample is base64 too.
 base64 = { workspace = true }
 blake3 = { workspace = true }
+# The sync Parquet reader hands back `Bytes` and takes them, so a ranged read
+# that never copies has to name the type.
+bytes = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 parquet = { workspace = true }
