@@ -28,11 +28,13 @@
 //!
 //! # Politeness
 //!
-//! One request per host, which is the whole of it. There is no per host rate
-//! limit here because there is no second request to a host to space out, and
-//! the hosts arrive in an order that has nothing to do with which IP serves
-//! them, so a run at a few hundred in flight is a few hundred different
-//! origins. What the run does honour is doc 07.7's block list, which is pulled
+//! One request per host, and a second one only when the first got no answer at
+//! all from a name that resolves. There is no per host rate limit here because
+//! there is no third request to space out, and the second one is a retry of a
+//! request that already failed, which is to say it is asking a host that has so
+//! far served nothing. The hosts arrive in an order that has nothing to do with
+//! which IP serves them, so a run at a few hundred in flight is a few hundred
+//! different origins. What the run does honour is doc 07.7's block list, pulled
 //! from the published list when there is a hub to pull it from, because a
 //! domain somebody asked us to leave alone should not be getting requests for
 //! its robots.txt either.
@@ -41,13 +43,16 @@ use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use arrow::array::Array as _;
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use umi_crawl::{Clock, RobotsBuilder, RobotsRow, SegmentInfo, SegmentSink, SystemClock};
+use umi_crawl::{
+    Clock, RobotsBuilder, RobotsEntry as Entry, RobotsRow, SegmentInfo, SegmentSink, SystemClock,
+};
 use umi_fetch::{FetchConfig, Ladder, Tier};
 use umi_file::{StreamKind, WriterConfig};
 use umi_publish::{BlockEntry, Hub};
@@ -211,6 +216,7 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
         .build()
         .map_err(Error::Io)?;
     let fetcher = Arc::new(Ladder::with_signer(FetchConfig::default(), signer)?);
+    let again = Arc::new(Again::default());
 
     let state: Arc<dyn State> =
         Arc::new(SqliteState::open(&layout.state).map_err(|e| Error::State(e.to_string()))?);
@@ -307,13 +313,15 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
             // back to collecting instead and asks again next time round.
             while !drained && inflight.len() < want {
                 match rx.try_recv() {
-                    Ok(host) => inflight.push(start(&fetcher, host, clock.now_ms())),
+                    Ok(host) => inflight.push(start(&fetcher, &again, host, clock.now_ms())),
                     Err(mpsc::error::TryRecvError::Empty) => {
                         if !inflight.is_empty() {
                             break;
                         }
                         match rx.recv().await {
-                            Some(host) => inflight.push(start(&fetcher, host, clock.now_ms())),
+                            Some(host) => {
+                                inflight.push(start(&fetcher, &again, host, clock.now_ms()))
+                            }
                             None => drained = true,
                         }
                     }
@@ -356,7 +364,7 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
             let now_ms = clock.now_ms();
             if now_ms.saturating_sub(said_ms) >= PROGRESS.as_millis() as u64 {
                 said_ms = now_ms;
-                log.line(&progress(&summary, &counts, started_ms, now_ms))?;
+                log.line(&progress(&summary, &counts, &again, started_ms, now_ms))?;
             }
             if let Some(limit) = max_duration
                 && now_ms.saturating_sub(started_ms) >= limit.as_millis() as u64
@@ -408,7 +416,7 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
     });
 
     let now_ms = clock.now_ms();
-    log.line(&progress(&summary, &counts, started_ms, now_ms))?;
+    log.line(&progress(&summary, &counts, &again, started_ms, now_ms))?;
     result?;
     Ok(summary)
 }
@@ -429,13 +437,19 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
 /// are inside it, so every TLS handshake, every header parse and every body
 /// read in the window takes its turn on one thread. The two spellings look
 /// identical at the call site and one of them is eight times the machine.
-fn start(fetch: &Arc<Ladder>, host: String, now_ms: u64) -> JoinHandle<RobotsRow> {
+fn start(
+    fetch: &Arc<Ladder>,
+    again: &Arc<Again>,
+    host: String,
+    now_ms: u64,
+) -> JoinHandle<RobotsRow> {
     let fetch = Arc::clone(fetch);
-    tokio::spawn(async move { one(&fetch, host, now_ms).await })
+    let again = Arc::clone(again);
+    tokio::spawn(async move { one(&fetch, &again, host, now_ms).await })
 }
 
-async fn one(fetch: &Ladder, host: String, now_ms: u64) -> RobotsRow {
-    let entry = umi_crawl::fetch_entry(fetch, &origin(&host), Tier::Plain, now_ms).await;
+async fn one(fetch: &Ladder, again: &Again, host: String, now_ms: u64) -> RobotsRow {
+    let entry = ask(fetch, again, &host, now_ms).await;
     // A domain list holds registrable domains and plenty of sites only exist
     // under `www`, so an apex that never answered at all is worth one more
     // request. Only when nothing came back: a 404 or a 403 is the apex
@@ -452,12 +466,50 @@ async fn one(fetch: &Ladder, host: String, now_ms: u64) -> RobotsRow {
     // that cannot resolve.
     if entry.status == 0 && host.split('.').count() == 2 && registered(&host).await {
         let www = format!("www.{host}");
-        let second = umi_crawl::fetch_entry(fetch, &origin(&www), Tier::Plain, now_ms).await;
+        let second = ask(fetch, again, &www, now_ms).await;
         if second.status != 0 {
             return RobotsRow::build(&www, &second);
         }
     }
     RobotsRow::build(&host, &entry)
+}
+
+/// Ask one name, and ask it a second time if the first ask got nothing back.
+///
+/// The reason there is a second ask at all is a measurement. Five thousand
+/// hosts that one box had recorded as silent were put to a second box, and 733
+/// of them answered. The same list put back to the box that had failed on them
+/// answered 621 times, so the box only accounts for two points of the
+/// difference and the rest is the request itself: a connection reset, a
+/// handshake that timed out, a server that was busy for a minute. About an
+/// eighth of the silence in the corpus is a request that would work if it were
+/// made again, which at the size the corpus has reached is several hundred
+/// thousand rows.
+///
+/// The second ask is guarded on the name resolving, and that guard is what
+/// makes it affordable. Most silence is not a failed request, it is a name that
+/// does not exist, and asking those again would spend a whole connect timeout
+/// on every one of them for an answer that cannot change. The lookup costs
+/// nothing here because the first ask has just made it and lost, so the
+/// resolver is answering out of its own negative cache and the query does not
+/// leave the box.
+///
+/// Nothing waits between the two asks. The failure that dominates is a timeout,
+/// which has already put seconds between them, and a sleep would hold a slot in
+/// the window open for a host that is probably dead rather than spending it on
+/// the next one.
+async fn ask(fetch: &Ladder, again: &Again, host: &str, now_ms: u64) -> Entry {
+    let first = umi_crawl::fetch_entry(fetch, &origin(host), Tier::Plain, now_ms).await;
+    if first.status != 0 || !registered(host).await {
+        return first;
+    }
+    again.asked.fetch_add(1, Ordering::Relaxed);
+    let second = umi_crawl::fetch_entry(fetch, &origin(host), Tier::Plain, now_ms).await;
+    if second.status != 0 {
+        again.answered.fetch_add(1, Ordering::Relaxed);
+        return second;
+    }
+    first
 }
 
 /// Whether the apex might exist, so that a `www.` under it is worth a request.
@@ -962,6 +1014,27 @@ struct Counts {
     silent: u64,
 }
 
+/// How the second ask is doing, counted from inside the fetch tasks.
+///
+/// Atomics and not two more fields on [`Counts`] because the decision to ask
+/// again is made in the task and the row it produces cannot say whether it took
+/// one request or two. Relaxed ordering throughout: these are counters for a
+/// progress line and nothing branches on them, so there is nothing for an
+/// ordering to protect.
+///
+/// It is here rather than left unmeasured because the retry is the sort of
+/// thing that is easy to be wrong about. The 12 to 15 percent that came out of
+/// the controlled experiment was a second ask hours later from a different box,
+/// and this is a second ask straight away from the same one, so the honest
+/// expectation is lower. The two numbers say what it actually is.
+#[derive(Default)]
+struct Again {
+    /// Names that went silent and resolve, so were asked a second time.
+    asked: AtomicU64,
+    /// Second asks that came back with something.
+    answered: AtomicU64,
+}
+
 impl Counts {
     fn add(&mut self, row: &RobotsRow) {
         match row.status {
@@ -977,17 +1050,25 @@ impl Counts {
 }
 
 /// The line the run prints while it works.
-fn progress(summary: &Summary, counts: &Counts, started_ms: u64, now_ms: u64) -> String {
+fn progress(
+    summary: &Summary,
+    counts: &Counts,
+    again: &Again,
+    started_ms: u64,
+    now_ms: u64,
+) -> String {
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
         "{} hosts  {:.1} h/s  {} with rules  {} with none  {} refused  {} silent  \
-         {} rows  {} files  {} MB stored",
+         {} of {} second asks answered  {} rows  {} files  {} MB stored",
         summary.fetched,
         summary.fetched as f64 / elapsed,
         counts.rules,
         counts.none,
         counts.refused,
         counts.silent,
+        again.answered.load(Ordering::Relaxed),
+        again.asked.load(Ordering::Relaxed),
         summary.rows,
         summary.files,
         summary.bytes_stored / (1 << 20),
