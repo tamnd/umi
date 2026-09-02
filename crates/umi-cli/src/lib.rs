@@ -18,6 +18,7 @@ pub mod config;
 pub mod crawl;
 pub mod doctor;
 mod error;
+pub mod evict;
 pub mod exporter;
 pub mod get;
 pub mod inspect;
@@ -26,6 +27,8 @@ pub mod robots;
 pub mod supervise;
 pub mod verify;
 
+#[cfg(test)]
+mod evict_tests;
 #[cfg(test)]
 mod tests;
 

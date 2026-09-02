@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use umi_cli::{
-    Error, block, cards, config, crawl, doctor, get, inspect, robots, supervise, verify,
+    Error, block, cards, config, crawl, doctor, evict, get, inspect, robots, supervise, verify,
 };
 use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
@@ -170,6 +170,23 @@ enum Command {
     Publish {
         /// The crawl directory.
         dir: String,
+    },
+    /// Move the backlog off the local disk and onto the hub, doc 08.6's evict.
+    ///
+    /// A crawl admits far more URLs than it fetches and all of them sit in the
+    /// ledger, so on a fleet whose disks are a cache the backlog is what fills
+    /// them. This writes the coldest domains into a frontier segment, publishes
+    /// it, records where each domain went, and only then drops the local rows.
+    /// A run that publishes nothing deletes nothing.
+    Evict {
+        /// The crawl directory.
+        dir: String,
+        /// How many domains to move.
+        #[arg(long, default_value_t = evict::DOMAINS)]
+        limit: usize,
+        /// Say how many domains would move and move none of them.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Rewrite the dataset card on repositories that already have one.
     ///
@@ -649,6 +666,33 @@ fn run(command: &Command) -> Result<(), Error> {
                 )),
             }
         }
+        Command::Evict {
+            dir,
+            limit,
+            dry_run,
+        } => match crawl::Publishing::resolve(&load(command)?, true)? {
+            Some(publishing) => {
+                let summary = evict::evict(
+                    &evict::Options {
+                        dir: std::path::PathBuf::from(dir),
+                        limit: *limit,
+                        dry_run: *dry_run,
+                    },
+                    &publishing,
+                )?;
+                println!(
+                    "{} of {} files published, {} rows, {} bytes",
+                    summary.published, summary.files, summary.rows, summary.bytes_stored
+                );
+                Ok(())
+            }
+            // The backlog goes to the hub or it does not go anywhere. There is
+            // no local mode here on purpose: writing a frontier segment and
+            // leaving it on the disk is not offloading the disk.
+            None => Err(Error::Missing(
+                "umi evict needs publish.token and publish.key".to_owned(),
+            )),
+        },
         Command::Block {
             domain,
             reason,
