@@ -422,7 +422,16 @@ async fn one(fetch: &Ladder, host: String, now_ms: u64) -> RobotsRow {
     // request. Only when nothing came back: a 404 or a 403 is the apex
     // answering, and asking `www` after an answer would put two rows in the
     // corpus for one site.
-    if entry.status == 0 && host.split('.').count() == 2 {
+    //
+    // And only when the apex might exist. RFC 8020 says nothing lives under a
+    // name that does not itself exist, so an NXDOMAIN on the apex settles the
+    // `www` without asking. That is not a rare case, it is most of them:
+    // sampled against the domain list, 88 percent of dead apexes at rank two
+    // million and 97 percent at rank five and a half million are NXDOMAIN. The
+    // fallback was costing a lookup and a full connect timeout on every one of
+    // those, which on the deep tail is most of the run's budget spent on names
+    // that cannot resolve.
+    if entry.status == 0 && host.split('.').count() == 2 && registered(&host).await {
         let www = format!("www.{host}");
         let second = umi_crawl::fetch_entry(fetch, &origin(&www), Tier::Plain, now_ms).await;
         if second.status != 0 {
@@ -430,6 +439,17 @@ async fn one(fetch: &Ladder, host: String, now_ms: u64) -> RobotsRow {
         }
     }
     RobotsRow::build(&host, &entry)
+}
+
+/// Whether the apex might exist, so that a `www.` under it is worth a request.
+///
+/// The lookup is free in the only case that matters. The fetch above has just
+/// asked for this same name and lost, so the answer is sitting in the
+/// resolver's negative cache and this does not leave the box.
+async fn registered(host: &str) -> bool {
+    umi_fetch::resolver::Resolver::shared()
+        .registered(host)
+        .await
 }
 
 /// The origin to ask, which is https and nothing else.

@@ -31,6 +31,8 @@ use std::time::Duration;
 use hickory_resolver::TokioResolver;
 use hickory_resolver::config::{LookupIpStrategy, NameServerConfig, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::{DnsError, NetError};
+use hickory_resolver::proto::op::ResponseCode;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 /// How many answers to keep. A broad crawl comes back to a host many times
@@ -117,6 +119,37 @@ impl Resolver {
         }
     }
 
+    /// Whether this name exists in the DNS at all.
+    ///
+    /// False for NXDOMAIN and true for everything else, including a lookup
+    /// that timed out or came back SERVFAIL, because not knowing is not the
+    /// same as knowing there is nothing there.
+    ///
+    /// What this is for is deciding whether a name below this one is worth
+    /// asking about. RFC 8020 says a name under a name that does not exist
+    /// does not exist either, so an NXDOMAIN on `example.com` settles
+    /// `www.example.com` without a second query. Measured against the domain
+    /// list, 88 percent of dead apexes at rank two million and 97 percent at
+    /// rank five and a half million are NXDOMAIN, so almost every `www.`
+    /// fallback we were doing was a lookup and a connect timeout spent on a
+    /// name that cannot resolve.
+    ///
+    /// Cheap where it matters. The caller has just tried to fetch this host,
+    /// so the answer is in the resolver's negative cache and this does not
+    /// leave the box.
+    pub async fn registered(&self, host: &str) -> bool {
+        let Some(resolver) = self.get() else {
+            // No DNS configuration is not evidence about this name, and a
+            // fallback that never fires is worse than one that fires too
+            // often.
+            return true;
+        };
+        match resolver.lookup_ip(host).await {
+            Ok(_) => true,
+            Err(err) => !nonexistent(&err),
+        }
+    }
+
     /// The resolver, built if this is the first call.
     ///
     /// Returns `None` when the platform has no usable DNS configuration at
@@ -149,6 +182,21 @@ impl Resolver {
         let _ = self.inner.set(built);
         self.inner.get()
     }
+}
+
+/// Whether a failed lookup failed because the name is not there.
+///
+/// Only the NXDOMAIN response code counts. A `NoRecordsFound` carrying
+/// `NoError` is the other half of the same variant and means the opposite
+/// thing: the zone exists and this label has records of some other type, or
+/// subzones, which is exactly the case where a `www.` under it is likely to
+/// work.
+fn nonexistent(err: &NetError) -> bool {
+    matches!(
+        err,
+        NetError::Dns(DnsError::NoRecordsFound(no_records))
+            if no_records.response_code == ResponseCode::NXDomain
+    )
 }
 
 /// The resolvers named in the environment, if any are.
@@ -236,6 +284,42 @@ mod tests {
         );
         assert!(addresses("").is_empty());
         assert!(addresses("localhost").is_empty());
+    }
+
+    #[test]
+    fn only_nxdomain_says_the_name_is_not_there() {
+        use hickory_resolver::net::NoRecords;
+        use hickory_resolver::proto::op::Query;
+        use hickory_resolver::proto::rr::RecordType;
+
+        let query = Query::query("example.com.".parse().expect("name"), RecordType::A);
+        let no_such_name = NetError::Dns(DnsError::NoRecordsFound(NoRecords::new(
+            query.clone(),
+            ResponseCode::NXDomain,
+        )));
+        assert!(nonexistent(&no_such_name));
+
+        // The zone is there and this label simply has no A record, which is
+        // the case a `www.` fallback exists for.
+        let no_such_record = NetError::Dns(DnsError::NoRecordsFound(NoRecords::new(
+            query,
+            ResponseCode::NoError,
+        )));
+        assert!(!nonexistent(&no_such_record));
+
+        // Nobody answered, which is not evidence either way.
+        assert!(!nonexistent(&NetError::Dns(DnsError::ResponseCode(
+            ResponseCode::ServFail
+        ))));
+        assert!(!nonexistent(&NetError::Busy));
+    }
+
+    #[tokio::test]
+    async fn a_name_the_platform_knows_counts_as_registered() {
+        // The same hosts file trick the lookup test uses, because CI has no
+        // network and the only name worth asking about is the one the
+        // platform answers on its own.
+        assert!(Resolver::shared().registered("localhost").await);
     }
 
     #[tokio::test]
