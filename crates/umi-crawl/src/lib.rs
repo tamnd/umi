@@ -29,6 +29,7 @@
 pub mod backpressure;
 pub mod clock;
 pub mod digest;
+pub mod evict;
 pub mod fetch;
 pub mod frontier;
 pub mod ledger;
@@ -43,6 +44,8 @@ pub mod sitemap;
 
 #[cfg(test)]
 mod backpressure_tests;
+#[cfg(test)]
+mod evict_tests;
 #[cfg(test)]
 mod frontier_tests;
 #[cfg(test)]
@@ -63,6 +66,7 @@ mod tests;
 pub use backpressure::{Allowance, Backpressure, Cause, Ladder, Signals, Transition};
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use digest::extract_digest;
+pub use evict::spill_into;
 pub use fetch::Fetch;
 pub use frontier::FrontierBuilder;
 pub use ledger::{Recorded, SupervisedLedger};
@@ -73,5 +77,5 @@ pub use run::{CrawlConfig, CrawlError, Crawler, Live, Sink, TickReport};
 pub use scope::{
     Budget, ContentFilter, Corpus, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,
 };
-pub use sink::{Rows, Sealed, SegmentInfo, SegmentSink, Streams};
+pub use sink::{Placement, Rows, Sealed, SegmentInfo, SegmentSink, Streams};
 pub use sitemap::{SitemapLimits, SitemapReport};
