@@ -545,6 +545,43 @@ impl Hub {
         Ok(entries.into_iter().filter_map(Entry::file).collect())
     }
 
+    /// Every dataset repository an organisation owns, fully qualified.
+    ///
+    /// For the jobs that are about the repositories themselves rather than
+    /// about a file in one: refreshing a card, checking that every week's
+    /// slice got a manifest, seeing what a year of publishing actually made.
+    /// The caller decides which of them are umi's, because an organisation
+    /// holds other things too.
+    ///
+    /// # Errors
+    ///
+    /// When the hub will not list. An organisation with nothing in it is an
+    /// empty listing rather than an error.
+    pub async fn datasets(&self, org: &str) -> Result<Vec<String>> {
+        /// Only the name is wanted. The endpoint returns downloads, likes,
+        /// tags and a description alongside it and none of that is this
+        /// method's business.
+        #[derive(Deserialize)]
+        struct Listed {
+            id: String,
+        }
+
+        // A thousand is the endpoint's ceiling per call and the project is a
+        // long way from it. When it stops being, this grows a cursor rather
+        // than a bigger number, because the hub pages with a Link header and
+        // quietly truncating a listing is how a card refresh starts skipping
+        // repositories without saying so.
+        let url = format!("{}/api/datasets?author={org}&limit=1000", self.base);
+        let response = self
+            .send_allowing("listing the organisation", &[404], || self.client.get(&url))
+            .await?;
+        if response.status == 404 {
+            return Ok(Vec::new());
+        }
+        let listed = response.into_json::<Vec<Listed>>("listing the organisation")?;
+        Ok(listed.into_iter().map(|repo| repo.id).collect())
+    }
+
     /// One file, or `None` if the hub does not have it.
     ///
     /// Doc 12.7's first condition is about a single object and this is the

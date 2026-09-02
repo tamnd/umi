@@ -13,6 +13,7 @@
 pub mod addresses;
 pub mod bandwidth;
 pub mod block;
+pub mod cards;
 pub mod config;
 pub mod crawl;
 pub mod doctor;
