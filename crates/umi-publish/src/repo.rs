@@ -112,6 +112,12 @@ impl Family {
     /// `umi-pages-of-something` and `umi-pagesomething` would both come back
     /// as pages, and a repository whose name merely starts with the same
     /// letters is not a member of the family.
+    ///
+    /// A focused crawl's repository is pages too, and it is
+    /// [`Corpus::of_repo`] rather than this that says so, because the family
+    /// on its own is not enough to write that repository's card: the card
+    /// carries the scope name and the warning that the rows are not an
+    /// unbiased sample, and both of those come off the corpus.
     #[must_use]
     pub fn of_repo(name: &str) -> Option<Self> {
         let bare = name.rsplit('/').next().unwrap_or(name);
@@ -328,6 +334,41 @@ impl Corpus {
             org: org.to_owned(),
             focus: Some(slug(name)),
         }
+    }
+
+    /// The corpus and family that would have produced a repository name.
+    ///
+    /// The inverse of [`Corpus::locate`] as far as the repository name goes,
+    /// which is as far as anything needs it. `None` for a name this crate
+    /// would not have generated, so a caller sweeping an organisation can tell
+    /// umi's repositories from everyone else's without a list.
+    ///
+    /// The focused case is the reason this exists rather than
+    /// [`Family::of_repo`] alone. A focused crawl publishes its pages to
+    /// `umi-focus-<scope>`, and that repository's card says which scope it is
+    /// and that the rows are not an unbiased sample of the web. A caller that
+    /// only asked for the family would either skip those repositories or, far
+    /// worse, write the general corpus card over them and delete the warning.
+    ///
+    /// The scope comes back as the slug rather than as whatever the operator
+    /// typed, because the slug is what the name preserved and [`slug`] does
+    /// not invert. Running it through [`Corpus::focused`] again is a no op, so
+    /// a corpus from here locates to the repository it came from.
+    #[must_use]
+    pub fn of_repo(org: &str, name: &str) -> Option<(Self, Family)> {
+        let bare = name.rsplit('/').next().unwrap_or(name);
+        if let Some(focus) = bare.strip_prefix("umi-focus-")
+            && !focus.is_empty()
+        {
+            return Some((
+                Self {
+                    org: org.to_owned(),
+                    focus: Some(focus.to_owned()),
+                },
+                Family::Pages,
+            ));
+        }
+        Family::of_repo(bare).map(|family| (Self::new(org), family))
     }
 
     /// Where a segment of this family goes.
@@ -557,5 +598,35 @@ mod tests {
         ] {
             assert_eq!(Family::of_repo(name), want, "name {name:?}");
         }
+    }
+
+    #[test]
+    fn a_focused_repository_reads_back_to_the_corpus_that_made_it() {
+        let corpus = super::Corpus::focused("open-index", "blog.rust-lang.org");
+        let ulid = Ulid::new(ms(2026, 8, 17), [3; 10]);
+        let repo = corpus.locate(Family::Pages, ms(2026, 8, 17), 0, ulid).repo;
+
+        // Round trip. The name the corpus produced reads back to a corpus that
+        // produces the same name, which is what makes it safe to write a card
+        // from a listing rather than from the crawl that published it.
+        let (back, family) = super::Corpus::of_repo("open-index", &repo).expect("focused");
+        assert_eq!(family, Family::Pages);
+        assert_eq!(back, corpus);
+        assert_eq!(
+            back.locate(Family::Pages, ms(2026, 8, 17), 0, ulid).repo,
+            repo
+        );
+
+        // Everything else in the organisation comes back as the general corpus,
+        // or as nothing at all.
+        assert_eq!(
+            super::Corpus::of_repo("open-index", "open-index/umi-robots"),
+            Some((super::Corpus::new("open-index"), Family::Robots))
+        );
+        assert_eq!(super::Corpus::of_repo("open-index", "ccrawl-domains"), None);
+        // A prefix with no scope after it is not a focused crawl, it is a
+        // repository somebody named badly, and guessing at an empty scope
+        // would write a card claiming a focus that does not exist.
+        assert_eq!(super::Corpus::of_repo("open-index", "umi-focus-"), None);
     }
 }
