@@ -428,6 +428,10 @@ struct RobotsArgs {
     /// Only files under this prefix, when the source is a dataset.
     #[arg(long)]
     prefix: Option<String>,
+    /// Do not ask hosts a published robots corpus already answers for. Bare
+    /// for the corpus this project publishes, or name another one.
+    #[arg(long, num_args = 0..=1, default_missing_value = robots::KNOWN, value_name = "REPO")]
+    known: Option<String>,
 
     /// Simultaneous in flight fetches.
     #[arg(long, default_value_t = robots::CONCURRENCY)]
@@ -457,6 +461,7 @@ impl RobotsArgs {
             source: self.source.clone(),
             column: self.column.clone(),
             prefix: self.prefix.clone(),
+            known: self.known.clone(),
             out: self.out.clone(),
             concurrency: self.concurrency,
             limit: self.limit,

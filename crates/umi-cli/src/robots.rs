@@ -26,6 +26,32 @@
 //! because the fleet's disks are a cache and not a library, and two gigabytes
 //! of hostnames sitting on every box is two gigabytes not holding pages.
 //!
+//! # Not asking twice
+//!
+//! A run has no memory of any run before it. Two runs whose rank bands overlap
+//! at all ask the same hosts, and the corpus shows what that costs: counted on
+//! 2026-09-02 over 18,515,689 published rows there were 14,244,161 distinct
+//! hosts, so 4,271,528 rows, 23.1 percent of the corpus, were a host somebody
+//! had already fetched. It is not history either, since every one of those rows
+//! was written inside a single day. And it is not a run repeating itself: of the
+//! 4,266,753 hosts with more than one row, 4,266,751 have exactly one row per
+//! file, so no run ever wrote a host twice and every duplicate came from a
+//! second run covering ground the first had already covered.
+//!
+//! `--known` fixes that by reading the host column of the published corpus
+//! before it starts and dropping any host already in it. Reading only that
+//! column is what makes it affordable: the column is about 2.8 megabytes of a
+//! 147 megabyte file, so the whole corpus at 121 million hosts is somewhere
+//! near a gigabyte over the wire rather than sixty eight, and one ranged read
+//! per row group is a few thousand small requests against a run that then
+//! fetches for hours.
+//!
+//! The list is held as a sorted vector of eight byte host ids and searched, not
+//! a hash set, because the memory is what bounds it: 121 million hosts is 968
+//! megabytes packed and closer to two and a half gigabytes in a hash set at a
+//! sensible load factor. On server2 with 11 GB that is the difference between
+//! comfortable and not.
+//!
 //! # Politeness
 //!
 //! One request per host, and a second one only when the first got no answer at
@@ -55,7 +81,7 @@ use umi_crawl::{
 };
 use umi_fetch::{FetchConfig, Ladder, Tier};
 use umi_file::{StreamKind, WriterConfig};
-use umi_publish::{BlockEntry, Hub};
+use umi_publish::{BlockEntry, Hub, HubFile, footer, read_column};
 use umi_state::{State, Stream};
 use umi_state_sqlite::SqliteState;
 use umi_types::HostId;
@@ -73,6 +99,25 @@ pub const DOMAINS: &str = "open-index/ccrawl-domains";
 
 /// The column in the default list that holds a registrable domain.
 pub const DOMAIN_COLUMN: &str = "domain";
+
+/// The corpus a run reads to find out what it already has an answer for.
+///
+/// Spelled out rather than built from `umi_publish::repo::ORG` and the robots
+/// family's stem because a constant cannot format, and this is the same literal
+/// those two produce. An operator publishing to another organisation passes
+/// `--known org/name` and gets their own.
+pub const KNOWN: &str = "open-index/umi-robots";
+
+/// The column in the published corpus that holds a hostname.
+const HOST_COLUMN: &str = "host";
+
+/// How many published files a run reads the host column of at once.
+///
+/// The reads are small and almost all of the time is the round trip, so this is
+/// about hiding latency rather than about bandwidth. Eight is enough to keep
+/// the link busy and few enough that a run does not open a connection per file
+/// against a corpus of several hundred.
+const KNOWN_FILES: usize = 8;
 
 /// How many fetches a run keeps in flight when nobody says otherwise.
 ///
@@ -138,6 +183,9 @@ pub struct Options {
     /// with a year of snapshots in it is one repository and a run wants one
     /// snapshot.
     pub prefix: Option<String>,
+    /// A published robots corpus to read before starting, so that hosts it
+    /// already answers for are not asked again.
+    pub known: Option<String>,
     /// Where to write.
     pub out: Option<String>,
     /// Simultaneous in flight fetches.
@@ -161,6 +209,7 @@ impl Default for Options {
             source: DOMAINS.to_owned(),
             column: DOMAIN_COLUMN.to_owned(),
             prefix: None,
+            known: None,
             out: None,
             concurrency: CONCURRENCY,
             limit: None,
@@ -246,6 +295,10 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
     let mut summary = Summary::default();
     let mut counts = Counts::default();
 
+    // Before the run rather than inside it, because the last progress line is
+    // printed after the run has finished and wants the same list the run used.
+    let known = runtime.block_on(known(options, &mut log))?;
+
     let result = runtime.block_on(async {
         if let Some(publisher) = &publisher {
             let org = options
@@ -273,7 +326,8 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
         ))?;
 
         let (tx, mut rx) = mpsc::channel::<String>(QUEUE);
-        let reader = tokio::spawn(source.drive(Admit::new(options, blocked), tx));
+        let reader =
+            tokio::spawn(source.drive(Admit::new(options, blocked, Arc::clone(&known)), tx));
 
         // Converting a segment and pushing it to the hub takes minutes and it
         // used to happen inline, between one completed fetch and the next. The
@@ -364,7 +418,9 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
             let now_ms = clock.now_ms();
             if now_ms.saturating_sub(said_ms) >= PROGRESS.as_millis() as u64 {
                 said_ms = now_ms;
-                log.line(&progress(&summary, &counts, &again, started_ms, now_ms))?;
+                log.line(&progress(
+                    &summary, &counts, &again, &known, started_ms, now_ms,
+                ))?;
             }
             if let Some(limit) = max_duration
                 && now_ms.saturating_sub(started_ms) >= limit.as_millis() as u64
@@ -416,7 +472,9 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
     });
 
     let now_ms = clock.now_ms();
-    log.line(&progress(&summary, &counts, &again, started_ms, now_ms))?;
+    log.line(&progress(
+        &summary, &counts, &again, &known, started_ms, now_ms,
+    ))?;
     result?;
     Ok(summary)
 }
@@ -693,6 +751,139 @@ async fn blocked(
         .collect())
 }
 
+/// The hosts a published corpus already has an answer for.
+///
+/// A sorted vector rather than a `HashSet`, for the reason in the module doc:
+/// at 121 million hosts the vector is 968 megabytes and holds no slack, and a
+/// hash set of the same thing is nearer two and a half gigabytes. A binary
+/// search is a couple of dozen cache misses and this is consulted once per host
+/// on a path whose next step is a DNS lookup, so the lookup cost does not show
+/// up anywhere a run can measure.
+#[derive(Default)]
+pub struct Known {
+    /// Sorted and deduplicated.
+    hosts: Vec<HostId>,
+    /// How many hosts this run did not ask because they were in the list.
+    skipped: AtomicU64,
+}
+
+impl Known {
+    /// Whether the corpus already answers for this host.
+    fn holds(&self, host: &HostId) -> bool {
+        self.hosts.binary_search(host).is_ok()
+    }
+
+    /// How many hosts the list carries.
+    fn len(&self) -> usize {
+        self.hosts.len()
+    }
+
+    /// No list, which is what a run without `--known` uses.
+    #[cfg(test)]
+    fn none() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// A list of the given hosts, for tests that do not want a hub.
+    #[cfg(test)]
+    fn of(hosts: &[&str]) -> Arc<Self> {
+        let mut hosts: Vec<HostId> = hosts
+            .iter()
+            .map(|host| HostId::derive(host.as_bytes()))
+            .collect();
+        hosts.sort_unstable();
+        Arc::new(Self {
+            hosts,
+            skipped: AtomicU64::new(0),
+        })
+    }
+}
+
+/// Read the host column of every file in a published robots corpus.
+///
+/// Nothing when the operator did not ask for one, which is the default: a run
+/// that names no corpus behaves exactly as it did before.
+///
+/// A file that will not open is logged and skipped rather than failing the run.
+/// The list is an optimisation, so a corpus that is half readable makes a run
+/// ask for more hosts than it needed to, which is the old behaviour and not a
+/// wrong answer. Failing here would instead turn a transient hub error into a
+/// run that does not start.
+async fn known(options: &Options, log: &mut crawl::Log) -> Result<Arc<Known>, Error> {
+    let Some(repo) = &options.known else {
+        return Ok(Arc::new(Known::default()));
+    };
+    // No token, for the same reason the domain list is read without one: the
+    // corpus is public and a run a stranger cannot reproduce is not much of a
+    // corpus.
+    let hub = Hub::new("")?;
+    let mut files: Vec<String> = hub
+        .list(repo, "data")
+        .await?
+        .into_iter()
+        .map(|remote| remote.path)
+        .filter(|path| path.ends_with(".parquet"))
+        .collect();
+    files.sort();
+    log.line(&format!(
+        "reading the host column of {} published files from {repo}",
+        files.len()
+    ))?;
+
+    let mut hosts: Vec<HostId> = Vec::new();
+    let mut chunks = files.chunks(KNOWN_FILES);
+    for batch in &mut chunks {
+        let mut reading = FuturesUnordered::new();
+        for path in batch {
+            reading.push(one_file(&hub, repo, path));
+        }
+        while let Some(found) = reading.next().await {
+            match found {
+                Ok(found) => hosts.extend(found),
+                Err(cause) => log.line(&format!("could not read a published file: {cause}"))?,
+            }
+        }
+    }
+
+    hosts.sort_unstable();
+    hosts.dedup();
+    log.line(&format!(
+        "{} hosts already have an answer and will not be asked again",
+        hosts.len()
+    ))?;
+    Ok(Arc::new(Known {
+        hosts,
+        skipped: AtomicU64::new(0),
+    }))
+}
+
+/// The hosts in one published file, as ids.
+///
+/// Ids and not strings, because the strings are the whole reason this would not
+/// fit: 121 million hostnames average about twenty bytes each plus a pointer, a
+/// length and a capacity, which is over four gigabytes before any of them is
+/// compared. Hashing each one as it arrives and keeping eight bytes turns that
+/// into 968 megabytes, and the id is what [`Admit`] compares against anyway.
+async fn one_file(hub: &Hub, repo: &str, path: &str) -> Result<Vec<HostId>, Error> {
+    let source = HubFile::open(hub, repo, path).await?;
+    let metadata = Arc::new(footer(&source).await?);
+    let batches = read_column(&source, &metadata, HOST_COLUMN).await?;
+    let mut found = Vec::new();
+    for batch in batches {
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or_else(|| Error::NoColumn(HOST_COLUMN.to_owned()))?;
+        for i in 0..values.len() {
+            if values.is_valid(i) {
+                found.push(HostId::derive(values.value(i).as_bytes()));
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// Where the hosts come from.
 enum Source {
     /// A file of hosts, or standard input.
@@ -899,6 +1090,7 @@ fn hosts_in(bytes: Vec<u8>, column: &str) -> Result<Vec<String>, Error> {
 struct Admit {
     seen: HashSet<HostId>,
     blocked: HashSet<String>,
+    known: Arc<Known>,
     skip: u64,
     limit: Option<u64>,
     passed: u64,
@@ -906,10 +1098,11 @@ struct Admit {
 }
 
 impl Admit {
-    fn new(options: &Options, blocked: HashSet<String>) -> Self {
+    fn new(options: &Options, blocked: HashSet<String>, known: Arc<Known>) -> Self {
         Self {
             seen: HashSet::new(),
             blocked,
+            known,
             skip: options.skip,
             limit: options.limit,
             passed: 0,
@@ -934,7 +1127,17 @@ impl Admit {
         if self.blocked.contains(&host) || blocked_under(&self.blocked, &host) {
             return None;
         }
-        if !self.seen.insert(HostId::derive(host.as_bytes())) {
+        let id = HostId::derive(host.as_bytes());
+        if !self.seen.insert(id) {
+            return None;
+        }
+        // Last of the four, and after the limit rather than before it, so that
+        // `--limit` still means how many hosts this run asks. A run pointed at
+        // a corpus that already covers its whole band asks nothing and stops
+        // when the list runs out, which is the right answer and the one the
+        // duplicate rows in the corpus exist because nothing gave.
+        if self.known.holds(&id) {
+            self.known.skipped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         self.sent += 1;
@@ -1054,11 +1257,12 @@ fn progress(
     summary: &Summary,
     counts: &Counts,
     again: &Again,
+    known: &Known,
     started_ms: u64,
     now_ms: u64,
 ) -> String {
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
-    format!(
+    let mut line = format!(
         "{} hosts  {:.1} h/s  {} with rules  {} with none  {} refused  {} silent  \
          {} of {} second asks answered  {} rows  {} files  {} MB stored",
         summary.fetched,
@@ -1072,7 +1276,16 @@ fn progress(
         summary.rows,
         summary.files,
         summary.bytes_stored / (1 << 20),
-    )
+    );
+    // Only when there is a list, because a run without one would otherwise
+    // carry two zeroes that never move and say nothing.
+    if known.len() > 0 {
+        line.push_str(&format!(
+            "  {} already answered",
+            known.skipped.load(Ordering::Relaxed),
+        ));
+    }
+    line
 }
 
 #[cfg(test)]
