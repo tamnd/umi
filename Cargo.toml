@@ -201,7 +201,7 @@ hex = "0.4"
 # the only place in the tree that needs it, and it is here rather than in one
 # crate's dependencies so that a second caller does not arrive with a second
 # version of the same twenty lines.
-base64 = "0.22"
+base64 = "0.23"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
