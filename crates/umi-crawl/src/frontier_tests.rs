@@ -195,7 +195,7 @@ fn a_null_reads_back_as_the_zero_the_local_store_keeps() {
     // ever fetched at the epoch, so a null timestamp and a zero timestamp mean
     // the same thing and the round trip is exact either way.
     let row = pending(4);
-    let back = read_frontier(&batch(&[row.clone()])).expect("read");
+    let back = read_frontier(&batch(std::slice::from_ref(&row))).expect("read");
     let got = &back[0];
 
     assert_eq!(got.row.last_fetch_ms, 0);
