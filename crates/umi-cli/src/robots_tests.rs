@@ -7,7 +7,9 @@
 
 use std::collections::HashSet;
 
-use super::{Admit, Counts, Options, Source, host_of, hosts_in};
+use std::sync::atomic::Ordering;
+
+use super::{Admit, Again, Counts, Options, Source, host_of, hosts_in, progress};
 
 #[test]
 fn a_list_written_by_a_person_still_reads_as_hosts() {
@@ -205,4 +207,40 @@ fn the_four_numbers_say_what_the_web_said() {
     assert_eq!(counts.none, 2, "a 404 and a 410 both say there is no file");
     assert_eq!(counts.refused, 2, "a 503 and a 429 are both a refusal");
     assert_eq!(counts.silent, 1, "one host never answered at all");
+}
+
+#[test]
+fn the_run_says_how_much_the_second_ask_is_recovering() {
+    // The second ask is a guess about the network and the progress line is
+    // where the guess gets checked. A run whose second asks are answering
+    // almost nothing is a run that should stop making them, and there is no way
+    // to know that from the silent count on its own, because a host recovered
+    // by a second ask is not silent any more and leaves no trace.
+    let again = Again::default();
+    again.asked.fetch_add(10, Ordering::Relaxed);
+    again.answered.fetch_add(3, Ordering::Relaxed);
+
+    let line = progress(
+        &crate::crawl::Summary::default(),
+        &Counts::default(),
+        &again,
+        1000,
+        2000,
+    );
+    assert!(
+        line.contains("3 of 10 second asks answered"),
+        "the line does not say what the retry bought: {line}"
+    );
+
+    // A run where nothing has gone silent yet still prints the pair, because a
+    // number that appears partway through a run is one an operator has to
+    // notice rather than read.
+    let quiet = progress(
+        &crate::crawl::Summary::default(),
+        &Counts::default(),
+        &Again::default(),
+        1000,
+        2000,
+    );
+    assert!(quiet.contains("0 of 0 second asks answered"), "{quiet}");
 }
