@@ -42,6 +42,7 @@ umi state evict <pld>         push a shard out
 umi checkpoint                write a portable state checkpoint, doc 8.5
 
 umi publish <dir>             push through the doc 12 pipeline
+umi evict <dir>               move the backlog to the hub and free the disk, doc 8.6
 umi verify <repo|dir>         re verify manifests, signatures and digests
 umi manifest <repo>           print or validate a manifest chain
 
@@ -55,7 +56,7 @@ umi peers                     coordinator peering state
 umi fetchers                  connected fetchers, reputation, rates, doc 06
 ```
 
-Twenty seven commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
+Twenty eight commands is more than a small tool and fewer than a platform. The test for adding one is whether it does something the others cannot compose into.
 
 `--publish` is a flag on all three of `crawl`, `resume` and `watch`, and it means the same thing on each one. A crawl started with it and resumed without it keeps its next segments locally, which is deliberate: the flag is the operator saying what this run should do, not a property the directory remembers, because the two things it needs are secrets and secrets do not belong in a directory that gets moved around.
 
@@ -140,6 +141,26 @@ Both kinds of local file are picked up. `data/*.parquet` is what a finished craw
 Everything after that is doc 12, unchanged. The same eight steps, the same read back, the same signed day manifest, and the same four conditions in doc 12.7 before a local file is deleted. A directory with nothing left to publish is exit 3. A run where some files published and others did not prints what it did and then exits on the worst failure it saw, so a script does not read a partial success as a success.
 
 It does not crawl, seed or extract. If the directory is short of pages the answer is `umi resume`, and this stays the command that publishes what is there.
+
+### `umi evict`
+
+```
+umi evict ./example.com
+umi evict ./example.com --limit 5000
+umi evict ./example.com --dry-run
+```
+
+Doc 8.6's evict, run as a command. A crawl admits far more URLs than it fetches, because every link on every page is a candidate and most of them are never due, and all of them sit in the ledger taking room on a disk doc 15 says is a cache. At 100 billion URLs the state is around 2 TB against 342 GB of free local disk on the fleet, so the backlog is the thing that fills the disks and it has to live somewhere else.
+
+Somewhere else is `open-index/umi-frontier-*`, published exactly the way pages and robots are published, with the same manifests, the same digests and the same signatures. Five steps in this order: write the coldest domains into a frontier segment, publish it, check the read back digest, record where each domain went, and only then drop the local rows. The order is doc 12.7's fourth condition applied to state instead of to pages, and the consequence worth stating plainly is that a run which publishes nothing deletes nothing. If the hub is unreachable this writes a segment, fails to upload it, and leaves every domain where it was.
+
+The index write comes before the delete and both are durable. A crash between the delete and the index write would leave a domain that is neither local nor findable, which loses the backlog. A crash the other way round leaves a domain that is both local and pointed at, which costs disk and nothing else.
+
+A domain with a lease in flight is kept, because dropping it would leave the completion with nowhere to land. So is a domain too big to write in one piece, since a domain has to land in one file for the index entry to name it, and refusing one leaves it resident while writing it across a segment roll would leave an index that lies.
+
+`--limit` is how many domains to move and defaults to a thousand, which is a segment or two and a few minutes of uploading. A scheduler under disk pressure calls this repeatedly rather than once, because a run that goes wrong should have gone wrong on a thousand domains rather than on the whole store. `--dry-run` says how many would move and moves none.
+
+This is the bulk operation. `umi state evict <pld>` next to it is the single domain one, for looking at a specific site, and it is the same five steps with a list of one.
 
 ### `umi resume` and `umi watch`
 

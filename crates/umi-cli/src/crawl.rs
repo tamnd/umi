@@ -104,6 +104,12 @@ const SEGMENTS: &str = "segments";
 /// pages. A separate directory because doc 10.1 gives a segment one stream and
 /// because the two are published to different repositories.
 const ROBOTS: &str = "robots";
+
+/// Where doc 08.6's spilled backlog goes, under `segments/`. Its own directory
+/// for the same reason robots has one: a segment header names one stream and a
+/// sink writes one directory, so two streams in a crawl directory is two
+/// directories.
+const FRONTIER: &str = "frontier";
 const DATA: &str = "data";
 const MANIFEST: &str = "manifest.json";
 const LOG: &str = "crawl.log";
@@ -751,7 +757,7 @@ fn rows_in(path: &Path) -> Result<u64, Error> {
 /// `profile.toml` is doc 13.5's first entry and it is what tells a crawl
 /// directory apart from any other directory, so the error says that rather than
 /// repeating the operating system's word for a missing file.
-fn profile_of(dir: &Path) -> Result<Scope, Error> {
+pub(crate) fn profile_of(dir: &Path) -> Result<Scope, Error> {
     let text = std::fs::read_to_string(dir.join(PROFILE)).map_err(|cause| {
         Error::Io(std::io::Error::new(
             cause.kind(),
@@ -779,6 +785,7 @@ pub(crate) struct Layout {
     pub(crate) segments: PathBuf,
     pub(crate) robots_segments: PathBuf,
     pub(crate) robots_data: PathBuf,
+    pub(crate) frontier_segments: PathBuf,
     pub(crate) data: PathBuf,
     pub(crate) staging: PathBuf,
     pub(crate) manifest: PathBuf,
@@ -794,6 +801,7 @@ impl Layout {
         Ok(Self {
             robots_segments: dir.join(SEGMENTS).join(ROBOTS),
             robots_data: dir.join(DATA).join(ROBOTS),
+            frontier_segments: dir.join(SEGMENTS).join(FRONTIER),
             profile: dir.join(PROFILE),
             state: dir.join(STATE),
             segments: dir.join(SEGMENTS),
