@@ -491,7 +491,11 @@ const FRONTIER: &[(&str, &str)] = &[
     ("fetch_count", "How many times it has been fetched."),
     (
         "change_count",
-        "How many of those fetches found different content. The two counts together are the change rate estimator doc 09 schedules on.",
+        "How many of those fetches found different content.",
+    ),
+    (
+        "observed_secs",
+        "How long the URL has been watched for, in seconds, summed over the intervals we actually served rather than measured from the first fetch. This and `change_count` together are the change rate estimator doc 09 schedules on: two changes in a week and two changes in a year are the same count and want very different refetch intervals.",
     ),
     (
         "content_hash",
