@@ -226,6 +226,18 @@ pub enum Upload {
         /// The bytes.
         bytes: Vec<u8>,
     },
+    /// A file to take out of the repository.
+    ///
+    /// It is a variant of this enum rather than a separate call because doc
+    /// 12.5's manifest names every file in its day, so a commit that removes a
+    /// file without rewriting the manifest leaves the repository describing
+    /// something that is not there. Putting both in one commit means there is
+    /// no moment at which a reader can see one and not the other, and the hub
+    /// applies a commit whole or not at all.
+    Delete {
+        /// Where it is in the repository.
+        path: String,
+    },
 }
 
 impl Upload {
@@ -233,8 +245,14 @@ impl Upload {
     #[must_use]
     pub fn path(&self) -> &str {
         match self {
-            Self::Blob { path, .. } | Self::Inline { path, .. } => path,
+            Self::Blob { path, .. } | Self::Inline { path, .. } | Self::Delete { path } => path,
         }
+    }
+
+    /// Whether this takes a file out rather than putting one in.
+    #[must_use]
+    pub const fn is_delete(&self) -> bool {
+        matches!(self, Self::Delete { .. })
     }
 }
 
@@ -658,7 +676,7 @@ impl Hub {
         files
             .iter()
             .map(|file| match file {
-                Upload::Inline { .. } => Ok(Mode::Inline),
+                Upload::Inline { .. } | Upload::Delete { .. } => Ok(Mode::Inline),
                 Upload::Blob { path, sha256, .. } => {
                     let said = answer
                         .files
@@ -833,6 +851,10 @@ impl Hub {
 
         for (file, mode) in files.iter().zip(plan) {
             let line = match (file, mode) {
+                (Upload::Delete { path }, _) => serde_json::json!({
+                    "key": "deletedFile",
+                    "value": { "path": path },
+                }),
                 (Upload::Inline { path, bytes }, _) => serde_json::json!({
                     "key": "file",
                     "value": {

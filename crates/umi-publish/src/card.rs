@@ -131,7 +131,7 @@ fn heading(corpus: &Corpus, family: Family) -> String {
         _ => family.stem().to_owned(),
     };
     format!(
-        "# {name}\n\nPart of [umi](https://github.com/tamnd/umi), an open web crawl published as Parquet. Before you use any of this, read the exclusion list at [`{META_REPO}`](https://huggingface.co/datasets/{META_REPO}) and filter the rows it names. Published files are never rewritten and never deleted, so the exclusion list is how a takedown reaches you, and applying it is a condition of using the data rather than a suggestion.\n{focus}\n{what}\n\n"
+        "# {name}\n\nPart of [umi](https://github.com/tamnd/umi), an open web crawl published as Parquet. Before you use any of this, read the exclusion list at [`{META_REPO}`](https://huggingface.co/datasets/{META_REPO}) and filter the rows it names. Published files are never rewritten, so the exclusion list is how a takedown reaches you, and applying it is a condition of using the data rather than a suggestion.\n{focus}\n{what}\n\n"
     )
 }
 
@@ -228,7 +228,7 @@ fn reading(corpus: &Corpus) -> String {
 /// The exclusion list, again, with the paths on it.
 fn exclusions() -> String {
     format!(
-        "## Corrections\n\nWe never rewrite a published file and we never delete one, because both break every checksum anyone recorded and make old work unreproducible. Corrections go on an append only exclusion list in [`{META_REPO}`](https://huggingface.co/datasets/{META_REPO}) under `blocks/`, naming a repository and a file and either a row predicate or a set of `url_key` values, with a reason and a date. Apply it as a filter when you read.\n\nEvery day folder has a manifest under `_manifest/` listing each file with its digests, and a detached Ed25519 signature next to it. The signing keys are in the same meta repository, so a manifest can be checked without asking us for anything.\n\n"
+        "## Corrections\n\nWe never rewrite a published file, because that breaks every checksum anyone recorded and makes old work unreproducible. Corrections go on an append only exclusion list in [`{META_REPO}`](https://huggingface.co/datasets/{META_REPO}) under `blocks/`, naming a repository and a file and either a row predicate or a set of `url_key` values, with a reason and a date. Apply it as a filter when you read.\n\nEvery day folder has a manifest under `_manifest/` listing each file with its digests, and a detached Ed25519 signature next to it. The signing keys are in the same meta repository, so a manifest can be checked without asking us for anything.\n\nA file being removed is meant to be rare and it is not impossible. When it happens the deletion and the rewritten day manifests go in one commit, the manifest chain is relinked to the end of the repository, and a record naming every removed file with the digest it had goes to the same meta repository under `retractions/` first. So if a digest you recorded stops matching, look there before concluding you were served something altered. Nothing we can do repairs the digest itself.\n\n"
     )
 }
 
