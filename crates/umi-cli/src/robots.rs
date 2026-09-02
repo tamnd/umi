@@ -97,6 +97,15 @@ const QUEUE: usize = 8192;
 /// at the rate a fast run manages.
 const FLUSH: usize = 4096;
 
+/// How many sealed segments can be waiting to be published at once.
+///
+/// One, so that a run cannot get further and further ahead of the hub and end
+/// up holding an unbounded number of finished segments on a disk that is
+/// supposed to be a cache. A segment is 128 MB and takes minutes to upload, so
+/// filling this at all means the network is the bottleneck rather than the
+/// fetching, and blocking the loop at that point is the honest thing to do.
+const SEALED: usize = 1;
+
 /// How often the run says what it is doing.
 const PROGRESS: Duration = Duration::from_secs(10);
 
@@ -219,11 +228,11 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
         // The general corpus, not a focused one, because doc 12.4 puts the
         // robots family in one repository for everybody and a focused name
         // would only change where pages go, and this run has no pages.
-        Some(publishing) => Some(crawl::publisher(
+        Some(publishing) => Some(Arc::new(crawl::publisher(
             publishing,
             &umi_crawl::Scope::general(),
             &layout,
-        )?),
+        )?)),
         None => None,
     };
 
@@ -244,7 +253,7 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
                 log.line("the publishing key was added to the key directory")?;
             }
         }
-        let blocked = blocked(publisher.as_ref(), options).await?;
+        let blocked = blocked(publisher.as_deref(), options).await?;
         if !blocked.is_empty() {
             log.line(&format!(
                 "{} domains on the published block list will not be asked",
@@ -259,6 +268,30 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
 
         let (tx, mut rx) = mpsc::channel::<String>(QUEUE);
         let reader = tokio::spawn(source.drive(Admit::new(options, blocked), tx));
+
+        // Converting a segment and pushing it to the hub takes minutes and it
+        // used to happen inline, between one completed fetch and the next. The
+        // fetches themselves are spawned tasks so they kept running, but
+        // nothing topped the window back up and nothing collected what came
+        // back, so every socket the run had open drained away and then the box
+        // sat idle until the upload finished. On a run that seals a segment
+        // every twenty minutes that is a large fraction of the wall clock spent
+        // doing nothing.
+        //
+        // So it moves to its own task and the loop hands it sealed segments.
+        // The channel is one deep, which is the backpressure: a run cannot get
+        // arbitrarily far ahead of the hub and pile up finished segments on a
+        // disk that is meant to be a cache.
+        let (seal_tx, seal_rx) = mpsc::channel::<Batch>(SEALED);
+        let (news_tx, mut news_rx) = mpsc::channel::<News>(SEALED + 1);
+        let stower = tokio::spawn(stow(
+            seal_rx,
+            news_tx,
+            Arc::clone(&state),
+            publisher.clone(),
+            layout.robots_data.clone(),
+            layout.published.clone(),
+        ));
 
         let mut inflight = FuturesUnordered::new();
         let mut rows: Vec<RobotsRow> = Vec::with_capacity(FLUSH);
@@ -313,18 +346,12 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
             }
 
             if rows.len() >= FLUSH {
-                flush(
-                    &mut rows,
-                    &sink,
-                    &layout,
-                    &*state,
-                    publisher.as_ref(),
-                    &mut summary,
-                    &mut log,
-                    clock.now_ms(),
-                )
-                .await?;
+                flush(&mut rows, &sink, &seal_tx, &mut summary, clock.now_ms()).await?;
             }
+            // Whatever the stower finished while the loop was fetching. Non
+            // blocking, because the point of the whole arrangement is that this
+            // loop never waits on the hub.
+            hear(&mut news_rx, &mut summary, &mut log)?;
 
             let now_ms = clock.now_ms();
             if now_ms.saturating_sub(said_ms) >= PROGRESS.as_millis() as u64 {
@@ -343,32 +370,24 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
         // matters on a run that ended on its budget with a hundred million
         // hosts still to come.
         drop(rx);
-        // The tail rows first, then the open segment, then a second drain to
+        // The tail rows first, then the open segment, then a second pass to
         // pick up what sealing it produced. The other order writes rows into a
         // sink that has already been finished.
-        flush(
-            &mut rows,
-            &sink,
-            &layout,
-            &*state,
-            publisher.as_ref(),
-            &mut summary,
-            &mut log,
-            clock.now_ms(),
-        )
-        .await?;
+        flush(&mut rows, &sink, &seal_tx, &mut summary, clock.now_ms()).await?;
         sink.finish().map_err(|e| Error::Crawl(e.to_string()))?;
-        flush(
-            &mut rows,
-            &sink,
-            &layout,
-            &*state,
-            publisher.as_ref(),
-            &mut summary,
-            &mut log,
-            clock.now_ms(),
-        )
-        .await?;
+        flush(&mut rows, &sink, &seal_tx, &mut summary, clock.now_ms()).await?;
+
+        // Now the loop can wait, because there is nothing left to fetch.
+        // Dropping the sender is what tells the stower there is no more coming,
+        // and until it has finished the last segment is a local file that
+        // nobody has published, so a run that walked away here would be a run
+        // that threw its last twenty minutes of work on the floor.
+        drop(seal_tx);
+        match stower.await {
+            Ok(result) => result?,
+            Err(joined) => return Err(Error::Crawl(joined.to_string())),
+        }
+        hear(&mut news_rx, &mut summary, &mut log)?;
 
         // The reader's own failure, which until here has only been a channel
         // that closed early. A run that stopped because the hub would not
@@ -461,25 +480,43 @@ fn origin(host: &str) -> String {
     format!("https://{host}")
 }
 
-/// Write what has been fetched, and publish whatever that sealed.
+/// Segments that reached their cap, on their way out of the fetch loop.
+struct Batch {
+    /// What sealed.
+    sealed: Vec<umi_crawl::Sealed>,
+    /// The clock reading the loop had when it handed them over, so that the
+    /// ledger rows and the manifest date from when the work finished rather
+    /// than from whenever the upload got round to it.
+    now_ms: u64,
+}
+
+/// What became of one batch, on its way back.
 ///
-/// The same two paths a crawl has. Without a publisher the segment becomes a
-/// Parquet file under `data/robots` and stays there. With one it gets a ledger
-/// row and doc 12.2's pipeline takes it from there, including deleting the
-/// local copy once the four conditions in doc 12.7 hold, which is the whole
-/// point on a box whose disk is a cache.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the alternative is a struct that exists to be one call's argument list"
-)]
+/// It comes back rather than being written where it happened because the
+/// summary and the log belong to the loop, and two writers to a progress line
+/// is how a run ends up reporting numbers that never held at the same instant.
+#[derive(Default)]
+struct News {
+    /// Segments that became a file, published or local.
+    files: usize,
+    /// How many of those went to the hub.
+    published: usize,
+    /// Their size on the hub or on disk.
+    bytes_stored: u64,
+    /// Anything the operator needs to read, in the order it happened.
+    lines: Vec<String>,
+}
+
+/// Write what has been fetched and hand off whatever that sealed.
+///
+/// The write is inline because it is fast and because the order matters: rows
+/// go into the open segment in the order they were fetched. The publishing is
+/// not inline, for the reason in the comment where the stower is spawned.
 async fn flush(
     rows: &mut Vec<RobotsRow>,
     sink: &SegmentSink,
-    layout: &crawl::Layout,
-    state: &dyn State,
-    publisher: Option<&umi_publish::Publisher>,
+    seals: &mpsc::Sender<Batch>,
     summary: &mut Summary,
-    log: &mut crawl::Log,
     now_ms: u64,
 ) -> Result<(), Error> {
     if !rows.is_empty() {
@@ -492,25 +529,87 @@ async fn flush(
     if sealed.is_empty() {
         return Ok(());
     }
-    let Some(publisher) = publisher else {
-        return crawl::keep(&sealed, &layout.robots_data, &mut None, summary);
-    };
-    crawl::record(&sealed, Stream::Robots, state, now_ms).await?;
-    let (done, failed) = publisher.drain(state, now_ms).await?;
-    for published in &done {
-        summary.files += 1;
-        summary.published += 1;
-        summary.bytes_stored += published.bytes;
-        crawl::receipt(&layout.published, published)?;
-        if let Some(blocked) = &published.blocked {
-            log.line(&format!(
-                "{} is on the hub but the local copy stays: {blocked}",
-                published.segment
-            ))?;
+    seals
+        .send(Batch { sealed, now_ms })
+        .await
+        .map_err(|_| Error::Crawl("the publishing task stopped early".to_owned()))
+}
+
+/// Convert and publish sealed segments, away from the loop that is fetching.
+///
+/// The same two paths a crawl has. Without a publisher the segment becomes a
+/// Parquet file under `data/robots` and stays there. With one it gets a ledger
+/// row and doc 12.2's pipeline takes it from there, including deleting the
+/// local copy once the four conditions in doc 12.7 hold, which is the whole
+/// point on a box whose disk is a cache.
+///
+/// One batch at a time and never two at once, which is not just about load:
+/// [`Publisher::drain`](umi_publish::Publisher::drain) works through every
+/// unpublished segment in the ledger rather than the ones it was handed, so two
+/// of these running together would be two uploads of the same file.
+async fn stow(
+    mut batches: mpsc::Receiver<Batch>,
+    news: mpsc::Sender<News>,
+    state: Arc<dyn State>,
+    publisher: Option<Arc<umi_publish::Publisher>>,
+    data: PathBuf,
+    receipts: PathBuf,
+) -> Result<(), Error> {
+    while let Some(batch) = batches.recv().await {
+        let mut said = News::default();
+        match &publisher {
+            None => {
+                let mut summary = Summary::default();
+                crawl::keep(&batch.sealed, &data, &mut None, &mut summary)?;
+                said.files = summary.files;
+                said.bytes_stored = summary.bytes_stored;
+            }
+            Some(publisher) => {
+                crawl::record(&batch.sealed, Stream::Robots, &*state, batch.now_ms).await?;
+                let (done, failed) = publisher.drain(&*state, batch.now_ms).await?;
+                for published in &done {
+                    said.files += 1;
+                    said.published += 1;
+                    said.bytes_stored += published.bytes;
+                    crawl::receipt(&receipts, published)?;
+                    if let Some(blocked) = &published.blocked {
+                        said.lines.push(format!(
+                            "{} is on the hub but the local copy stays: {blocked}",
+                            published.segment
+                        ));
+                    }
+                }
+                for (segment, error) in &failed {
+                    said.lines
+                        .push(format!("{segment} did not publish, will retry: {error}"));
+                }
+            }
+        }
+        // A loop that has already given up is not an error worth failing the
+        // last upload over.
+        if news.send(said).await.is_err() {
+            break;
         }
     }
-    for (segment, error) in &failed {
-        log.line(&format!("{segment} did not publish, will retry: {error}"))?;
+    Ok(())
+}
+
+/// Fold whatever the stower has finished into the run's own counters.
+///
+/// Never waits. The loop calls this between fetches and the whole point of the
+/// stower is that the loop does not stop for the hub.
+fn hear(
+    news: &mut mpsc::Receiver<News>,
+    summary: &mut Summary,
+    log: &mut crawl::Log,
+) -> Result<(), Error> {
+    while let Ok(said) = news.try_recv() {
+        summary.files += said.files;
+        summary.published += said.published;
+        summary.bytes_stored += said.bytes_stored;
+        for line in &said.lines {
+            log.line(line)?;
+        }
     }
     Ok(())
 }
