@@ -38,7 +38,7 @@ use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 use crate::{
     BlockRow, Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow,
     LeaseRequest, NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery, SegmentRow,
-    State, Stream, SupervisionRow, TierPolicy, retry_after_ms,
+    Shard, State, Stream, SupervisionRow, TierPolicy, retry_after_ms,
 };
 
 /// A fixed instant to run every case from, so nothing in here depends on when
@@ -218,6 +218,11 @@ where
     run!(a_seal_window_is_half_open);
     run!(warming_a_domain_the_store_has_never_seen_is_not_an_error);
     run!(evicting_a_domain_that_is_not_resident_is_not_an_error);
+    run!(a_shard_entry_round_trips);
+    run!(an_unevicted_domain_has_no_shard_entry);
+    run!(evicting_a_domain_again_replaces_its_entry);
+    run!(clearing_a_shard_entry_makes_the_domain_look_local_again);
+    run!(shards_answers_the_domains_it_was_asked_about_and_no_others);
     run!(resident_is_sorted_and_free_of_duplicates);
     run!(a_domain_the_store_holds_a_url_for_is_local);
     run!(stats_account_for_what_was_admitted);
@@ -291,6 +296,18 @@ fn published(n: u8) -> SegmentRow {
         }),
         manifest_day: Some(20_260_825),
         ..sealed(n)
+    }
+}
+
+/// One entry of doc 08.6's local index, pointing at [`segment_id`]'s file.
+fn shard(pld: PldId, segment: u8, first_group: u32, last_group: u32) -> Shard {
+    Shard {
+        pld,
+        segment: segment_id(segment),
+        first_group,
+        last_group,
+        rows: 4096 * u64::from(last_group - first_group + 1),
+        evicted_at_ms: T0 + u64::from(segment),
     }
 }
 
@@ -1814,6 +1831,128 @@ async fn evicting_a_domain_that_is_not_resident_is_not_an_error(state: &dyn Stat
         0,
         "a domain the store has never seen was reported as evicted"
     );
+    Ok(())
+}
+
+async fn a_shard_entry_round_trips(state: &dyn State) -> Outcome {
+    let pld = PldId::derive(b"spilled.example");
+    let entry = shard(pld, 1, 4, 9);
+    state
+        .put_shards(&[entry])
+        .await
+        .map_err(|e| format!("put_shards failed: {e}"))?;
+
+    let found = state
+        .shards(&[pld])
+        .await
+        .map_err(|e| format!("shards failed: {e}"))?;
+    ensure_eq!(found.len(), 1, "one entry went in and this came back");
+    ensure_eq!(
+        found[0],
+        entry,
+        "the entry came back changed, so a warm would read the wrong row group"
+    );
+    Ok(())
+}
+
+async fn an_unevicted_domain_has_no_shard_entry(state: &dyn State) -> Outcome {
+    // A domain nothing has evicted and one nobody has ever heard of look the
+    // same here, and both mean the same thing to a warm: there is nothing to
+    // fetch back.
+    let urls = vec!["https://local.example/a".to_owned()];
+    admit_all(state, &urls).await?;
+
+    let found = state
+        .shards(&[key(&urls[0]).pld, PldId::derive(b"nowhere.invalid")])
+        .await
+        .map_err(|e| format!("shards failed: {e}"))?;
+    ensure!(
+        found.is_empty(),
+        "a domain that has never been evicted came back with somewhere to warm from: {found:?}"
+    );
+    Ok(())
+}
+
+async fn evicting_a_domain_again_replaces_its_entry(state: &dyn State) -> Outcome {
+    // The index is what makes a version current. Two entries for one domain
+    // would be a warm that loads a row twice, once from each file, and the
+    // older copy would win or lose depending on the order they arrive in.
+    let pld = PldId::derive(b"twice.example");
+    let first = shard(pld, 1, 0, 3);
+    let second = shard(pld, 2, 7, 11);
+    state
+        .put_shards(&[first])
+        .await
+        .map_err(|e| format!("the first put_shards failed: {e}"))?;
+    state
+        .put_shards(&[second])
+        .await
+        .map_err(|e| format!("the second put_shards failed: {e}"))?;
+
+    let found = state
+        .shards(&[pld])
+        .await
+        .map_err(|e| format!("shards failed: {e}"))?;
+    ensure_eq!(
+        found.len(),
+        1,
+        "a second eviction of one domain left two entries pointing at it"
+    );
+    ensure_eq!(
+        found[0],
+        second,
+        "the older entry won, so a warm would read rows the newer eviction has superseded"
+    );
+    Ok(())
+}
+
+async fn clearing_a_shard_entry_makes_the_domain_look_local_again(state: &dyn State) -> Outcome {
+    let pld = PldId::derive(b"warmed.example");
+    state
+        .put_shards(&[shard(pld, 1, 0, 0)])
+        .await
+        .map_err(|e| format!("put_shards failed: {e}"))?;
+    state
+        .clear_shards(&[pld, PldId::derive(b"nowhere.invalid")])
+        .await
+        .map_err(|e| format!("clear_shards failed: {e}"))?;
+
+    let found = state
+        .shards(&[pld])
+        .await
+        .map_err(|e| format!("shards failed: {e}"))?;
+    ensure!(
+        found.is_empty(),
+        "a warmed domain still points at cold storage, so the next warm loads its rows twice"
+    );
+    Ok(())
+}
+
+async fn shards_answers_the_domains_it_was_asked_about_and_no_others(state: &dyn State) -> Outcome {
+    let evicted: Vec<_> = (0..4)
+        .map(|n| PldId::derive(format!("cold{n}.example").as_bytes()))
+        .collect();
+    let entries: Vec<_> = evicted
+        .iter()
+        .enumerate()
+        .map(|(n, pld)| shard(*pld, n as u8, n as u32, n as u32))
+        .collect();
+    state
+        .put_shards(&entries)
+        .await
+        .map_err(|e| format!("put_shards failed: {e}"))?;
+
+    let found = state
+        .shards(&evicted[1..3])
+        .await
+        .map_err(|e| format!("shards failed: {e}"))?;
+    ensure_eq!(found.len(), 2, "asked about two domains and got {found:?}");
+    for entry in &found {
+        ensure!(
+            evicted[1..3].contains(&entry.pld),
+            "shards answered about a domain nobody asked about: {entry:?}"
+        );
+    }
     Ok(())
 }
 

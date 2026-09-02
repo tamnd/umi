@@ -618,3 +618,30 @@ INSERT OR REPLACE INTO segments (
     id, stream, local_path, sealed_at_ms, rows, bytes, local_digest,
     remote_repo, remote_path, remote_digest, manifest_day, deleted_at_ms
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)";
+
+/// The columns of doc 08.6's local index, in the order [`row::shard`] reads
+/// them.
+///
+/// [`row::shard`]: crate::row::shard
+macro_rules! shard_columns {
+    () => {
+        "SELECT pld, segment, first_group, last_group, rows, evicted_at_ms FROM shards"
+    };
+}
+
+/// Write one entry of the local index.
+///
+/// Replace and not append, because the index is what makes a version of a
+/// domain's rows current. The file the old entry pointed at is untouched and
+/// stays on the hub, which is doc 08.6's rollback window and doc 12's rule that
+/// nothing published is ever rewritten.
+pub const PUT_SHARD: &str = "
+INSERT OR REPLACE INTO shards (
+    pld, segment, first_group, last_group, rows, evicted_at_ms
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
+/// Where one domain's evicted rows are, if they have been evicted.
+pub const SELECT_SHARD: &str = concat!(shard_columns!(), " WHERE pld = ?1");
+
+/// Forget where a domain's rows were, because a warm has brought them back.
+pub const DELETE_SHARD: &str = "DELETE FROM shards WHERE pld = ?1";

@@ -27,7 +27,7 @@ use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Tier, Ulid, Url
 use crate::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,
-    Priority, Quotas, RefreshClass, Result, Revalidator, SegmentQuery, SegmentRow, State,
+    Priority, Quotas, RefreshClass, Result, Revalidator, SegmentQuery, SegmentRow, Shard, State,
     StateStats, SupervisionRow, TierPolicy, UrlState, next_due_dated, retry_after_ms,
 };
 
@@ -64,6 +64,8 @@ struct Inner {
     /// Live leases, so `release` can find a row from an id alone.
     leases: HashMap<LeaseId, RowKey>,
     resident: BTreeSet<PldId>,
+    /// Doc 08.6's local index, one entry per evicted domain.
+    shards: BTreeMap<PldId, Shard>,
     /// The interned ETag pool a `LedgerRow::etag_ref` points into. One pool
     /// for the whole store here; a sharded backend has one per shard.
     etags: Vec<String>,
@@ -859,6 +861,30 @@ impl State for MemoryState {
         // backend seals the shard, uploads it and updates the manifest before
         // dropping the local copy, and reports the bytes that cost.
         Ok(report)
+    }
+
+    async fn put_shards(&self, shards: &[Shard]) -> Result<()> {
+        let mut inner = self.lock();
+        for shard in shards {
+            inner.shards.insert(shard.pld, *shard);
+        }
+        Ok(())
+    }
+
+    async fn shards(&self, plds: &[PldId]) -> Result<Vec<Shard>> {
+        let inner = self.lock();
+        Ok(plds
+            .iter()
+            .filter_map(|pld| inner.shards.get(pld).copied())
+            .collect())
+    }
+
+    async fn clear_shards(&self, plds: &[PldId]) -> Result<()> {
+        let mut inner = self.lock();
+        for pld in plds {
+            inner.shards.remove(pld);
+        }
+        Ok(())
     }
 
     async fn resident(&self) -> Result<Vec<PldId>> {

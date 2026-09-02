@@ -21,7 +21,7 @@
 use rusqlite::Row;
 use rusqlite::types::Type;
 use umi_state::{
-    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Stream,
+    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Shard, Stream,
     SupervisionRow, TierPolicy, UrlState,
 };
 use umi_types::{Digest, HostId, PldId, Tier, Ulid, UrlKey, UrlKeyFull};
@@ -277,6 +277,18 @@ fn stream(row: &Row<'_>, column: &str) -> rusqlite::Result<Stream> {
         .ok()
         .and_then(Stream::from_u8)
         .ok_or_else(|| bad(column, format!("{raw} is not a stream"), Type::Integer))
+}
+
+/// Read one entry of doc 08.6's local index.
+pub fn shard(row: &Row<'_>) -> rusqlite::Result<Shard> {
+    Ok(Shard {
+        pld: pld(row, "pld")?,
+        segment: Ulid::from_bytes(bytes(row, "segment")?),
+        first_group: small(row, "first_group")?,
+        last_group: small(row, "last_group")?,
+        rows: count(row, "rows")?,
+        evicted_at_ms: from_ms(row.get("evicted_at_ms")?),
+    })
 }
 
 /// Read a whole segment record.
