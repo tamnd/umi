@@ -88,7 +88,20 @@ pub(crate) trait Transport: Send + Sync {
 pub(crate) struct Engine<T> {
     transport: T,
     config: FetchConfig,
-    hosts: Mutex<HashMap<String, Arc<Semaphore>>>,
+    hosts: Mutex<Hosts>,
+}
+
+/// The per host permit table, and when it is next worth sweeping.
+///
+/// The second field is the whole point. See [`Engine::permits`].
+pub(crate) struct Hosts {
+    permits: HashMap<String, Arc<Semaphore>>,
+    /// Sweep once the table reaches this many entries.
+    sweep_at: usize,
+    /// How many sweeps there have been. The cost this change is about is a
+    /// sweep per fetch, and counting them is the only way to see it.
+    #[cfg(test)]
+    sweeps: usize,
 }
 
 // By hand rather than derived, because a derive would put a `T: Debug` bound
@@ -104,10 +117,16 @@ impl<T> std::fmt::Debug for Engine<T> {
 impl<T: Transport> Engine<T> {
     /// An engine over a client that is already built.
     pub(crate) fn new(transport: T, config: FetchConfig) -> Self {
+        let config_cap = config.host_table_cap.max(1);
         Self {
             transport,
             config,
-            hosts: Mutex::new(HashMap::new()),
+            hosts: Mutex::new(Hosts {
+                permits: HashMap::new(),
+                sweep_at: config_cap,
+                #[cfg(test)]
+                sweeps: 0,
+            }),
         }
     }
 
@@ -351,22 +370,48 @@ impl<T: Transport> Engine<T> {
         Ok(body.freeze())
     }
 
+    /// How many times the table has been swept. For the sweep test.
+    #[cfg(test)]
+    pub(crate) fn sweeps(&self) -> usize {
+        self.hosts.lock().unwrap_or_else(|e| e.into_inner()).sweeps
+    }
+
     /// How many hosts the permit table is holding. For the sweep test.
     #[cfg(test)]
     pub(crate) fn live_hosts(&self) -> usize {
-        self.hosts.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.hosts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .permits
+            .len()
     }
 
     /// The permit set for a host, creating it if this is the first request.
     pub(crate) fn permits(&self, host: &str) -> Arc<Semaphore> {
+        let cap = self.config.host_table_cap.max(1);
         let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
 
-        if hosts.len() >= self.config.host_table_cap {
+        if hosts.permits.len() >= hosts.sweep_at {
             // An entry nobody else holds a reference to has no requests in
             // flight and no permits taken, so dropping it loses nothing. This
             // is a sweep rather than an eviction policy because the table is
             // only a leak and never a cache.
-            hosts.retain(|_, permits| Arc::strong_count(permits) > 1);
+            hosts
+                .permits
+                .retain(|_, permits| Arc::strong_count(permits) > 1);
+            // What survives is one entry per request in flight, so a caller
+            // with a window as wide as the cap sweeps, keeps everything, and
+            // is over the cap again on its next fetch. That is a full scan of
+            // the table under this lock on every single fetch, which is how a
+            // window of 4096 came to be worth eleven percent over one of 1024
+            // when it should have been worth a good deal more. Moving the mark
+            // to a cap above whatever survived puts a whole cap's worth of
+            // insertions between one scan and the next, whatever the window.
+            hosts.sweep_at = hosts.permits.len().saturating_add(cap);
+            #[cfg(test)]
+            {
+                hosts.sweeps += 1;
+            }
         }
 
         // At least one permit, because a semaphore with none is a fetcher that
@@ -375,6 +420,7 @@ impl<T: Transport> Engine<T> {
         // asking for no idle connections, which was the same field.
         Arc::clone(
             hosts
+                .permits
                 .entry(host.to_owned())
                 .or_insert_with(|| Arc::new(Semaphore::new(self.config.per_host.max(1)))),
         )

@@ -183,6 +183,13 @@ pub struct FetchConfig {
     /// How many hosts to keep permit sets for before pruning the idle ones. A
     /// fleet at rate touches millions of hosts and the map would otherwise be
     /// a slow leak.
+    ///
+    /// Read it as how many hosts may accumulate between one prune and the next
+    /// rather than as a ceiling on the table. The table also holds an entry for
+    /// every request in flight, and those cannot be pruned, so a caller with a
+    /// window wider than this number would otherwise prune on every fetch and
+    /// free nothing. That was a full scan of the table under one lock on the
+    /// hot path.
     pub host_table_cap: usize,
 }
 

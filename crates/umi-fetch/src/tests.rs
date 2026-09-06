@@ -811,15 +811,48 @@ fn a_host_with_a_request_in_flight_keeps_its_permits() {
         drop(fetcher.inner.permits(&format!("idle{n}.example.com")));
     }
 
+    // The cap is how many may pile up between one sweep and the next, not a
+    // ceiling on the table, because the one busy host cannot be swept and is
+    // still there afterwards.
     let live = fetcher.inner.live_hosts();
     assert!(
-        live <= 4,
-        "the host table grew to {live} entries past a cap of 4"
+        live <= 5,
+        "the host table grew to {live} entries on a cap of 4 with one host busy"
     );
     assert!(
         Arc::ptr_eq(&busy, &fetcher.inner.permits("busy.example.com")),
         "the busy host lost the semaphore its in flight request was counted against"
     );
+}
+
+#[test]
+fn a_window_wider_than_the_cap_does_not_sweep_on_every_fetch() {
+    // What this is really about. Everything in flight survives a sweep, so a
+    // caller whose window is as wide as the cap used to sweep, keep the lot,
+    // and be over the cap again on its next fetch. That is a full scan of the
+    // table under one lock on the hot path, and it is why a robots run at a
+    // window of 4096 was worth only eleven percent over one at 1024 on the same
+    // list of hosts.
+    let fetcher = fetcher(FetchConfig {
+        host_table_cap: 16,
+        ..FetchConfig::default()
+    });
+
+    // Sixteen hosts held the way a wide window holds them, so not one of them
+    // can be swept, and then two hundred more that can.
+    let held: Vec<_> = (0..16)
+        .map(|n| fetcher.inner.permits(&format!("busy{n}.example.com")))
+        .collect();
+    for n in 0..200 {
+        drop(fetcher.inner.permits(&format!("idle{n}.example.com")));
+    }
+
+    let sweeps = fetcher.inner.sweeps();
+    assert!(
+        sweeps <= 200 / 16 + 1,
+        "{sweeps} sweeps over 200 fetches, which is a scan per fetch again"
+    );
+    assert_eq!(held.len(), 16, "the busy hosts are held for the whole test");
 }
 
 #[tokio::test]
