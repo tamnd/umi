@@ -772,21 +772,21 @@ async fn a_file_in_hand_is_ready_and_one_that_has_gone_stale_is_not() {
     let host = RowKey::for_url(&url, None).expect("a crawlable url").host;
 
     // Nothing has been asked yet, so there is nothing to read.
-    assert!(!crawler.robots().ready(host, T0).await);
+    assert!(!crawler.robots().ready(host, T0));
 
     crawler
         .tick(&Arc::new(Collected::default()))
         .await
         .expect("tick");
 
-    assert!(crawler.robots().ready(host, T0).await);
+    assert!(crawler.robots().ready(host, T0));
     // A host we never met is not ready however much else is cached.
     let other = RowKey::for_url("https://elsewhere.example/a", None)
         .expect("a crawlable url")
         .host;
-    assert!(!crawler.robots().ready(other, T0).await);
+    assert!(!crawler.robots().ready(other, T0));
     // And doc 07.3's day is the end of it. A slot that took a day old answer
     // for a fresh one would crawl on rules the site has had a day to change.
-    assert!(!crawler.robots().ready(host, T0 + A_DAY_MS + 1).await);
-    assert!(!crawler.robots().holds(host, T0 + A_DAY_MS + 1).await);
+    assert!(!crawler.robots().ready(host, T0 + A_DAY_MS + 1));
+    assert!(!crawler.robots().holds(host, T0 + A_DAY_MS + 1));
 }

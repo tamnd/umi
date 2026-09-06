@@ -1813,7 +1813,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             return Ok(None);
         }
         loop {
-            if let Some(next) = self.gate(&mut supply.queue, deferred, report).await {
+            if let Some(next) = self.gate(&mut supply.queue, deferred, report) {
                 // Below one ask's worth, which in the steady state means there
                 // is always exactly one ask in flight. A queue holding a full
                 // ask is a window's worth of fetching in hand, which is the
@@ -2113,7 +2113,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// the origin answered, which on a broad crawl is most of what the window
     /// was doing. It goes to the back instead and the slot takes a lease that
     /// can fetch now. See [`STEP_ASIDE`].
-    async fn gate(
+    fn gate(
         &self,
         queue: &mut VecDeque<umi_state::Lease>,
         deferred: &mut Vec<LeaseId>,
@@ -2130,7 +2130,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             // be the same lease coming back sixteen times.
             if stepped < STEP_ASIDE
                 && !queue.is_empty()
-                && !self.robots.ready(lease.key.host, self.clock.now_ms()).await
+                && !self.robots.ready(lease.key.host, self.clock.now_ms())
             {
                 stepped += 1;
                 report.robots_stepped += 1;
@@ -2337,7 +2337,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         floors: &HostFloors,
     ) -> Option<Learned> {
         let now_ms = self.clock.now_ms();
-        if self.robots.holds(host, now_ms).await {
+        if self.robots.holds(host, now_ms) {
             return None;
         }
         // The same ceiling a lease uses. A prefetch is not holding a window

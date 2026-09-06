@@ -31,14 +31,14 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use arrow::array::{
     ArrayRef, ListBuilder, RecordBatch, StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder,
     UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field};
-use tokio::sync::{Mutex, OnceCell};
+use tokio::sync::OnceCell;
 use umi_file::StreamKind;
 use umi_robots::{Decision, Provenance, Robots};
 use umi_types::{Digest, HostId, Tier};
@@ -198,6 +198,16 @@ impl Silent {
 }
 
 /// Robots.txt per host, fetched once and shared.
+///
+/// The map is behind a blocking mutex and the fetch is behind the cell inside
+/// it, which is the whole reason the two are separate. Nothing holds the map
+/// lock across an await, so an async mutex here bought nothing and cost a
+/// reschedule on every contended take. That was measurable: with the fetch
+/// window at 4096 on server2 the crawl loop asked this map up to sixteen times
+/// per lease while every fetch task in flight was taking the same lock, and 83
+/// percent of the window was finished work waiting for the loop to come round.
+/// A guard held across an await would not compile, because the tick's futures
+/// are spawned and a blocking guard is not [`Send`].
 #[derive(Default)]
 pub struct RobotsCache {
     hosts: Mutex<HashMap<HostId, Arc<OnceCell<Entry>>>>,
@@ -206,6 +216,14 @@ pub struct RobotsCache {
 }
 
 impl RobotsCache {
+    /// The map, with a poisoned lock recovered rather than propagated.
+    ///
+    /// Nothing under this lock can panic, and taking the rest of a crawl down
+    /// over a map of cached files would be the wrong trade even if it could.
+    fn hosts(&self) -> MutexGuard<'_, HashMap<HostId, Arc<OnceCell<Entry>>>> {
+        self.hosts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// An empty cache.
     #[must_use]
     pub fn new() -> Self {
@@ -235,13 +253,15 @@ impl RobotsCache {
     }
 
     /// How many hosts are held.
-    pub async fn len(&self) -> usize {
-        self.hosts.lock().await.len()
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hosts().len()
     }
 
     /// Whether anything is held.
-    pub async fn is_empty(&self) -> bool {
-        self.len().await == 0
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// Whether a fresh answer for this host is already in hand.
@@ -251,10 +271,9 @@ impl RobotsCache {
     /// caller would only queue behind it. What this is for is deciding whether
     /// a host needs a request spent on it, and a host with a fetch in flight
     /// does not.
-    pub async fn holds(&self, host: HostId, now_ms: u64) -> bool {
-        self.hosts
-            .lock()
-            .await
+    #[must_use]
+    pub fn holds(&self, host: HostId, now_ms: u64) -> bool {
+        self.hosts()
             .get(&host)
             .is_some_and(|cell| cell.get().is_none_or(|e| e.fresh(now_ms)))
     }
@@ -272,10 +291,9 @@ impl RobotsCache {
     /// else's robots.txt is a page slot not fetching a page, and on a broad
     /// crawl that was most of the window. A caller holding a slot can ask this
     /// first and go and do something else instead.
-    pub async fn ready(&self, host: HostId, now_ms: u64) -> bool {
-        self.hosts
-            .lock()
-            .await
+    #[must_use]
+    pub fn ready(&self, host: HostId, now_ms: u64) -> bool {
+        self.hosts()
             .get(&host)
             .and_then(|cell| cell.get())
             .is_some_and(|entry| entry.fresh(now_ms))
@@ -332,7 +350,7 @@ impl RobotsCache {
         // whole crawl behind whichever site is slowest, which at 250 pages a
         // second is the difference between a crawler and a queue.
         let cell = {
-            let mut hosts = self.hosts.lock().await;
+            let mut hosts = self.hosts();
             let existing = hosts.entry(host).or_default();
             // A cell whose entry has expired is replaced rather than reset,
             // because a task that already has a clone of the old cell should
@@ -378,9 +396,9 @@ impl RobotsCache {
 
     /// Put an entry in without fetching, which is how a coordinator restores
     /// what it had before a restart and how a test sets a host up.
-    pub async fn insert(&self, host: HostId, entry: Entry) {
+    pub fn insert(&self, host: HostId, entry: Entry) {
         let cell = OnceCell::new_with(Some(entry));
-        self.hosts.lock().await.insert(host, Arc::new(cell));
+        self.hosts().insert(host, Arc::new(cell));
     }
 
     /// Drop everything that has expired.
@@ -388,8 +406,8 @@ impl RobotsCache {
     /// Nothing calls this on a timer. The loop calls it when it seals a
     /// segment, which is every few minutes and is a moment when a millisecond
     /// of map walking costs nothing.
-    pub async fn evict_expired(&self, now_ms: u64) -> usize {
-        let mut hosts = self.hosts.lock().await;
+    pub fn evict_expired(&self, now_ms: u64) -> usize {
+        let mut hosts = self.hosts();
         let before = hosts.len();
         hosts.retain(|_, cell| cell.get().is_none_or(|e| e.fresh(now_ms)));
         before - hosts.len()
