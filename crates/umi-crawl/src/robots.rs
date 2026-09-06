@@ -197,31 +197,85 @@ impl Silent {
     }
 }
 
+/// How many pieces the host map is cut into.
+///
+/// A power of two so the shard is the first byte of the host masked, and 64
+/// because of what the two failure modes cost either side of it.
+///
+/// The map is asked a few tens of thousands of times a second on a wide window:
+/// once or more per lease from the gate walk, up to sixteen when the walk is
+/// stepping, and once from every fetch task on its way to the file it needs.
+/// Under one lock that was measured on server2 at a window of 8192 and it took
+/// the crawl from 247 pages a second to 74, because a blocking lock in an async
+/// runtime does not cost the task that waits for it, it costs the worker
+/// thread, and six worker threads all parked on the same futex is a process
+/// that has stopped. Sixty four shards means two callers have to want the same
+/// eight millionth of the host space in the same instant rather than merely the
+/// same map.
+///
+/// Not larger, because every shard is a `HashMap` with its own allocation and
+/// [`len`](RobotsCache::len) and [`evict_expired`](RobotsCache::evict_expired)
+/// walk all of them, and the second of those runs while a segment is sealing.
+/// Sixty four is well under the point where either matters and well over the
+/// six threads that can collide.
+const SHARDS: usize = 64;
+
 /// Robots.txt per host, fetched once and shared.
 ///
-/// The map is behind a blocking mutex and the fetch is behind the cell inside
-/// it, which is the whole reason the two are separate. Nothing holds the map
-/// lock across an await, so an async mutex here bought nothing and cost a
-/// reschedule on every contended take. That was measurable: with the fetch
-/// window at 4096 on server2 the crawl loop asked this map up to sixteen times
-/// per lease while every fetch task in flight was taking the same lock, and 83
-/// percent of the window was finished work waiting for the loop to come round.
-/// A guard held across an await would not compile, because the tick's futures
-/// are spawned and a blocking guard is not [`Send`].
-#[derive(Default)]
+/// The map is behind blocking mutexes and the fetch is behind the cell inside
+/// it, which is the whole reason the two are separate. Nothing holds a map lock
+/// across an await, so an async mutex here bought nothing and cost a reschedule
+/// on every contended take. That was measurable: with the fetch window at 4096
+/// on server2 the crawl loop asked this map up to sixteen times per lease while
+/// every fetch task in flight was taking the same lock, and 83 percent of the
+/// window was finished work waiting for the loop to come round. A guard held
+/// across an await would not compile, because the tick's futures are spawned
+/// and a blocking guard is not [`Send`].
+///
+/// Sharded as well as blocking, and the two go together. A blocking lock in an
+/// async runtime does not cost the task that waits for it, it costs the worker
+/// thread, so one lock for the whole map took the crawl from 247 pages a second
+/// to 74 at a window of 8192 with six worker threads all parked on the same
+/// futex. Sixty four shards is what makes the blocking take safe at width, and
+/// the constant that says so has the arithmetic.
 pub struct RobotsCache {
-    hosts: Mutex<HashMap<HostId, Arc<OnceCell<Entry>>>>,
+    /// One map per shard, indexed by [`shard`].
+    hosts: [Mutex<HashMap<HostId, Arc<OnceCell<Entry>>>>; SHARDS],
     /// What a published corpus already knows, when a run handed one over.
     silent: OnceLock<Silent>,
 }
 
+impl Default for RobotsCache {
+    fn default() -> Self {
+        Self {
+            hosts: std::array::from_fn(|_| Mutex::default()),
+            silent: OnceLock::new(),
+        }
+    }
+}
+
+/// Which shard a host lives in.
+///
+/// The first byte, because a [`HostId`] is the front of a blake3 digest and is
+/// uniform, so there is nothing to gain by hashing it again.
+fn shard(host: HostId) -> usize {
+    usize::from(host.as_bytes()[0]) % SHARDS
+}
+
 impl RobotsCache {
-    /// The map, with a poisoned lock recovered rather than propagated.
+    /// One shard's map, with a poisoned lock recovered rather than propagated.
     ///
     /// Nothing under this lock can panic, and taking the rest of a crawl down
     /// over a map of cached files would be the wrong trade even if it could.
-    fn hosts(&self) -> MutexGuard<'_, HashMap<HostId, Arc<OnceCell<Entry>>>> {
-        self.hosts.lock().unwrap_or_else(PoisonError::into_inner)
+    fn hosts(&self, host: HostId) -> MutexGuard<'_, HashMap<HostId, Arc<OnceCell<Entry>>>> {
+        self.shard_at(shard(host))
+    }
+
+    /// The same by index, for the two callers that walk every shard.
+    fn shard_at(&self, at: usize) -> MutexGuard<'_, HashMap<HostId, Arc<OnceCell<Entry>>>> {
+        self.hosts[at]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// An empty cache.
@@ -253,9 +307,14 @@ impl RobotsCache {
     }
 
     /// How many hosts are held.
+    ///
+    /// A shard at a time and not all of them at once, so this never holds two
+    /// of these locks and cannot be half of a deadlock. The count is a sum of
+    /// readings taken at slightly different moments, which is the right answer
+    /// for what this is used for: a log line and a test.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.hosts().len()
+        (0..SHARDS).map(|at| self.shard_at(at).len()).sum()
     }
 
     /// Whether anything is held.
@@ -273,7 +332,7 @@ impl RobotsCache {
     /// does not.
     #[must_use]
     pub fn holds(&self, host: HostId, now_ms: u64) -> bool {
-        self.hosts()
+        self.hosts(host)
             .get(&host)
             .is_some_and(|cell| cell.get().is_none_or(|e| e.fresh(now_ms)))
     }
@@ -293,7 +352,7 @@ impl RobotsCache {
     /// first and go and do something else instead.
     #[must_use]
     pub fn ready(&self, host: HostId, now_ms: u64) -> bool {
-        self.hosts()
+        self.hosts(host)
             .get(&host)
             .and_then(|cell| cell.get())
             .is_some_and(|entry| entry.fresh(now_ms))
@@ -350,7 +409,7 @@ impl RobotsCache {
         // whole crawl behind whichever site is slowest, which at 250 pages a
         // second is the difference between a crawler and a queue.
         let cell = {
-            let mut hosts = self.hosts();
+            let mut hosts = self.hosts(host);
             let existing = hosts.entry(host).or_default();
             // A cell whose entry has expired is replaced rather than reset,
             // because a task that already has a clone of the old cell should
@@ -398,7 +457,7 @@ impl RobotsCache {
     /// what it had before a restart and how a test sets a host up.
     pub fn insert(&self, host: HostId, entry: Entry) {
         let cell = OnceCell::new_with(Some(entry));
-        self.hosts().insert(host, Arc::new(cell));
+        self.hosts(host).insert(host, Arc::new(cell));
     }
 
     /// Drop everything that has expired.
@@ -407,10 +466,14 @@ impl RobotsCache {
     /// segment, which is every few minutes and is a moment when a millisecond
     /// of map walking costs nothing.
     pub fn evict_expired(&self, now_ms: u64) -> usize {
-        let mut hosts = self.hosts();
-        let before = hosts.len();
-        hosts.retain(|_, cell| cell.get().is_none_or(|e| e.fresh(now_ms)));
-        before - hosts.len()
+        let mut gone = 0;
+        for at in 0..SHARDS {
+            let mut hosts = self.shard_at(at);
+            let before = hosts.len();
+            hosts.retain(|_, cell| cell.get().is_none_or(|e| e.fresh(now_ms)));
+            gone += before - hosts.len();
+        }
+        gone
     }
 }
 
