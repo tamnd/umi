@@ -576,12 +576,15 @@ async fn one(fetch: &Ladder, again: &Again, host: String, now_ms: u64) -> Robots
 /// finished pass, and the surprise is worse than the correction.
 fn waiting(patience: u64) -> FetchConfig {
     let wait = Duration::from_secs(patience.max(1));
-    FetchConfig {
-        connect_timeout: wait,
-        read_timeout: wait,
-        total_timeout: wait * PATIENCE_TOTAL,
-        ..FetchConfig::default()
-    }
+    // Built by mutation rather than by a struct expression because
+    // `FetchConfig` is non exhaustive, which is the right thing for it to be:
+    // a field added there should reach every caller as its own default and not
+    // as a compile error here.
+    let mut config = FetchConfig::default();
+    config.connect_timeout = wait;
+    config.read_timeout = wait;
+    config.total_timeout = wait * PATIENCE_TOTAL;
+    config
 }
 
 /// Ask one name, and ask it a second time if the first ask got nothing back.
