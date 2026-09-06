@@ -234,6 +234,21 @@ pub struct Options {
     /// the default and is also what a build without the `render` feature can
     /// do regardless of what is configured.
     pub tabs: u16,
+    /// A published robots corpus to read before the first lease, or nothing
+    /// when the operator did not name one.
+    ///
+    /// What it buys is the hosts that never answered. Four page window arms on
+    /// server3 spent between 83 and 97 percent of every page lease inside
+    /// robots.txt, because a broad crawl meets a new host on nearly every page
+    /// and 41 percent of the corpus is hosts we asked and heard nothing back
+    /// from. Those cost the whole timeout every time we meet them.
+    pub robots_corpus: Option<String>,
+    /// One host in this many is asked anyway, even when the corpus says it
+    /// never answered.
+    ///
+    /// The corpus is a snapshot and hosts come back. Nothing when there is no
+    /// corpus, and ignored then.
+    pub robots_resample: u32,
     /// A file of URLs, or `-` for standard input.
     pub seed: Option<String>,
     /// Any program that prints URLs, repeatable.
@@ -1204,6 +1219,16 @@ fn run(
             None => None,
         };
 
+        // Second, because it is the longest thing that happens before the
+        // first fetch and an operator watching a run start should see it
+        // begin rather than wonder what the process is doing. It is also the
+        // one piece of startup work whose size an operator can misjudge by an
+        // order of magnitude, so the count goes in the log.
+        if let Some(repo) = &options.robots_corpus {
+            let silent = crate::robots::silent(repo, options.robots_resample, &mut log).await?;
+            crawler.robots().learn(silent);
+        }
+
         // Doc 12.7's step 8 for whatever a previous run got as far as step 6
         // and then lost the process. Before the first fetch rather than after
         // the last one, because the reason it matters is disk, and disk is
@@ -1485,6 +1510,17 @@ fn run(
             "{} files published, {} still local",
             summary.published,
             summary.files - summary.published
+        ))?;
+    }
+    // What the corpus bought, because a run that cannot say is a run nobody
+    // can tune. Both numbers matter: the first is robots.txt fetches that did
+    // not happen and the second is the resample, which is the part that keeps
+    // a host that has come back from being lost for good.
+    if let Some(silent) = crawler.robots().silent() {
+        log.line(&format!(
+            "the corpus spared {} robots fetches and asked {} of its hosts anyway",
+            silent.spared(),
+            silent.asked()
         ))?;
     }
     Ok(summary)
@@ -2529,6 +2565,8 @@ impl Default for Options {
             tier_max: 3,
             allow_supervised: false,
             tabs: 0,
+            robots_corpus: None,
+            robots_resample: 20,
             seed: None,
             seeder: Vec::new(),
             sitemaps: None,
