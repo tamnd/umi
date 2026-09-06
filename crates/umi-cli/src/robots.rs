@@ -132,6 +132,34 @@ pub const CONCURRENCY: u16 = 256;
 /// The directory a run writes into when nobody says where.
 const DEFAULT_OUT: &str = "./umi-robots";
 
+/// How long a run waits on a host that is not answering, in seconds.
+///
+/// This is the setting that decides the rate of a robots pass, and it took a
+/// while to see that. Three runs over the domain ranking line up on how much
+/// of the band is silent rather than on anything else: ranks 10 to 18 million
+/// at 35.6 percent silent ran 275.9 hosts a second, ranks 18 to 26 million at
+/// 55.9 percent ran 155.3, and a pass over hosts already known to be live at
+/// 4.2 percent ran 341.3. A host that answers costs a lookup and one small
+/// request. A host that does not costs the whole wait, twice over because of
+/// the second ask, and holds a fetch slot the entire time. Raising concurrency
+/// does not help, because slots are not what is short.
+///
+/// So the number is a trade and not a safety margin: patience buys coverage of
+/// slow hosts and costs rate on dead ones. [`crate::robots`] measures it rather
+/// than assuming it, and the default is what that measurement settled on.
+///
+/// A crawl of pages keeps the fetcher's own default, which is longer. A page is
+/// worth waiting for and there is one robots.txt per host either way.
+pub const PATIENCE: u64 = 10;
+
+/// How much longer than [`PATIENCE`] a whole fetch may take.
+///
+/// The fetcher's default is three times its connect timeout, and keeping the
+/// same ratio means `--patience 10` is exactly what the run did before the flag
+/// existed. A robots.txt is a few hundred bytes, so this only ever binds on a
+/// host that accepted the connection and then dribbled.
+const PATIENCE_TOTAL: u32 = 3;
+
 /// How many hosts the reader keeps queued ahead of the fetchers.
 ///
 /// Enough that downloading the next Parquet part, which takes a few seconds,
@@ -190,6 +218,9 @@ pub struct Options {
     pub out: Option<String>,
     /// Simultaneous in flight fetches.
     pub concurrency: u16,
+    /// How many seconds to wait on a host that is not answering. See
+    /// [`PATIENCE`].
+    pub patience: u64,
     /// Stop after this many hosts.
     pub limit: Option<u64>,
     /// Skip this many hosts from the front of the list, which is how a run
@@ -212,6 +243,7 @@ impl Default for Options {
             known: None,
             out: None,
             concurrency: CONCURRENCY,
+            patience: PATIENCE,
             limit: None,
             skip: 0,
             max_duration: None,
@@ -264,7 +296,7 @@ pub fn robots(options: &Options) -> Result<Summary, Error> {
         .enable_all()
         .build()
         .map_err(Error::Io)?;
-    let fetcher = Arc::new(Ladder::with_signer(FetchConfig::default(), signer)?);
+    let fetcher = Arc::new(Ladder::with_signer(waiting(options.patience), signer)?);
     let again = Arc::new(Again::default());
 
     let state: Arc<dyn State> =
@@ -530,6 +562,26 @@ async fn one(fetch: &Ladder, again: &Again, host: String, now_ms: u64) -> Robots
         }
     }
     RobotsRow::build(&host, &entry)
+}
+
+/// The fetcher settings a run of this shape wants.
+///
+/// Only the three waits differ from the fetcher's own defaults, and they move
+/// together because splitting them into separate flags would be three numbers
+/// an operator has to keep consistent to get one behaviour. See [`PATIENCE`]
+/// for why the number matters more here than anywhere else in the crawler.
+///
+/// Zero is raised to one rather than refused. A run started with no patience at
+/// all would fail every host and write a file of zeroes that looks like a
+/// finished pass, and the surprise is worse than the correction.
+fn waiting(patience: u64) -> FetchConfig {
+    let wait = Duration::from_secs(patience.max(1));
+    FetchConfig {
+        connect_timeout: wait,
+        read_timeout: wait,
+        total_timeout: wait * PATIENCE_TOTAL,
+        ..FetchConfig::default()
+    }
 }
 
 /// Ask one name, and ask it a second time if the first ask got nothing back.

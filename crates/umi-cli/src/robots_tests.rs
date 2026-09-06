@@ -8,8 +8,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use super::{Admit, Again, Counts, Known, Options, Source, host_of, hosts_in, progress};
+use super::{Admit, Again, Counts, Known, Options, Source, host_of, hosts_in, progress, waiting};
 
 #[test]
 fn a_list_written_by_a_person_still_reads_as_hosts() {
@@ -310,4 +311,26 @@ fn a_run_with_no_corpus_to_read_says_nothing_about_one() {
         1000,
     );
     assert!(with.contains("41 already answered"), "{with}");
+}
+
+#[test]
+fn patience_moves_all_three_waits_and_keeps_the_old_behaviour_at_the_old_number() {
+    // The flag exists to be turned down, and the thing that would make that
+    // untrustworthy is the default quietly meaning something else than it did
+    // before there was a flag. So the default is asserted against the fetcher's
+    // own, field by field, rather than against a number written twice.
+    let default = umi_fetch::FetchConfig::default();
+    let same = waiting(super::PATIENCE);
+    assert_eq!(same.connect_timeout, default.connect_timeout);
+    assert_eq!(same.read_timeout, default.read_timeout);
+    assert_eq!(same.total_timeout, default.total_timeout);
+
+    let short = waiting(3);
+    assert_eq!(short.connect_timeout, Duration::from_secs(3));
+    assert_eq!(short.read_timeout, Duration::from_secs(3));
+    assert_eq!(short.total_timeout, Duration::from_secs(9));
+
+    // Zero would fail every host and write a file of zeroes that reads like a
+    // finished pass, which is a worse outcome than ignoring the operator.
+    assert_eq!(waiting(0).connect_timeout, Duration::from_secs(1));
 }
