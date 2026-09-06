@@ -133,7 +133,11 @@ jobs:
           set -e
           grep -q 'channel = "1.98"' rust-toolchain.toml
           grep -q 'rust-version = "1.98"' Cargo.toml
-          test "$(rustc +1.98 --version | cut -d' ' -f2)" = 1.98.0
+          # Minor and not patch. The pin is a language version, and a point
+          # release inside it is a bug fix we want rather than a change to
+          # what the code is allowed to use. This asserted 1.98.0 until
+          # 1.98.1 shipped and turned every build red for no reason.
+          test "$(rustc +1.98 --version | cut -d' ' -f2 | cut -d. -f1,2)" = 1.98
       - env:
           RUSTUP_TOOLCHAIN: "1.98"
         run: cargo build --workspace --locked
