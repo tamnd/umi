@@ -72,7 +72,7 @@
 use core::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use umi_crawl::{
     Backpressure, Clock, CrawlConfig, Crawler, Live, Recorded, Scope, SegmentInfo, SegmentSink,
@@ -1329,8 +1329,18 @@ fn run(
             // is the only thing being waited on here and the heartbeat reads
             // counters it writes as it goes, so nothing is held up by it and
             // nothing has to be threaded through the loop.
+            // What is left of `--for`, handed to the tick so that it stops
+            // leasing when the time is up instead of finishing the batch it
+            // started. Computed from the clock rather than from a saved
+            // `Instant` so that a test clock still drives it, and turned into
+            // an `Instant` because that is what a tick can compare against
+            // without a clock of its own.
+            let until = settings.max_duration.map(|limit| {
+                let gone = Duration::from_millis(tick_ms.saturating_sub(started_ms));
+                Instant::now() + limit.saturating_sub(gone)
+            });
             let report = {
-                let ticking = crawler.tick(&recorded);
+                let ticking = crawler.tick_until(&recorded, until);
                 tokio::pin!(ticking);
                 let mut beat = tokio::time::interval(WORKING);
                 // The first one fires straight away, and a heartbeat in the
