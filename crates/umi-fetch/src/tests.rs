@@ -742,6 +742,27 @@ async fn a_rate_limit_with_a_vendor_marker_on_it_is_a_block() {
 }
 
 #[tokio::test]
+async fn asking_for_no_idle_connections_still_fetches() {
+    // A robots pass wants zero, because it asks each host once and a kept
+    // socket is one nobody reuses. That used to be the same field as the per
+    // host cap, so setting it hung the run on its first fetch with no error and
+    // no traffic, which took a while to recognise as a setting rather than as
+    // the network. The two are separate fields now and this is the test that
+    // says so.
+    let origin = Origin::start(|_| Reply::response(200, &[], b"User-agent: *\n")).await;
+
+    let outcome = fetcher(FetchConfig {
+        idle_per_host: 0,
+        ..FetchConfig::default()
+    })
+    .fetch(&origin.url("/robots.txt"), None)
+    .await
+    .expect("the url parses");
+
+    assert!(matches!(outcome, Outcome::Ok(_)), "{outcome:?}");
+}
+
+#[tokio::test]
 async fn the_per_host_cap_holds_under_concurrency() {
     // Doc 05.4 caps us at 2 per host. The origin holds each connection open for
     // long enough that eight requests would overlap if nothing stopped them.

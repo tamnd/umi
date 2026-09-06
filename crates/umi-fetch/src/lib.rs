@@ -165,6 +165,21 @@ pub struct FetchConfig {
     /// Concurrent requests per host. Doc 05.4 caps connections at 2, and with
     /// HTTP/2 multiplexing this is the stricter of the two readings.
     pub per_host: usize,
+    /// Idle connections to keep per host once a request has finished.
+    ///
+    /// Separate from `per_host` because they are separate questions that only
+    /// happen to have the same answer for a crawl. One is how many requests may
+    /// be in the air at a host at once, which is politeness. This is how long a
+    /// socket outlives the request that opened it, which is a resource
+    /// question, and the right answer to it depends on whether the caller is
+    /// coming back.
+    ///
+    /// They were one field until a robots pass tried to set it to zero and hung
+    /// on the first fetch, because zero is also a semaphore with no permits in
+    /// it. Zero is a perfectly reasonable thing to want here: a run that asks
+    /// each host once and never returns gets nothing from a kept connection and
+    /// pays a file descriptor and a socket on both ends for it.
+    pub idle_per_host: usize,
     /// How many hosts to keep permit sets for before pruning the idle ones. A
     /// fleet at rate touches millions of hosts and the map would otherwise be
     /// a slow leak.
@@ -181,6 +196,7 @@ impl Default for FetchConfig {
             body_cap: 512 * 1024,
             max_redirects: 5,
             per_host: 2,
+            idle_per_host: 2,
             host_table_cap: 4096,
         }
     }

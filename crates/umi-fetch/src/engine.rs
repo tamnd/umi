@@ -369,10 +369,14 @@ impl<T: Transport> Engine<T> {
             hosts.retain(|_, permits| Arc::strong_count(permits) > 1);
         }
 
+        // At least one permit, because a semaphore with none is a fetcher that
+        // accepts every request and finishes none, and the failure looks like
+        // the network rather than like a setting. Zero used to be reachable by
+        // asking for no idle connections, which was the same field.
         Arc::clone(
             hosts
                 .entry(host.to_owned())
-                .or_insert_with(|| Arc::new(Semaphore::new(self.config.per_host))),
+                .or_insert_with(|| Arc::new(Semaphore::new(self.config.per_host.max(1)))),
         )
     }
 }

@@ -143,7 +143,7 @@ impl Browser {
             // Same reason as T1: doc 04.7 stops at the first redirect that
             // leaves the registrable domain, and it has to report which one.
             .redirect(wreq::redirect::Policy::none())
-            .pool_max_idle_per_host(config.per_host)
+            .pool_max_idle_per_host(config.idle_per_host)
             .build()
             .map_err(|e| FetchError::Client(e.to_string()))?;
 
