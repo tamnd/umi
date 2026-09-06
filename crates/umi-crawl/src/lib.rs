@@ -72,7 +72,9 @@ pub use frontier::{FrontierBuilder, read_frontier};
 pub use ledger::{Recorded, SupervisedLedger};
 pub use page::{Crawled, PageBuilder, PageRow, Snippet, SnippetKind};
 pub use render::{RenderBudget, RenderPolicy, Slot};
-pub use robots::{Entry as RobotsEntry, RobotsBuilder, RobotsCache, RobotsRow, fetch_entry};
+pub use robots::{
+    Entry as RobotsEntry, RobotsBuilder, RobotsCache, RobotsRow, Silent, fetch_entry,
+};
 pub use run::{CrawlConfig, CrawlError, Crawler, Live, Sink, TickReport};
 pub use scope::{
     Budget, ContentFilter, Corpus, LinkPolicy, Matcher, RateOverride, Scope, ScopeError, Seed,

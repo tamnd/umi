@@ -18,9 +18,20 @@
 //! is the normal case, not the rare one, and a cache that let all two hundred
 //! discover the miss would send two hundred requests for the same file to an
 //! origin that has done nothing wrong.
+//!
+//! A cold cache is the expensive thing, and on a broad crawl the cache is
+//! always cold. Four page window arms on server3 spent between 83 and 97
+//! percent of a page lease inside robots.txt, because depth two meets a new
+//! host on nearly every page and roughly forty percent of hosts at those ranks
+//! never answer at all. A host that never answers costs the whole fetch
+//! timeout, and it costs it again tomorrow. [`Silent`] is the way out: the
+//! published corpus already asked tens of millions of those hosts and wrote
+//! down that nothing came back, so a crawl that reads it can decline to ask
+//! again instead of paying the timeout to learn what we already know.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
     ArrayRef, ListBuilder, RecordBatch, StringBuilder, UInt8Builder, UInt16Builder, UInt32Builder,
@@ -92,10 +103,106 @@ impl Entry {
     }
 }
 
+/// The hosts a published corpus asked and never heard back from.
+///
+/// A sorted vector rather than a `HashSet`, the same trade the bulk prefetch's
+/// `--known` list makes: eight bytes a host with no slack is 968 megabytes at
+/// 121 million hosts, and a hash set of the same thing is nearer two and a
+/// half gigabytes. A binary search is a couple of dozen cache misses on a path
+/// whose alternative is a DNS lookup and a six second wait, so the lookup does
+/// not show up anywhere a run can measure.
+///
+/// Only the silent hosts, not the whole corpus. A host that served rules has
+/// to be asked again because rules change and doc 07.4 gives them a day, but a
+/// host that answered nothing is not going to answer nothing differently. The
+/// error this can make is the safe direction: a host that has since come back
+/// gets treated as unreachable, which makes us crawl less rather than more, so
+/// a stale list cannot make us impolite. What it can do is lose coverage, and
+/// that is what `sample` and the two counters are for.
+pub struct Silent {
+    /// Sorted and deduplicated.
+    hosts: Vec<HostId>,
+    /// One host in this many is asked anyway, so a host that came back is
+    /// found again rather than written off forever. Zero asks none of them.
+    sample: u32,
+    /// How many fetches the list saved.
+    spared: AtomicU64,
+    /// How many hosts were on the list and asked anyway.
+    asked: AtomicU64,
+}
+
+impl Silent {
+    /// A list of hosts, sorted and deduplicated here so a caller reading a
+    /// corpus file at a time does not have to.
+    ///
+    /// `sample` is the resample rate: one host in this many is asked anyway.
+    /// Zero means none are, which is the right setting for a run that wants
+    /// the speed and does not care about the hosts that recovered.
+    #[must_use]
+    pub fn new(mut hosts: Vec<HostId>, sample: u32) -> Self {
+        hosts.sort_unstable();
+        hosts.dedup();
+        Self {
+            hosts,
+            sample,
+            spared: AtomicU64::new(0),
+            asked: AtomicU64::new(0),
+        }
+    }
+
+    /// How many hosts the list carries.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.hosts.len()
+    }
+
+    /// Whether the list is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+    }
+
+    /// How many fetches the list has saved so far.
+    pub fn spared(&self) -> u64 {
+        self.spared.load(Ordering::Relaxed)
+    }
+
+    /// How many hosts on the list were asked anyway.
+    pub fn asked(&self) -> u64 {
+        self.asked.load(Ordering::Relaxed)
+    }
+
+    /// Whether this host can be answered from the list instead of the network.
+    ///
+    /// The resample die is the host id mixed with the day, which does two
+    /// things. It rotates, so a host skipped today is a candidate tomorrow and
+    /// no host is written off permanently. And it is a function of arguments
+    /// the caller already has rather than of a counter or a random number, so
+    /// two machines replaying the same run take the same decision and produce
+    /// the same rows, which is the rule the rest of the crate follows about
+    /// clocks.
+    pub(crate) fn spares(&self, host: HostId, now_ms: u64) -> bool {
+        if self.hosts.binary_search(&host).is_err() {
+            return false;
+        }
+        if self.sample > 0 {
+            let id = u64::from_be_bytes(*host.as_bytes());
+            if (id ^ (now_ms / TTL_MS)).is_multiple_of(u64::from(self.sample)) {
+                self.asked.fetch_add(1, Ordering::Relaxed);
+                return false;
+            }
+        }
+        self.spared.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+}
+
 /// Robots.txt per host, fetched once and shared.
 #[derive(Default)]
 pub struct RobotsCache {
     hosts: Mutex<HashMap<HostId, Arc<OnceCell<Entry>>>>,
+    /// What a published corpus already knows, when a run handed one over.
+    silent: OnceLock<Silent>,
 }
 
 impl RobotsCache {
@@ -103,6 +210,28 @@ impl RobotsCache {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Hand the cache what a published corpus already knows.
+    ///
+    /// `&self` and a `OnceLock` rather than a constructor argument, because a
+    /// [`Crawler`](crate::Crawler) builds its cache four layers down inside an
+    /// `Arc` and threading a list through every one of those signatures would
+    /// change four public shapes to carry something almost every caller leaves
+    /// empty. The list also arrives late: it is tens of gigabytes of parquet
+    /// on the hub, read while the state layer is opening.
+    ///
+    /// False when a list was already set, in which case this one is dropped.
+    /// One corpus per run, and a second call is a bug in the caller rather
+    /// than a merge somebody wanted.
+    pub fn learn(&self, silent: Silent) -> bool {
+        self.silent.set(silent).is_ok()
+    }
+
+    /// The corpus this cache was given, if it was given one.
+    #[must_use]
+    pub fn silent(&self) -> Option<&Silent> {
+        self.silent.get()
     }
 
     /// How many hosts are held.
@@ -200,6 +329,15 @@ impl RobotsCache {
         let mut fetched = false;
         let entry = cell
             .get_or_init(|| async {
+                // The corpus first, because the whole point is to not make the
+                // request. `fetched` stays false: nothing was asked, so
+                // nothing may be published as an answer from this host. A row
+                // saying we heard silence at this timestamp when we heard
+                // nothing at all would put a fetch in the corpus that never
+                // happened, and the corpus is the thing this is reading.
+                if self.silent.get().is_some_and(|s| s.spares(host, now_ms)) {
+                    return corpus_entry(now_ms);
+                }
                 fetched = true;
                 let got = fetch_robots(fetch, origin, tier).await;
                 Entry {
@@ -263,6 +401,25 @@ pub async fn fetch_entry<F: Fetch + ?Sized>(
         expires_ms: now_ms + TTL_MS,
         status: got.status,
         body: got.body,
+    }
+}
+
+/// The entry for a host the corpus says never answered.
+///
+/// Byte for byte what a fetch that got no response produces: status zero, no
+/// body, the empty digest, and [`Robots::for_status`] run on the same pair, so
+/// the decision a lease gets is the decision it would have got after waiting
+/// six seconds for nothing. Building it through `for_status` rather than
+/// writing `disallow_all` here is deliberate, because there is then one place
+/// that decides what silence means and doc 07.4 can change it once.
+fn corpus_entry(now_ms: u64) -> Entry {
+    Entry {
+        robots: Arc::new(Robots::for_status(0, b"")),
+        digest: digest_of(b""),
+        fetched_ms: now_ms,
+        expires_ms: now_ms + TTL_MS,
+        status: 0,
+        body: None,
     }
 }
 

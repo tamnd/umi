@@ -13,9 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use umi_state::{HostRow, State};
-use umi_types::RowKey;
+use umi_types::{HostId, RowKey};
 
 use crate::clock::FixedClock;
+use crate::robots::Silent;
 use crate::run::Crawler;
 use crate::run_tests::{Canned, Collected, T0, config, crawler, page, seeded};
 
@@ -594,4 +595,144 @@ async fn a_host_whose_robots_would_not_load_comes_round_again() {
         .expect("tick");
     assert_eq!(report.fetched, 1, "the site never came back: {report:?}");
     assert!(later.fetcher().asked_for(&url));
+}
+
+#[tokio::test]
+async fn a_host_the_corpus_never_heard_from_is_not_asked_again() {
+    // The finding on issue #47, written down as a test. Four page window arms
+    // on server3 spent between 83 and 97 percent of every page lease inside
+    // robots.txt, because a broad crawl at depth two meets a new host on
+    // nearly every page and roughly forty percent of hosts at those ranks
+    // never answer at all. A host that never answers costs the whole timeout,
+    // and it costs it again tomorrow, and the published corpus has already
+    // paid it for tens of millions of them.
+    //
+    // The fetcher serves a perfectly good robots.txt on purpose. If the crawl
+    // asks, the answer allows everything and the page is fetched, so the two
+    // assertions below can only hold if it never asked.
+    let url = format!("{ORIGIN}/a");
+    let state = seeded(&[&url]).await;
+    let fetch = Canned::new()
+        .robots(ORIGIN, "User-agent: *\nAllow: /\n")
+        .html(&url, &page("A", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+    let host = RowKey::for_url(&url, None).expect("a crawlable url").host;
+    assert!(crawler.robots().learn(Silent::new(vec![host], 0)));
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+
+    assert!(
+        !crawler.fetcher().asked_for(&format!("{ORIGIN}/robots.txt")),
+        "the corpus already knows this host is silent: {:?}",
+        crawler.fetcher().asked()
+    );
+    assert!(
+        !crawler.fetcher().asked_for(&url),
+        "silence disallows the host, so the page is not a fetch we may make"
+    );
+    assert_eq!(report.fetched, 0, "{report:?}");
+
+    let silent = crawler.robots().silent().expect("just handed over");
+    assert_eq!(silent.spared(), 1);
+    assert_eq!(silent.asked(), 0);
+}
+
+#[tokio::test]
+async fn a_host_the_corpus_does_not_carry_is_asked_as_before() {
+    // The other half, and the one that says the list is a list rather than a
+    // switch. A run that hands over a corpus still crawls every host the
+    // corpus has nothing to say about, at full speed, with no extra lookup
+    // visible in the result.
+    let url = format!("{ORIGIN}/a");
+    let state = seeded(&[&url]).await;
+    let fetch = Canned::new()
+        .robots(ORIGIN, "User-agent: *\nAllow: /\n")
+        .html(&url, &page("A", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+    let elsewhere = RowKey::for_url("https://other.example/x", None)
+        .expect("a crawlable url")
+        .host;
+    assert!(crawler.robots().learn(Silent::new(vec![elsewhere], 0)));
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+
+    assert_eq!(report.fetched, 1, "{report:?}");
+    assert!(crawler.fetcher().asked_for(&format!("{ORIGIN}/robots.txt")));
+    assert!(crawler.fetcher().asked_for(&url));
+    let silent = crawler.robots().silent().expect("just handed over");
+    assert_eq!(silent.spared(), 0);
+    assert_eq!(silent.asked(), 0);
+}
+
+#[tokio::test]
+async fn the_resample_rate_asks_a_listed_host_anyway() {
+    // Why the list cannot be a permanent verdict. A host that was down for the
+    // week the corpus was built is a host we would otherwise never speak to
+    // again, and the web has more of those than it has hosts that are gone for
+    // good. One in `sample` is asked regardless, and a rate of one means every
+    // one of them, which is the setting that turns the list back off.
+    let url = format!("{ORIGIN}/a");
+    let state = seeded(&[&url]).await;
+    let fetch = Canned::new()
+        .robots(ORIGIN, "User-agent: *\nAllow: /\n")
+        .html(&url, &page("A", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+    let host = RowKey::for_url(&url, None).expect("a crawlable url").host;
+    assert!(crawler.robots().learn(Silent::new(vec![host], 1)));
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+
+    assert_eq!(report.fetched, 1, "{report:?}");
+    assert!(crawler.fetcher().asked_for(&format!("{ORIGIN}/robots.txt")));
+    let silent = crawler.robots().silent().expect("just handed over");
+    assert_eq!(silent.spared(), 0);
+    assert_eq!(silent.asked(), 1);
+}
+
+#[test]
+fn a_corpus_list_sorts_itself_and_drops_duplicates() {
+    // The loader reads a file at a time off the hub and appends, so it hands
+    // over whatever order the files came back in, with a host that appears in
+    // two of them appearing twice. Sorting is not tidiness here: the lookup is
+    // a binary search, and a binary search over an unsorted vector does not
+    // fail loudly, it quietly says no to hosts that are in the list.
+    let one = HostId::derive(b"one.example");
+    let two = HostId::derive(b"two.example");
+    let three = HostId::derive(b"three.example");
+    let silent = Silent::new(vec![two, one, two, three, one], 0);
+    assert_eq!(silent.len(), 3);
+    assert!(!silent.is_empty());
+    for host in [one, two, three] {
+        assert!(silent.spares(host, T0), "{host} went missing in the sort");
+    }
+    assert_eq!(silent.spared(), 3);
+    assert!(Silent::new(Vec::new(), 0).is_empty());
+}
+
+#[test]
+fn the_resample_die_turns_over_with_the_day() {
+    // The rotation is what stops a host being written off forever, and it has
+    // to come from the arguments rather than from a counter or a random
+    // number, because two machines replaying the same run have to take the
+    // same decision and write the same rows. A rate of two over a fortnight
+    // should ask a listed host on about half the days, and the only thing
+    // worth asserting is that it is neither never nor always.
+    let host = HostId::derive(b"sometimes.example");
+    let silent = Silent::new(vec![host], 2);
+    let asked = (0..14)
+        .filter(|day| !silent.spares(host, T0 + day * A_DAY_MS))
+        .count();
+    assert!(asked > 0, "a listed host is never asked again");
+    assert!(asked < 14, "the list saves nothing");
+    assert_eq!(silent.asked(), asked as u64);
+    assert_eq!(silent.spared(), 14 - asked as u64);
 }
