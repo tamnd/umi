@@ -41,7 +41,7 @@ impl Plain {
             // stops at the first one that leaves the registrable domain and a
             // policy closure cannot report which URL it stopped at.
             .redirect(reqwest::redirect::Policy::none())
-            .pool_max_idle_per_host(config.per_host)
+            .pool_max_idle_per_host(config.idle_per_host)
             .https_only(false)
             .build()
             .map_err(|e| FetchError::Client(e.to_string()))?;

@@ -127,6 +127,20 @@ const KNOWN_FILES: usize = 8;
 /// clock is DNS and the connect. The tail of hosts that never answer is thick,
 /// so the number that matters is how many of those a run can be waiting on at
 /// once.
+///
+/// The window is what sets the rate, which is worth writing down because the
+/// obvious rival explanation is [`PATIENCE`] and that one turned out to be
+/// wrong. Thirty thousand hosts at rank forty million, same list, resolver
+/// cache flushed between runs: 256 took 229 seconds, 1024 took 117 and 126,
+/// and 4096 took 106. Four times the window doubles the rate up to about a
+/// thousand and then buys eleven percent, which is barely above the eight
+/// percent two identical runs differ by.
+///
+/// So the useful reading is that the plateau is near a thousand and the
+/// default is well under it. It is left there because this default is also
+/// what a laptop gets, and 1024 sockets against 1024 strangers is not a thing
+/// to do to somebody's home connection without being asked. The fleet passes
+/// `--concurrency 1024` and should.
 pub const CONCURRENCY: u16 = 256;
 
 /// The directory a run writes into when nobody says where.
@@ -134,23 +148,47 @@ const DEFAULT_OUT: &str = "./umi-robots";
 
 /// How long a run waits on a host that is not answering, in seconds.
 ///
-/// This is the setting that decides the rate of a robots pass, and it took a
-/// while to see that. Three runs over the domain ranking line up on how much
-/// of the band is silent rather than on anything else: ranks 10 to 18 million
-/// at 35.6 percent silent ran 275.9 hosts a second, ranks 18 to 26 million at
-/// 55.9 percent ran 155.3, and a pass over hosts already known to be live at
-/// 4.2 percent ran 341.3. A host that answers costs a lookup and one small
-/// request. A host that does not costs the whole wait, twice over because of
-/// the second ask, and holds a fetch slot the entire time. Raising concurrency
-/// does not help, because slots are not what is short.
+/// This was put here on the theory that it sets the rate of a robots pass, and
+/// the measurement says it does not. Thirty thousand hosts at rank forty
+/// million, same list every time, window of 1024, resolver cache flushed
+/// between runs:
 ///
-/// So the number is a trade and not a safety margin: patience buys coverage of
-/// slow hosts and costs rate on dead ones. [`crate::robots`] measures it rather
-/// than assuming it, and the default is what that measurement settled on.
+/// | patience | seconds | hosts that answered |
+/// | --- | --- | --- |
+/// | 10 | 124 | 17,778 |
+/// | 5 | 135 | 17,747 |
+/// | 3 | 117 | 17,711 |
+/// | 2 | 110 | 17,670 |
+/// | 10 again | 144 | 17,756 |
 ///
-/// A crawl of pages keeps the fetcher's own default, which is longer. A page is
-/// worth waiting for and there is one robots.txt per host either way.
+/// The two runs at 10 differ by 16 percent from each other, which is most of
+/// the spread across the whole column, so a fifth of the patience buys
+/// something between nothing and eleven percent. What it costs is clearer:
+/// about a hundred hosts, half a percent of the answers, that would have come
+/// back given longer.
+///
+/// So the default stays where the fetcher had it, and the flag stays because
+/// the trade is real even if it is small and because an operator racing a
+/// deadline should be able to make it. What the measurement rules out is the
+/// idea that dead hosts sit out the whole timeout. Most of them fail long
+/// before it: a name that does not exist, a connection refused, a reset.
 pub const PATIENCE: u64 = 10;
+
+/// How many connections a finished request leaves open, per host.
+///
+/// None, which is the opposite of what a crawl wants and the right answer here.
+/// A crawl comes back to a host for the next page and the handshake it saves is
+/// the expensive part of the fetch. This command asks each host once, twice at
+/// most and only when the first ask got nothing back, so a kept connection is
+/// never reused by anybody.
+///
+/// It is not free to keep. Sampled on server3 at a window of 4096, the process
+/// was holding 17,364 file descriptors and 14,130 established sockets, so more
+/// than nine thousand of them were connections to hosts the run had already
+/// finished with and would not speak to again. They sit in the poll set, they
+/// hold kernel buffers on both ends, and the far end is a site keeping a
+/// connection open for a crawler that has left.
+const IDLE: usize = 0;
 
 /// How much longer than [`PATIENCE`] a whole fetch may take.
 ///
@@ -584,6 +622,7 @@ fn waiting(patience: u64) -> FetchConfig {
     config.connect_timeout = wait;
     config.read_timeout = wait;
     config.total_timeout = wait * PATIENCE_TOTAL;
+    config.idle_per_host = IDLE;
     config
 }
 
