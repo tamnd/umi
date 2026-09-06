@@ -259,6 +259,28 @@ impl RobotsCache {
             .is_some_and(|cell| cell.get().is_none_or(|e| e.fresh(now_ms)))
     }
 
+    /// Whether the answer for this host is in hand right now.
+    ///
+    /// The other half of [`holds`](Self::holds), and the difference is the
+    /// whole point of both. `holds` answers "does this host need a request
+    /// spent on it", so a fetch already in flight counts. This answers "can a
+    /// caller read the answer without waiting", so a fetch already in flight
+    /// does not count: the cell is there but whoever asks for it goes to sleep
+    /// until the origin replies.
+    ///
+    /// What that is for is the window. A page slot spent asleep on somebody
+    /// else's robots.txt is a page slot not fetching a page, and on a broad
+    /// crawl that was most of the window. A caller holding a slot can ask this
+    /// first and go and do something else instead.
+    pub async fn ready(&self, host: HostId, now_ms: u64) -> bool {
+        self.hosts
+            .lock()
+            .await
+            .get(&host)
+            .and_then(|cell| cell.get())
+            .is_some_and(|entry| entry.fresh(now_ms))
+    }
+
     /// What robots.txt says about `url`, fetching the file first if we do not
     /// have a fresh copy.
     ///

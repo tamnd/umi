@@ -2317,6 +2317,17 @@ impl Pressure {
 /// fetch before it may ask for anything, and doc 07.6's politeness delay, which
 /// a lease waits out twice on a host it has never seen.
 ///
+/// `warmed` and `stepped` are the two halves of what the crawler does about
+/// that robots.txt figure, and they are only worth anything read together.
+/// `warmed` is files fetched ahead of the lease that wanted them, so it says
+/// how much of the bill the prefetch went after. `stepped` is how often a
+/// window slot found the file still in the air and took the lease behind it
+/// instead, so it says how much of the bill the prefetch was too late for. A
+/// crawl where both are high and the robots figure is low is the pair working.
+/// A crawl where `stepped` is at sixteen times the pages and the robots figure
+/// is still high has a queue too shallow for either of them to help, which is a
+/// frontier problem and not a fetch one.
+///
 /// `state` is the last piece of the arithmetic and it is the one that catches
 /// the case where the first two do not add up. The window and the lease cost
 /// are what the fetches did, and they are measured on the fetch tasks. This is
@@ -2359,7 +2370,7 @@ fn progress(
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  \
-         {} ms per page ({} robots, {} polite, {} warmed)  \
+         {} ms per page ({} robots, {} polite, {} warmed, {} stepped)  \
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
          {:.0}s links for {} of {})  \
@@ -2372,6 +2383,7 @@ fn progress(
         report.robots_mean_ms(),
         report.waited_mean_ms(),
         report.robots_warmed,
+        report.robots_stepped,
         (report.store_waited_ms + report.ask_waited_ms) as f64 / 1000.0,
         report.ask_waited_ms as f64 / 1000.0,
         report.asks,
