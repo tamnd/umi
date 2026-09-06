@@ -222,6 +222,11 @@ pub struct Options {
     pub rps: f32,
     /// Simultaneous fetches in flight.
     pub concurrency: u16,
+    /// How many domains one ask to the frontier may take work from.
+    ///
+    /// [`None`] derives it from `concurrency`, which is what a broad crawl
+    /// wants. Set it to compare two widths on the same seed.
+    pub max_domains: Option<usize>,
     /// Highest tier allowed.
     pub tier_max: u8,
     /// Doc 05.7's opt in. Off by default and the only thing that lets a lease
@@ -880,11 +885,25 @@ fn settings(options: &Options) -> Result<Settings, Error> {
         .unwrap_or(u32::MAX)
         .min(u32::try_from(options.max_pages.unwrap_or(u64::MAX)).unwrap_or(u32::MAX))
         .max(1);
+    // One domain per slot in the window, because on a broad crawl that is the
+    // ratio. An ask visits `max_domains` domains and almost every domain it
+    // reaches has one url due and the rest of its frontier inside a politeness
+    // window, so an ask returns about as many urls as it visited domains. The
+    // default of 512 was picked when the window was 512 and it stayed at 512
+    // when the window went to 4096, which turned it into a supply limit
+    // nobody had set on purpose: measured on server2 at `--concurrency 4096`
+    // the loop spent 155 seconds of a tick waiting on asks and the window ran
+    // at 593 of its 4096 slots. Never below the old default, because a narrow
+    // window on a focused crawl still wants domains to choose between.
+    let max_domains = options
+        .max_domains
+        .unwrap_or_else(|| in_flight.max(CrawlConfig::default().max_domains));
     Ok(Settings {
         config: CrawlConfig {
             fetcher: FetcherId::LOCAL,
             in_flight,
             batch,
+            max_domains,
             max_tier: tier(options.tier_max, options.allow_supervised),
             ..CrawlConfig::default()
         },
@@ -2581,6 +2600,7 @@ impl Default for Options {
             watch: false,
             rps: 1.0,
             concurrency: 4,
+            max_domains: None,
             tier_max: 3,
             allow_supervised: false,
             tabs: 0,

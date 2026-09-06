@@ -92,6 +92,7 @@ Budget
 Rate
   --rps <f>                    per host, clamped by doc 07.6, default 1.0
   --concurrency <n>            default 4
+  --max-domains <n>            domains one ask may take work from
 
 Fetching
   --tier <max>                 highest tier allowed, default 3 in focused mode
@@ -135,6 +136,10 @@ example.com   4212 done   118 in flight   9871 queued   3.9 p/s   T1 92% T2 7% T
 ```
 
 `bottleneck` is the single most useful field and it is one word: `politeness`, `cpu`, `disk`, `network`, `render-pool`, `origin-slow`, or `none`. It comes from whichever queue is saturated. A user who sees `politeness` understands immediately that raising concurrency will not help, which is the question everyone asks first.
+
+`--concurrency` is the window and `--max-domains` is what feeds it, and the second one is the one people leave alone. An ask to the frontier visits at most `max_domains` domains, and on a broad crawl almost every domain it reaches has one url due and the rest of its frontier inside a politeness window, so an ask returns about as many urls as it visited domains. A window of four thousand fed by asks of five hundred runs at five hundred. Measured on server2 at `--concurrency 4096` with the old fixed default, the loop spent 155 seconds of a tick waiting on asks and the window averaged 593 of its 4096 slots. So the default is now the concurrency rather than a constant, never below 512, and the flag is there to compare two widths on one seed rather than because anybody should need to set it.
+
+`in flight` on the progress line is the mean occupancy of that window and it is the field to read before either flag. A window that is full is a crawl limited by what is in it, and a window at a seventh of its size is a crawl limited by the thing that fills it, and no amount of raising `--concurrency` moves the second one.
 
 ### `umi publish`
 
