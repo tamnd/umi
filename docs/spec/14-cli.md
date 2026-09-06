@@ -141,6 +141,8 @@ example.com   4212 done   118 in flight   9871 queued   3.9 p/s   T1 92% T2 7% T
 
 `in flight` on the progress line is the mean occupancy of that window and it is the field to read before either flag. A window that is full is a crawl limited by what is in it, and a window at a seventh of its size is a crawl limited by the thing that fills it, and no amount of raising `--concurrency` moves the second one.
 
+`ms per slot` and `ms per page` are the pair that says which. The slot figure is what one lease cost the window from the moment it was handed to the runtime to the moment the answer was collected, and the page figure is the part of that which was the fetch. The window over the slot figure is the rate. They come apart in two places, and both are printed next to the slot figure because they have different answers. `waiting to start` is a lease counted against the window, holding its host's politeness slot, that has not sent a byte because every worker thread is busy, and it means the process has taken on more concurrent work than the box can run. `uncollected` is a lease that finished and is still holding its slot because the loop has not come round to it, and it means the loop is the constraint, since the fetches run on the whole runtime and the harvest runs on one task. A crawl whose slot figure is three times its page figure is not waiting on origins whatever `bottleneck` says.
+
 ### `umi publish`
 
 ```

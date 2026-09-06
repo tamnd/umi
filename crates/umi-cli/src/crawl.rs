@@ -2328,13 +2328,29 @@ impl Pressure {
 /// this line: a crawl configured for 256 that is running 30 is not fetching
 /// slowly, it is not fetching, and no other field says so.
 ///
-/// `ms per page` is what one lease cost the window from claim to answer. The
-/// window over that number is the rate, so those two fields next to each other
-/// are the whole of doc 16's gate 3.1 arithmetic, and the rest of the line is
-/// what the crawl has to show for it. The two figures in brackets are the parts
-/// of it that are not the page: the robots.txt the first lease on a host has to
-/// fetch before it may ask for anything, and doc 07.6's politeness delay, which
-/// a lease waits out twice on a host it has never seen.
+/// `ms per slot` is what one lease cost the window, and `ms per page` is the
+/// part of that which was the fetch. The window over the slot figure is the
+/// rate, so those two fields next to each other are the whole of doc 16's gate
+/// 3.1 arithmetic, and the rest of the line is what the crawl has to show for
+/// it.
+///
+/// The two are not the same number and the difference is the thing this line
+/// exists to catch. A slot is taken when the loop hands the lease to the
+/// runtime and it is free again when the loop has collected the answer, so a
+/// lease that waits for a worker thread to pick it up, or that finishes and
+/// then waits for the loop to come round, is holding a slot the whole time
+/// without fetching anything. `waiting to start` is the first of those and says
+/// the process has taken on more concurrent work than it can run. `uncollected`
+/// is the second and says the loop is the constraint, because the fetches run
+/// on the whole runtime and the harvest runs on one task. A crawl whose slot
+/// figure is three times its page figure is not being held up by origins
+/// however much the bottleneck field says so, and no amount of work on the
+/// fetch path will move it.
+///
+/// The two figures in brackets after `ms per page` are the parts of the fetch
+/// that are not the page: the robots.txt the first lease on a host has to fetch
+/// before it may ask for anything, and doc 07.6's politeness delay, which a
+/// lease waits out twice on a host it has never seen.
 ///
 /// `warmed` and `stepped` are the two halves of what the crawler does about
 /// that robots.txt figure, and they are only worth anything read together.
@@ -2389,6 +2405,7 @@ fn progress(
     let elapsed = now_ms.saturating_sub(started_ms).max(1) as f64 / 1000.0;
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  \
+         {} ms per slot ({} waiting to start, {} uncollected)  \
          {} ms per page ({} robots, {} polite, {} warmed, {} stepped)  \
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
@@ -2398,6 +2415,9 @@ fn progress(
         report.window_mean(),
         queued,
         summary.rows as f64 / elapsed,
+        report.slot_mean_ms(),
+        report.queued_mean_ms(),
+        report.uncollected_mean_ms(),
         report.lease_mean_ms(),
         report.robots_mean_ms(),
         report.waited_mean_ms(),
