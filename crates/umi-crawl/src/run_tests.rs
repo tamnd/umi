@@ -3472,3 +3472,49 @@ async fn the_last_lease_in_the_queue_is_never_stepped_over() {
     assert_eq!(report.fetched, 1, "{report:?}");
     assert_eq!(report.robots_stepped, 0, "{report:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_slot_costs_at_least_what_the_fetch_in_it_cost() {
+    // The whole point of the slot figure is that it is never smaller than the
+    // page figure. A lease is handed to the runtime, fetched, and collected,
+    // and the first and third of those are free only on a box with nothing
+    // else to do. Getting the sign wrong here would report a window emptier
+    // than it is, which is the one direction that sends somebody off to
+    // optimise the fetch path for no reason.
+    let (urls, canned) = a_page_each(16);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let fetch = Slow {
+        inner: canned,
+        per_request: Duration::from_millis(20),
+    };
+    let crawler = Crawler::new(
+        fetch,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    assert_eq!(report.fetched, 16, "{report:?}");
+    assert!(
+        report.slot_mean_ms() >= report.lease_mean_ms(),
+        "a slot cost {} ms and the page in it cost {} ms",
+        report.slot_mean_ms(),
+        report.lease_mean_ms()
+    );
+    // The three parts are the whole of it, give or take the rounding of four
+    // integer divisions.
+    let parts = report.queued_mean_ms() + report.lease_mean_ms() + report.uncollected_mean_ms();
+    assert!(
+        report.slot_mean_ms().abs_diff(parts) <= 3,
+        "a slot cost {} ms against {parts} ms of parts",
+        report.slot_mean_ms()
+    );
+}

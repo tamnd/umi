@@ -814,6 +814,22 @@ pub struct TickReport {
     /// so the window drains by however long the loop waits before trying
     /// again.
     pub asks_empty: usize,
+    /// Milliseconds leases spent held by the runtime before they began.
+    ///
+    /// The first of the three things a window slot can be doing, and the one
+    /// that says the process has bitten off more than it can chew. A slot here
+    /// is a lease that has been counted against the window, is holding its
+    /// host's politeness slot, and has not sent a byte, because every worker
+    /// thread is busy with something else.
+    pub queued_ms: u64,
+    /// Milliseconds finished leases spent waiting for the loop to collect them.
+    ///
+    /// The third of the three, and the one that says the loop is the
+    /// constraint. The fetch tasks run on the whole runtime and the harvest
+    /// runs on one task, so a loop that cannot keep up leaves finished work
+    /// sitting in the window. The slot is spent either way: nothing else may
+    /// use it until the loop gets there.
+    pub uncollected_ms: u64,
 }
 
 /// Where a lease's wall clock went.
@@ -830,6 +846,17 @@ struct Spent {
     robots_ms: u32,
     /// Claim to answer, which is the other two plus the fetch and the parse.
     total_ms: u32,
+    /// Handed to the runtime to the first moment a worker ran the task.
+    ///
+    /// Zero on a box with cores to spare. It stops being zero when the process
+    /// has taken on more concurrent work than it can run, and that is a
+    /// different problem from a slow origin even though the window looks the
+    /// same from the outside either way.
+    queued_ms: u32,
+    /// When the answer was ready, which is what the loop measures its own lag
+    /// against. [`None`] cannot happen on a lease the loop harvests, because
+    /// [`one`](Shared::one) sets it on the way out of every path.
+    done_at: Option<Instant>,
 }
 
 impl TickReport {
@@ -859,6 +886,9 @@ impl TickReport {
     /// puts one in on every pass, so the count sits at the window size whatever
     /// the fetches are doing. It reports a full window for a crawl that has
     /// stopped fetching, which is the exact case worth catching.
+    ///
+    /// The gap between the two is worth having, though, and
+    /// [`slot_mean_ms`](Self::slot_mean_ms) is where it went.
     ///
     /// This is the number that says whether the crawl is limited by the window
     /// or by what is in it. A tick configured for 256 that averages 18 is not
@@ -893,6 +923,33 @@ impl TickReport {
     #[must_use]
     pub fn waited_mean_ms(&self) -> u64 {
         self.mean(self.waited_ms)
+    }
+
+    /// What one lease cost the window from the moment it took a slot to the
+    /// moment the slot came free again.
+    ///
+    /// Always at least [`lease_mean_ms`](Self::lease_mean_ms) and on a busy box
+    /// a good deal more, and the difference is the point. A slot is taken when
+    /// the loop hands the lease to the runtime and it is not free again until
+    /// the loop has collected the answer, so the fetch is only the middle of
+    /// three things a slot does. The window over this number is the rate,
+    /// exactly the way the window over the lease cost would be if the other two
+    /// were zero.
+    #[must_use]
+    pub fn slot_mean_ms(&self) -> u64 {
+        self.mean(self.queued_ms + self.lease_ms + self.uncollected_ms)
+    }
+
+    /// The part of that spent waiting for a runtime worker to start the task.
+    #[must_use]
+    pub fn queued_mean_ms(&self) -> u64 {
+        self.mean(self.queued_ms)
+    }
+
+    /// The part of that spent finished and waiting for the loop to collect it.
+    #[must_use]
+    pub fn uncollected_mean_ms(&self) -> u64 {
+        self.mean(self.uncollected_ms)
     }
 
     fn mean(&self, total: u64) -> u64 {
@@ -1340,6 +1397,11 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 Ok(fetched) => fetched,
                 Err(joined) => std::panic::resume_unwind(joined.into_panic()),
             };
+            // Here and not down with the rest of the folding, because what this
+            // measures is how long the answer sat waiting for this loop and
+            // everything below is the loop taking its time over it.
+            report.queued_ms += u64::from(done.spent.queued_ms);
+            report.uncollected_ms += done.spent.done_at.map_or(0, |at| u64::from(ms(at)));
             // This fetch is over, so the host it was on is free and the clock
             // has moved, which are the two things that can turn a scheduler
             // that had nothing ready into one that has.
@@ -1593,7 +1655,10 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
     ) -> JoinHandle<Fetched> {
         let shared = Arc::clone(&self.shared);
         let floors = Arc::clone(floors);
-        tokio::spawn(async move { shared.one(lease, at, &floors).await })
+        // Started here rather than inside the task, because the gap between
+        // the two is the thing it is here to measure. See `Spent::queued_ms`.
+        let queued = Instant::now();
+        tokio::spawn(async move { shared.one(lease, at, &floors, queued).await })
     }
 
     /// Start fetching robots.txt for the hosts a batch of leases will need it
@@ -2274,11 +2339,21 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// ones that return early. A lease that spent thirty seconds on a
     /// robots.txt that never arrived is exactly the lease a rate measurement
     /// needs to see, and it leaves through one of those returns.
-    async fn one(&self, lease: umi_state::Lease, start_ms: u64, floors: &HostFloors) -> Fetched {
+    async fn one(
+        &self,
+        lease: umi_state::Lease,
+        start_ms: u64,
+        floors: &HostFloors,
+        queued: Instant,
+    ) -> Fetched {
         let began = Instant::now();
-        let mut spent = Spent::default();
+        let mut spent = Spent {
+            queued_ms: ms(queued),
+            ..Spent::default()
+        };
         let mut out = self.run_one(lease, start_ms, floors, &mut spent).await;
         spent.total_ms = ms(began);
+        spent.done_at = Some(Instant::now());
         out.spent = spent;
         out
     }
