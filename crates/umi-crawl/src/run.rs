@@ -269,6 +269,18 @@ struct Supply {
     patience: usize,
     /// The ask already on its way back, if there is one.
     asking: Option<Asking>,
+    /// The moment past which this tick takes no more work.
+    ///
+    /// A tick leases a whole batch and then drains it, so the only place a
+    /// crawl could stop was between two of them. On a broad crawl a batch is
+    /// minutes, and `--for 6m` on server3 was still fetching at ten. That is
+    /// half again as long as the operator asked for, and it makes every timed
+    /// measurement a measurement of the batch size as much as of the crawl.
+    ///
+    /// This stops the tick handing out new leases. What is already in flight
+    /// is finished and written, because a lease dropped on the floor is a URL
+    /// nobody knows the state of and doc 09.5 would rather have the row.
+    until: Option<Instant>,
 }
 
 /// One ask to the scheduler, in flight.
@@ -1143,6 +1155,32 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
     /// than released, because an error here means we do not know what happened
     /// and the safe reading of that is that the work was not done.
     pub async fn tick<S: Sink + 'static>(&self, sink: &Arc<S>) -> Result<TickReport, CrawlError> {
+        self.tick_until(sink, None).await
+    }
+
+    /// The same tick, with a moment past which it takes no more work.
+    ///
+    /// A caller with a deadline needs this because a tick is not a small unit.
+    /// It leases a whole batch and drains it, so a crawl that only checks its
+    /// budget between ticks overshoots by however long the batch in progress
+    /// takes. On a broad crawl that is minutes: `--for 6m` on server3 ran to
+    /// ten, which is not a rounding error and is the difference between a
+    /// measurement and an anecdote.
+    ///
+    /// Past the deadline the tick stops handing out leases and finishes what
+    /// is in flight. It does not abandon those fetches. A dropped lease is a
+    /// URL nobody knows the state of until it expires, and finishing costs at
+    /// most one fetch timeout against a batch that would otherwise have cost
+    /// minutes.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`tick`](Self::tick).
+    pub async fn tick_until<S: Sink + 'static>(
+        &self,
+        sink: &Arc<S>,
+        until: Option<Instant>,
+    ) -> Result<TickReport, CrawlError> {
         // The schedule lives in memory and the urls do not, so a crawler whose
         // gate is empty has no domains to take work from and leases nothing
         // however full the store is. Seeds go in through `umi seed` and through
@@ -1199,6 +1237,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             left: batch,
             patience: 0,
             asking: None,
+            until,
         };
 
         // Fill the window, then top it up as each one lands, which is what
@@ -1635,6 +1674,14 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         warming: &Warming<'_>,
         report: &mut TickReport,
     ) -> Result<Option<(umi_state::Lease, u64)>, CrawlError> {
+        // Before the queue and not after it, because a lease already in hand
+        // is still a fetch this tick would have to wait for, and the deadline
+        // is the caller saying it has waited enough. What is in hand goes back
+        // to the store when the tick ends, so nothing is lost by not starting
+        // it.
+        if supply.until.is_some_and(|until| Instant::now() >= until) {
+            return Ok(None);
+        }
         loop {
             if let Some(next) = self.gate(&mut supply.queue, deferred, report) {
                 // Below one ask's worth, which in the steady state means there

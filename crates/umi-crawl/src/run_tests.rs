@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use umi_fetch::outcome::{Page, Version};
@@ -767,6 +767,41 @@ async fn a_tick_leases_fetches_and_completes() {
     // nothing to do rather than handing the same URL out again.
     let again = crawler.tick(&sink).await.expect("tick");
     assert!(again.idle(), "the same url was leased twice: {again:?}");
+}
+
+#[tokio::test]
+async fn a_deadline_already_past_leases_nothing_and_reports_idle() {
+    // What `--for` needs and did not have. A tick takes a whole batch and then
+    // drains it, so a crawl that only looked at its budget between ticks ran
+    // over by however long the batch took, which on server3 was `--for 6m`
+    // still fetching at ten minutes.
+    let state = seeded(&[
+        "https://example.com/a",
+        "https://example.com/b",
+        "https://example.com/c",
+    ])
+    .await;
+    let fetch = Canned::new()
+        .robots("https://example.com", "User-agent: *\nAllow: /\n")
+        .html("https://example.com/a", &page("A", &[]))
+        .html("https://example.com/b", &page("B", &[]))
+        .html("https://example.com/c", &page("C", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+    let sink = Arc::new(Collected::default());
+
+    let past = Instant::now() - Duration::from_secs(1);
+    let report = crawler.tick_until(&sink, Some(past)).await.expect("tick");
+    assert_eq!(report.leased, 0, "{report:?}");
+    assert!(report.idle(), "{report:?}");
+    assert!(
+        sink.rows().is_empty(),
+        "a page was fetched past the deadline"
+    );
+
+    // Nothing was consumed either. The urls are still there for the next tick,
+    // because a deadline stops the crawl and does not spend its frontier.
+    let after = crawler.tick(&sink).await.expect("tick");
+    assert_eq!(after.leased, 3, "{after:?}");
 }
 
 #[tokio::test]
