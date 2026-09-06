@@ -233,17 +233,12 @@ fn the_card_is_written_the_way_the_rest_of_the_project_is() {
 
 #[test]
 fn the_robots_card_says_how_many_rows_are_a_second_answer_for_the_same_host() {
-    // The reader who counts rows and calls it a host count is off by 23
-    // percent, and the reader who takes any row for the current answer gets a
-    // stale one. Both are avoidable by saying the number and showing the query,
-    // and neither is avoidable by fixing the files, because a published file is
-    // never rewritten.
+    // The reader who counts rows and calls it a host count is wrong by whatever
+    // the repeat rate happens to be, and the reader who takes any row for the
+    // current answer gets a stale one. The number moves, the query does not, so
+    // the card carries both and leans on the query.
     let card = general(Family::Robots);
     assert!(card.contains("more than once"), "{card}");
-    assert!(
-        card.contains("do not rewrite a published file"),
-        "the card does not say why the duplicates are still there",
-    );
     assert!(
         card.contains("QUALIFY row_number() OVER (PARTITION BY host ORDER BY fetched_at_ms DESC)"),
         "the card does not show how to take one row per host",
@@ -255,5 +250,14 @@ fn the_robots_card_says_how_many_rows_are_a_second_answer_for_the_same_host() {
     assert!(
         !card.contains("keeps history rather than replacing rows"),
         "{card}"
+    );
+
+    // The rate fell from 23.1 percent to 0.46 percent because files were taken
+    // out, and a reader who wants to know where the rows went has one place to
+    // look. Saying the number without saying that would leave them assuming a
+    // count they can no longer reproduce was simply wrong.
+    assert!(
+        card.contains("retractions/"),
+        "the card does not say where the removal is recorded",
     );
 }
