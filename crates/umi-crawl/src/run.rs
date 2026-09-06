@@ -140,6 +140,14 @@ const SLACK: usize = 4;
 /// at sixteen lookups before the slot gives up and waits like it used to. An
 /// unbounded walk would scan the whole queue per slot in exactly that case, and
 /// a crawl that cannot start is worse than one that starts slowly.
+///
+/// A walk that steps at all yields once before it carries on, because otherwise
+/// the sixteen lookups all happen in the same instant on a queue whose files
+/// cannot have arrived, since nothing else has been allowed to run. That was
+/// measured the hard way on #251: with the yield gone the crawl dropped from
+/// 191 pages a second to 74 and failed a hundred thousand leases an arm,
+/// because the leases went out ahead of their own prefetch and every
+/// robots.txt was fetched inside the window instead of beside it.
 const STEP_ASIDE: usize = 16;
 
 /// The earliest a host may be asked again, for the leases a tick is still
@@ -1813,7 +1821,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             return Ok(None);
         }
         loop {
-            if let Some(next) = self.gate(&mut supply.queue, deferred, report) {
+            if let Some(next) = self.gate(&mut supply.queue, deferred, report).await {
                 // Below one ask's worth, which in the steady state means there
                 // is always exactly one ask in flight. A queue holding a full
                 // ask is a window's worth of fetching in hand, which is the
@@ -2113,7 +2121,11 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// the origin answered, which on a broad crawl is most of what the window
     /// was doing. It goes to the back instead and the slot takes a lease that
     /// can fetch now. See [`STEP_ASIDE`].
-    fn gate(
+    ///
+    /// The one await left on this path is the yield in that walk, and it is
+    /// load bearing. `take_ask` spawns a warm task per host in the batch and
+    /// then comes straight here, so this is where those tasks get their turn.
+    async fn gate(
         &self,
         queue: &mut VecDeque<umi_state::Lease>,
         deferred: &mut Vec<LeaseId>,
@@ -2132,6 +2144,15 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                 && !queue.is_empty()
                 && !self.robots.ready(lease.key.host, self.clock.now_ms())
             {
+                // Once per walk and not once per step, which is the whole
+                // difference between pacing the crawl and spinning. The step
+                // aside is only worth anything if something else got to run in
+                // between, and with the map lock no longer an await this is the
+                // only place on the path that lets it happen. See
+                // [`STEP_ASIDE`].
+                if stepped == 0 {
+                    tokio::task::yield_now().await;
+                }
                 stepped += 1;
                 report.robots_stepped += 1;
                 queue.push_back(lease);
