@@ -370,6 +370,15 @@ struct CrawlArgs {
     #[arg(long)]
     tabs: Option<u16>,
 
+    /// Read a published robots corpus first and do not ask the hosts in it
+    /// that never answered. Bare, it reads the published one.
+    #[arg(long, value_name = "ORG/NAME", num_args = 0..=1, default_missing_value = robots::KNOWN)]
+    robots_corpus: Option<String>,
+    /// Ask one host in this many anyway, so a host that has come back since
+    /// the corpus was built is found again. The default is 20.
+    #[arg(long, value_name = "N")]
+    robots_resample: Option<u32>,
+
     /// Seed from a file of URLs, or `-` for stdin.
     #[arg(long)]
     seed: Option<String>,
@@ -423,6 +432,13 @@ impl CrawlArgs {
             tier_max: config.tier_max.value,
             allow_supervised: self.allow_supervised,
             tabs: config.tabs.value,
+            robots_corpus: self.robots_corpus.clone(),
+            // Twenty because of what the two sides cost. Asking one in twenty
+            // gives back five percent of the fetches the corpus saved, which
+            // is nothing next to a robots.txt bill that is most of the lease,
+            // and it finds a host that has come back inside a month, because
+            // the die turns over with the day.
+            robots_resample: self.robots_resample.unwrap_or(20),
             seed: self.seed.clone(),
             seeder: self.seeder.clone(),
             // Nothing when neither flag was given, because doc 13.4 lets the

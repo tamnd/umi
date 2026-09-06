@@ -77,7 +77,8 @@ use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use umi_crawl::{
-    Clock, RobotsBuilder, RobotsEntry as Entry, RobotsRow, SegmentInfo, SegmentSink, SystemClock,
+    Clock, RobotsBuilder, RobotsEntry as Entry, RobotsRow, SegmentInfo, SegmentSink, Silent,
+    SystemClock,
 };
 use umi_fetch::{FetchConfig, Ladder, Tier};
 use umi_file::{StreamKind, WriterConfig};
@@ -111,6 +112,9 @@ pub const KNOWN: &str = "open-index/umi-robots";
 /// The column in the published corpus that holds a hostname.
 const HOST_COLUMN: &str = "host";
 
+/// The column in the published corpus that holds the HTTP status.
+const STATUS_COLUMN: &str = "status";
+
 /// How many published files a run reads the host column of at once.
 ///
 /// The reads are small and almost all of the time is the round trip, so this is
@@ -118,6 +122,24 @@ const HOST_COLUMN: &str = "host";
 /// the link busy and few enough that a run does not open a connection per file
 /// against a corpus of several hundred.
 const KNOWN_FILES: usize = 8;
+
+/// How many published files a crawl reads at once on its way to the silent
+/// hosts.
+///
+/// Higher than [`KNOWN_FILES`] because the shape of the read is the same and
+/// the measurement says eight is not enough. Reading the 206 files of
+/// `open-index/umi-robots` eight at a time took seven minutes, which is a
+/// crawl that does nothing for seven minutes and is most of a six minute
+/// measurement arm. Almost none of that is bytes. `read_column` walks a file's
+/// row groups one at a time and there are sixteen of them, so eight files in
+/// flight is eight requests outstanding against a link that will carry far
+/// more, and the fix is to have more files open rather than to move fewer
+/// bytes.
+///
+/// Thirty two and not the whole list, because a corpus of several hundred
+/// files opened at once is a connection per file at a host that has done
+/// nothing to deserve it, and the run that follows is hours long either way.
+const SILENT_FILES: usize = 32;
 
 /// How many fetches a run keeps in flight when nobody says otherwise.
 ///
@@ -974,6 +996,146 @@ async fn one_file(hub: &Hub, repo: &str, path: &str) -> Result<Vec<HostId>, Erro
                 found.push(HostId::derive(values.value(i).as_bytes()));
             }
         }
+    }
+    Ok(found)
+}
+
+/// The hosts a published corpus asked and never heard back from, for a crawl.
+///
+/// The same read as [`known`] with one more column and a filter, and it exists
+/// separately because the two want different halves of the corpus. A prefetch
+/// skips every host that has any answer, since it is trying not to ask the same
+/// question twice. A crawl has to ask again about a host that served rules,
+/// because rules change and doc 07.4 gives them a day, and the only rows it can
+/// reuse are the ones where nothing came back at all.
+///
+/// Measured over the whole of `open-index/umi-robots`: 14,179,896 hosts at
+/// status zero out of about 34.5 million, which is 41 percent and matches what
+/// the bulk prefetch reports as it runs. At eight bytes a host that is 113
+/// megabytes resident, against page leases on server3 that spent between 83 and
+/// 97 percent of their time inside robots.txt.
+///
+/// A file that will not open is logged and skipped for the reason [`known`]
+/// skips one. The list is an optimisation, so a corpus that is half readable
+/// makes a crawl ask hosts it did not need to, which is the old behaviour and
+/// not a wrong answer.
+///
+/// `token` is the publishing token when the run has one and empty when it does
+/// not, and it is here because of what the hub does at [`SILENT_FILES`] in
+/// flight. Reading 207 files anonymously at that width came back with 429s and
+/// a message from Hugging Face asking us to log in, and a 429 that outlives the
+/// retry ladder is a file skipped, which is coverage lost quietly. The corpus
+/// is public and an anonymous read still works, so this is a courtesy the hub
+/// asked for rather than a permission we need.
+///
+/// # Errors
+///
+/// [`Error::Hub`] when the corpus cannot be listed at all, which is an operator
+/// who named a repository that is not there.
+pub(crate) async fn silent(
+    repo: &str,
+    sample: u32,
+    token: &str,
+    log: &mut crawl::Log,
+) -> Result<Silent, Error> {
+    let hub = Hub::new(token)?;
+    let mut files: Vec<String> = hub
+        .list(repo, "data")
+        .await?
+        .into_iter()
+        .map(|remote| remote.path)
+        .filter(|path| path.ends_with(".parquet"))
+        .collect();
+    files.sort();
+    log.line(&format!(
+        "reading {} published files from {repo} for hosts that never answered",
+        files.len()
+    ))?;
+
+    let mut hosts: Vec<HostId> = Vec::new();
+    let mut chunks = files.chunks(SILENT_FILES);
+    for batch in &mut chunks {
+        let mut reading = FuturesUnordered::new();
+        for path in batch {
+            reading.push(silent_in_file(&hub, repo, path));
+        }
+        while let Some(found) = reading.next().await {
+            match found {
+                Ok(found) => hosts.extend(found),
+                Err(cause) => log.line(&format!("could not read a published file: {cause}"))?,
+            }
+        }
+    }
+
+    let silent = Silent::new(hosts, sample);
+    log.line(&format!(
+        "{} hosts never answered and will not be asked again, {} MB held, one in {sample} asked anyway",
+        silent.len(),
+        silent.len() * HostId::LEN / (1 << 20)
+    ))?;
+    Ok(silent)
+}
+
+/// The hosts in one published file that came back with nothing.
+///
+/// Two ranged reads over the same footer rather than one, because
+/// [`read_column`] projects a single column and `status` is two bytes a row
+/// against a `body` column that is 8.9 megabytes a row group. Reading both
+/// small columns costs a second round trip per row group and still moves fifty
+/// times fewer bytes than reading the file.
+///
+/// A null status counts as an answer we do not have rather than as silence.
+/// Nothing writes one today, and the direction to be wrong in is the one that
+/// asks the host.
+async fn silent_in_file(hub: &Hub, repo: &str, path: &str) -> Result<Vec<HostId>, Error> {
+    let source = HubFile::open(hub, repo, path).await?;
+    let metadata = Arc::new(footer(&source).await?);
+    let hosts = read_column(&source, &metadata, HOST_COLUMN).await?;
+    let statuses = read_column(&source, &metadata, STATUS_COLUMN).await?;
+
+    let mut codes: Vec<u16> = Vec::new();
+    for batch in statuses {
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::UInt16Array>()
+            .ok_or_else(|| Error::NoColumn(STATUS_COLUMN.to_owned()))?;
+        for i in 0..values.len() {
+            codes.push(if values.is_valid(i) {
+                values.value(i)
+            } else {
+                u16::MAX
+            });
+        }
+    }
+
+    let mut found = Vec::new();
+    let mut at = 0usize;
+    for batch in hosts {
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .ok_or_else(|| Error::NoColumn(HOST_COLUMN.to_owned()))?;
+        for i in 0..values.len() {
+            // Two projections of one file, walked in step. They come back in
+            // file order and both cover every row group, so the nth host and
+            // the nth status are the same row, and the count below is what
+            // says so rather than a comment claiming it.
+            let code = codes.get(at).copied().unwrap_or(u16::MAX);
+            at += 1;
+            if code == 0 && values.is_valid(i) {
+                found.push(HostId::derive(values.value(i).as_bytes()));
+            }
+        }
+    }
+    if at != codes.len() {
+        return Err(Error::Arrow(
+            arrow::error::ArrowError::InvalidArgumentError(format!(
+                "{path} has {at} hosts and {} statuses",
+                codes.len()
+            )),
+        ));
     }
     Ok(found)
 }
