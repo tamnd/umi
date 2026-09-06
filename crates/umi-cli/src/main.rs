@@ -464,6 +464,10 @@ struct RobotsArgs {
     /// Simultaneous in flight fetches.
     #[arg(long, default_value_t = robots::CONCURRENCY)]
     concurrency: u16,
+    /// Seconds to wait on a host that is not answering. Lower finishes a band
+    /// sooner and loses the slowest hosts.
+    #[arg(long, default_value_t = robots::PATIENCE, value_parser = clap::value_parser!(u64).range(1..=120))]
+    patience: u64,
     /// Stop after this many hosts.
     #[arg(long)]
     limit: Option<u64>,
@@ -492,6 +496,7 @@ impl RobotsArgs {
             known: self.known.clone(),
             out: self.out.clone(),
             concurrency: self.concurrency,
+            patience: self.patience,
             limit: self.limit,
             skip: self.skip,
             max_duration: self.r#for.clone(),
