@@ -116,6 +116,32 @@ const PARKED_MS: u64 = 30_000;
 /// a store that has fallen four windows behind has stalled rather than slipped.
 const SLACK: usize = 4;
 
+/// How many leases a window slot will step over to find one whose robots.txt
+/// has already landed.
+///
+/// The prefetch starts a host's robots.txt when the lease is taken and the page
+/// goes out when the lease reaches the front of the queue, so the file gets
+/// whatever runway is left in between. Measured on server3 that was not enough:
+/// a tick warmed 28,590 hosts over 48,067 pages and still spent 1739 ms of a
+/// 2526 ms page on robots.txt, because a queue one window deep gives the lease
+/// at the front no runway at all.
+///
+/// Stepping over it is the fix, and it is cheap because the queue is full of
+/// other work. A lease whose file has not landed goes to the back and the slot
+/// takes the next one, so the slot fetches a page instead of sleeping and the
+/// file keeps arriving in the background on the task that was already fetching
+/// it. Nothing is dropped and nothing is fetched twice: the lease comes round
+/// again a few slots later with its file in hand.
+///
+/// Sixteen because of what each side costs. A step is one lock and one hash
+/// lookup and the walk stops at the first ready lease, so on a queue where most
+/// files have landed it stops on the first or second try. Where none have
+/// landed, which is the first window of a cold crawl, sixteen bounds the waste
+/// at sixteen lookups before the slot gives up and waits like it used to. An
+/// unbounded walk would scan the whole queue per slot in exactly that case, and
+/// a crawl that cannot start is worse than one that starts slowly.
+const STEP_ASIDE: usize = 16;
+
 /// The earliest a host may be asked again, for the leases a tick is still
 /// holding.
 ///
@@ -660,6 +686,19 @@ pub struct TickReport {
     /// slots on robots.txt is a tick where the files arrived too late to help,
     /// which means the queue was not deep enough to give them any runway.
     pub robots_warmed: usize,
+    /// Times a window slot stepped over a lease whose robots.txt had not
+    /// landed and took the one behind it instead.
+    ///
+    /// Steps and not leases, so a lease stepped over three times counts three
+    /// times. That is the number worth watching, because it is what the walk
+    /// costs: each step is a lock and a hash lookup on the way to a slot that
+    /// fetches a page rather than sleeping. Against `robots_ms` it says which
+    /// way the queue is going. A figure near the leases with `robots_ms` down
+    /// is the thing working. A figure at sixteen times the leases with
+    /// `robots_ms` still high means almost nothing in the queue was ready and
+    /// the walk is giving up every time, which is a queue too shallow rather
+    /// than a walk too short. See [`STEP_ASIDE`].
+    pub robots_stepped: usize,
     /// Leases fetched at T2, for doc 05.9's 15 percent alert.
     pub emulated: usize,
     /// Leases fetched at T3 or above.
@@ -1683,7 +1722,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             return Ok(None);
         }
         loop {
-            if let Some(next) = self.gate(&mut supply.queue, deferred, report) {
+            if let Some(next) = self.gate(&mut supply.queue, deferred, report).await {
                 // Below one ask's worth, which in the steady state means there
                 // is always exactly one ask in flight. A queue holding a full
                 // ask is a window's worth of fetching in hand, which is the
@@ -1977,13 +2016,36 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// Skipping rather than waiting is the whole point. The budget is global,
     /// so a tick that blocked on it would hold in flight slots open for pages
     /// that a different tick will be better placed to run.
-    fn gate(
+    ///
+    /// The same argument covers robots.txt, and that is the bigger of the two.
+    /// A lease whose file has not landed yet would hold its slot asleep until
+    /// the origin answered, which on a broad crawl is most of what the window
+    /// was doing. It goes to the back instead and the slot takes a lease that
+    /// can fetch now. See [`STEP_ASIDE`].
+    async fn gate(
         &self,
         queue: &mut VecDeque<umi_state::Lease>,
         deferred: &mut Vec<LeaseId>,
         report: &mut TickReport,
     ) -> Option<(umi_state::Lease, u64)> {
+        let mut stepped = 0;
         while let Some(lease) = queue.pop_front() {
+            // Before the render budget and not after it, because a slot handed
+            // to a lease that then steps aside is a slot the lease behind it
+            // could have used, and doc 05.9's budget is the scarcer of the two.
+            //
+            // Only while there is something else to take. A queue down to its
+            // last lease has nothing to step aside for, and rotating it would
+            // be the same lease coming back sixteen times.
+            if stepped < STEP_ASIDE
+                && !queue.is_empty()
+                && !self.robots.ready(lease.key.host, self.clock.now_ms()).await
+            {
+                stepped += 1;
+                report.robots_stepped += 1;
+                queue.push_back(lease);
+                continue;
+            }
             let due = lease.not_before_ms;
             if lease.tier < Tier::Rendered {
                 if lease.tier == Tier::Emulated {

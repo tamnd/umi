@@ -3365,3 +3365,110 @@ async fn a_host_with_no_robots_file_publishes_the_status_that_said_so() {
         "none of these served a file, so none of them has one to publish",
     );
 }
+
+/// The canned fetcher with one url that takes its time.
+///
+/// Everything else answers in the poll it was asked, which is what makes the
+/// rest of this file quick, and is also why none of it can show a window slot
+/// waiting on anything. One slow url is enough: it is the host whose robots.txt
+/// has not landed, and the question is what the leases behind it do about it.
+struct Stalls {
+    inner: Canned,
+    url: String,
+    takes: Duration,
+}
+
+#[async_trait::async_trait]
+impl Fetch for Stalls {
+    async fn fetch(
+        &self,
+        url: &str,
+        revalidate: Option<&Revalidator>,
+        tier: umi_types::Tier,
+    ) -> Result<Served, FetchError> {
+        if url == self.url {
+            tokio::time::sleep(self.takes).await;
+        }
+        self.inner.fetch(url, revalidate, tier).await
+    }
+}
+
+/// Eight hosts with a page each, and `stalls` served slowly.
+fn stalling(stalls: &str, takes: Duration) -> (Vec<String>, Stalls) {
+    let urls: Vec<String> = (0..8).map(|n| format!("https://s{n}.example/a")).collect();
+    let mut inner = Canned::new();
+    for (n, url) in urls.iter().enumerate() {
+        inner = inner
+            .robots(
+                &format!("https://s{n}.example"),
+                "User-agent: *\nAllow: /\n",
+            )
+            .html(url, &page("A", &[]));
+    }
+    let fetch = Stalls {
+        inner,
+        url: stalls.to_owned(),
+        takes,
+    };
+    (urls, fetch)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_whose_robots_is_still_in_the_air_lets_the_ones_behind_it_past() {
+    // The measurement on issue #245. A tick on server3 warmed 28,590 hosts over
+    // 48,067 pages and still spent 1739 ms of a 2526 ms page inside robots.txt,
+    // because the prefetch starts when the lease is taken and the lease goes
+    // out as soon as a slot frees, which on a queue one window deep is no
+    // runway at all. The slot then sleeps on the file it just asked for.
+    //
+    // Here one host's robots.txt takes a third of a second and the other seven
+    // answer at once. What the slot does with the slow one is the whole test:
+    // it puts the lease back and takes one it can fetch now, so the count below
+    // is not zero and no page is lost by the shuffle.
+    let (urls, fetch) = stalling("https://s0.example/robots.txt", Duration::from_millis(300));
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let crawler = Crawler::new(
+        Arc::new(fetch),
+        state,
+        Arc::new(FixedClock::at(T0)),
+        config(),
+    );
+    let sink = Arc::new(Collected::default());
+
+    let report = crawler.tick(&sink).await.expect("tick");
+
+    assert!(
+        report.robots_stepped > 0,
+        "a slot found a file still in the air and should have taken the next lease: {report:?}",
+    );
+    // And nothing was dropped on the way round. A lease that goes to the back
+    // of the queue is a lease that still has to be fetched, and the failure
+    // this guards against is the shuffle quietly losing one.
+    assert_eq!(report.fetched, urls.len(), "{report:?}");
+    assert_eq!(sink.rows().len(), urls.len());
+}
+
+#[tokio::test]
+async fn the_last_lease_in_the_queue_is_never_stepped_over() {
+    // The guard on the guard. Stepping aside means putting the lease at the
+    // back of the queue and taking the next one, and on a queue of one those
+    // are the same lease. Without the emptiness check the slot would hand the
+    // only work it has back to itself sixteen times and then do it anyway,
+    // which is a spin and not a stall, but it is sixteen lookups per page for
+    // nothing on every crawl narrow enough to lease one url at a time.
+    let url = "https://only.example/a";
+    let state = seeded(&[url]).await;
+    let fetch = Canned::new()
+        .robots("https://only.example", "User-agent: *\nAllow: /\n")
+        .html(url, &page("A", &[]));
+    let crawler = crawler(fetch, state);
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+
+    assert_eq!(report.fetched, 1, "{report:?}");
+    assert_eq!(report.robots_stepped, 0, "{report:?}");
+}

@@ -736,3 +736,44 @@ fn the_resample_die_turns_over_with_the_day() {
     assert_eq!(silent.asked(), asked as u64);
     assert_eq!(silent.spared(), 14 - asked as u64);
 }
+
+#[tokio::test]
+async fn a_file_in_hand_is_ready_and_one_that_has_gone_stale_is_not() {
+    // The predicate a window slot reads before it decides whether to wait. It
+    // is not the same question as `holds`, and the difference is the point of
+    // both. `holds` asks whether a host still needs a request spent on it, so a
+    // fetch already in flight counts and a second one is not started. This asks
+    // whether the answer can be read without waiting, so a fetch in flight does
+    // not count: the cell is there but everyone who touches it goes to sleep.
+    //
+    // Getting this wrong in the generous direction is the expensive mistake. A
+    // slot that believes an unfinished fetch is an answer stops stepping aside
+    // and goes back to sleeping on robots.txt, which is the bill issue #245 is
+    // about, and nothing fails loudly when it happens.
+    let url = format!("{ORIGIN}/a");
+    let state = seeded(&[&url]).await;
+    let fetch = Canned::new()
+        .robots(ORIGIN, "User-agent: *\nAllow: /\n")
+        .html(&url, &page("A", &[]));
+    let crawler = crawler(fetch, state);
+    let host = RowKey::for_url(&url, None).expect("a crawlable url").host;
+
+    // Nothing has been asked yet, so there is nothing to read.
+    assert!(!crawler.robots().ready(host, T0).await);
+
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+
+    assert!(crawler.robots().ready(host, T0).await);
+    // A host we never met is not ready however much else is cached.
+    let other = RowKey::for_url("https://elsewhere.example/a", None)
+        .expect("a crawlable url")
+        .host;
+    assert!(!crawler.robots().ready(other, T0).await);
+    // And doc 07.3's day is the end of it. A slot that took a day old answer
+    // for a fresh one would crawl on rules the site has had a day to change.
+    assert!(!crawler.robots().ready(host, T0 + A_DAY_MS + 1).await);
+    assert!(!crawler.robots().holds(host, T0 + A_DAY_MS + 1).await);
+}
