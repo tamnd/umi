@@ -697,7 +697,7 @@ pub struct TickReport {
     /// is the thing working. A figure at sixteen times the leases with
     /// `robots_ms` still high means almost nothing in the queue was ready and
     /// the walk is giving up every time, which is a queue too shallow rather
-    /// than a walk too short. See [`STEP_ASIDE`].
+    /// than a walk too short.
     pub robots_stepped: usize,
     /// Leases fetched at T2, for doc 05.9's 15 percent alert.
     pub emulated: usize,
