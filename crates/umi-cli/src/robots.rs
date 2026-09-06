@@ -123,6 +123,24 @@ const STATUS_COLUMN: &str = "status";
 /// against a corpus of several hundred.
 const KNOWN_FILES: usize = 8;
 
+/// How many published files a crawl reads at once on its way to the silent
+/// hosts.
+///
+/// Higher than [`KNOWN_FILES`] because the shape of the read is the same and
+/// the measurement says eight is not enough. Reading the 206 files of
+/// `open-index/umi-robots` eight at a time took seven minutes, which is a
+/// crawl that does nothing for seven minutes and is most of a six minute
+/// measurement arm. Almost none of that is bytes. `read_column` walks a file's
+/// row groups one at a time and there are sixteen of them, so eight files in
+/// flight is eight requests outstanding against a link that will carry far
+/// more, and the fix is to have more files open rather than to move fewer
+/// bytes.
+///
+/// Thirty two and not the whole list, because a corpus of several hundred
+/// files opened at once is a connection per file at a host that has done
+/// nothing to deserve it, and the run that follows is hours long either way.
+const SILENT_FILES: usize = 32;
+
 /// How many fetches a run keeps in flight when nobody says otherwise.
 ///
 /// Higher than a crawl's default because the work is different. A crawl at 256
@@ -1002,14 +1020,25 @@ async fn one_file(hub: &Hub, repo: &str, path: &str) -> Result<Vec<HostId>, Erro
 /// makes a crawl ask hosts it did not need to, which is the old behaviour and
 /// not a wrong answer.
 ///
+/// `token` is the publishing token when the run has one and empty when it does
+/// not, and it is here because of what the hub does at [`SILENT_FILES`] in
+/// flight. Reading 207 files anonymously at that width came back with 429s and
+/// a message from Hugging Face asking us to log in, and a 429 that outlives the
+/// retry ladder is a file skipped, which is coverage lost quietly. The corpus
+/// is public and an anonymous read still works, so this is a courtesy the hub
+/// asked for rather than a permission we need.
+///
 /// # Errors
 ///
 /// [`Error::Hub`] when the corpus cannot be listed at all, which is an operator
 /// who named a repository that is not there.
-pub(crate) async fn silent(repo: &str, sample: u32, log: &mut crawl::Log) -> Result<Silent, Error> {
-    // No token, for the reason `known` reads without one: the corpus is public
-    // and a run a stranger cannot reproduce is not much of a corpus.
-    let hub = Hub::new("")?;
+pub(crate) async fn silent(
+    repo: &str,
+    sample: u32,
+    token: &str,
+    log: &mut crawl::Log,
+) -> Result<Silent, Error> {
+    let hub = Hub::new(token)?;
     let mut files: Vec<String> = hub
         .list(repo, "data")
         .await?
@@ -1024,7 +1053,7 @@ pub(crate) async fn silent(repo: &str, sample: u32, log: &mut crawl::Log) -> Res
     ))?;
 
     let mut hosts: Vec<HostId> = Vec::new();
-    let mut chunks = files.chunks(KNOWN_FILES);
+    let mut chunks = files.chunks(SILENT_FILES);
     for batch in &mut chunks {
         let mut reading = FuturesUnordered::new();
         for path in batch {

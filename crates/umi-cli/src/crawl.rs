@@ -1225,7 +1225,14 @@ fn run(
         // one piece of startup work whose size an operator can misjudge by an
         // order of magnitude, so the count goes in the log.
         if let Some(repo) = &options.robots_corpus {
-            let silent = crate::robots::silent(repo, options.robots_resample, &mut log).await?;
+            // The publishing token when this run has one, because the hub
+            // rate limits an anonymous reader at this width and a 429 that
+            // outlives the retry ladder is coverage lost quietly. Empty when
+            // the run is not publishing, which still works and is what a
+            // stranger reproducing the run gets.
+            let token = options.publish.as_ref().map_or("", |p| p.token.as_str());
+            let silent =
+                crate::robots::silent(repo, options.robots_resample, token, &mut log).await?;
             crawler.robots().learn(silent);
         }
 
