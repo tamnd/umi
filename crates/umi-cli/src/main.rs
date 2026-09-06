@@ -354,6 +354,10 @@ struct CrawlArgs {
     /// Simultaneous in flight fetches.
     #[arg(long)]
     concurrency: Option<u16>,
+    /// How many domains one ask to the frontier may take work from. The
+    /// default is the concurrency, never below 512.
+    #[arg(long, value_name = "N")]
+    max_domains: Option<usize>,
 
     /// Highest tier allowed.
     #[arg(long)]
@@ -429,6 +433,7 @@ impl CrawlArgs {
             watch: self.watch,
             rps: config.rps.value,
             concurrency: config.concurrency.value,
+            max_domains: self.max_domains,
             tier_max: config.tier_max.value,
             allow_supervised: self.allow_supervised,
             tabs: config.tabs.value,
