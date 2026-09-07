@@ -15,7 +15,7 @@
 //! drops the columns it does not understand.
 
 /// The schema this build writes and understands.
-pub const SCHEMA_VERSION: u32 = 10;
+pub const SCHEMA_VERSION: u32 = 11;
 
 /// Stamped into the SQLite header so `file` and any SQLite tool can say what
 /// this is. "umi" plus the format generation.
@@ -44,7 +44,8 @@ pub(crate) use schedulable;
 pub const SCHEDULABLE: &str = schedulable!();
 
 /// One statement batch per schema version, in order.
-pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10];
+pub const MIGRATIONS: [&str; SCHEMA_VERSION as usize] =
+    [V1, V2, V3, V4, V5, V6, V7, V8, V9, V10, V11];
 
 /// Version 1: the four tables from doc 08.3, plus the ETag pool the ledger's
 /// `etag_ref` points into.
@@ -557,4 +558,38 @@ CREATE TABLE shards (
 ) WITHOUT ROWID;
 
 CREATE INDEX shards_segment ON shards (segment);
+";
+
+/// Version 11: the robots.txt files themselves, so a restart does not ask every
+/// host in its working set for a file it already had.
+///
+/// The `hosts` table has carried the digest and the expiry since V1, which is
+/// enough to know that an answer went stale and not enough to use one, so the
+/// rules have only ever lived in the crawl process and a restart threw them
+/// away. Measured on server3 in September 2026, a fifth of robots.txt fetches
+/// on a broad crawl fail outright, and every one of those costs the whole host
+/// rather than one url, so not asking is worth considerably more than asking
+/// faster.
+///
+/// The one table here with a rowid. Everything else is `WITHOUT ROWID`, which
+/// puts the whole row in the primary key b-tree and is right for the small
+/// fixed rows the rest of the schema holds. A robots.txt is up to 500 KiB, and
+/// putting bodies of that size in the key b-tree would push almost every page
+/// of it to an overflow chain and make a lookup by host walk them. With a
+/// rowid, `host` is a slim unique index over a heap and the body is read only
+/// once the row is found.
+const V11: &str = r"
+CREATE TABLE robots_documents (
+    host       BLOB    NOT NULL PRIMARY KEY,
+    digest     BLOB    NOT NULL,
+    fetched_ms INTEGER NOT NULL,
+    expires_ms INTEGER NOT NULL,
+    status     INTEGER NOT NULL,
+    body       TEXT
+);
+
+-- For the sweep that drops files nobody has wanted for a long time. Without it
+-- that sweep is a full scan of the one table in the schema that holds bodies,
+-- which is the scan most worth not doing.
+CREATE INDEX robots_documents_expires ON robots_documents (expires_ms);
 ";

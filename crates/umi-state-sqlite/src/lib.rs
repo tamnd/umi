@@ -72,8 +72,8 @@ use umi_state::{
     AdmitReport, BlockReport, BlockRow, CLASSES, Candidate, Checkpoint, DAILY_UNDER_MS, Discovery,
     EvictReport, FetchOutcome, FetchResult, HOURLY_UNDER_MS, HostRow, Lease, LeaseId, LeaseRequest,
     LedgerRow, NackReason, Priority, REALTIME_UNDER_MS, RefreshClass, Result, Revalidator,
-    SegmentQuery, SegmentRow, Shard, SpillRow, State, StateError, StateStats, SupervisionRow,
-    TierPolicy, UrlState, WEEKLY_UNDER_MS, next_due_dated, retry_after_ms,
+    RobotsDoc, SegmentQuery, SegmentRow, Shard, SpillRow, State, StateError, StateStats,
+    SupervisionRow, TierPolicy, UrlState, WEEKLY_UNDER_MS, next_due_dated, retry_after_ms,
 };
 use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKey, UrlKeyFull};
 
@@ -1385,6 +1385,69 @@ impl State for SqliteState {
                 .query_row(params![&id.as_bytes()[..]], row::host_record)
                 .optional()
                 .state()
+        })
+    }
+
+    async fn robots(&self, hosts: &[HostId]) -> Result<Vec<RobotsDoc>> {
+        if hosts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        blocking(|| {
+            let guard = self.lock();
+            let mut select = guard.conn.prepare_cached(sql::SELECT_ROBOTS).state()?;
+            // The set is what makes a host named twice produce one row. The
+            // caller's list comes from a leased batch, which has duplicates in
+            // it by construction because two hundred urls on one host is the
+            // normal case, and handing back two hundred copies of one file
+            // would undo the point of reading it.
+            let mut asked = HashSet::with_capacity(hosts.len());
+            let mut docs = Vec::new();
+            for host in hosts {
+                if !asked.insert(*host) {
+                    continue;
+                }
+                if let Some(doc) = select
+                    .query_row(params![&host.as_bytes()[..]], row::robots_doc)
+                    .optional()
+                    .state()?
+                {
+                    docs.push(doc);
+                }
+            }
+            Ok(docs)
+        })
+    }
+
+    async fn put_robots(&self, docs: &[RobotsDoc]) -> Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+
+        blocking(|| {
+            let mut guard = self.lock();
+            let conn = &mut guard.conn;
+            // Buffered, because losing one of these costs one refetch of one
+            // file. That is the cost this table exists to avoid and it is
+            // nowhere near enough to pay for a sync on the path that writes it.
+            set_sync(conn, Sync::Buffered)?;
+            let tx = conn.transaction().state()?;
+            {
+                let mut put = tx.prepare_cached(sql::PUT_ROBOTS).state()?;
+                for doc in docs {
+                    put.execute(params![
+                        &doc.host.as_bytes()[..],
+                        &doc.digest.as_bytes()[..],
+                        row::to_ms(doc.fetched_ms),
+                        row::to_ms(doc.expires_ms),
+                        i64::from(doc.status),
+                        doc.body.as_deref(),
+                    ])
+                    .state()?;
+                }
+            }
+            tx.commit().state()?;
+            Ok(())
         })
     }
 

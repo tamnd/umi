@@ -19,7 +19,7 @@
 //! that being a bug.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Tier, Ulid, UrlKey, UrlKeyFull};
@@ -27,8 +27,9 @@ use umi_types::{CANON_VERSION, FetcherId, HostId, PldId, RowKey, Tier, Ulid, Url
 use crate::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest, LedgerRow, NackReason,
-    Priority, Quotas, RefreshClass, Result, Revalidator, SegmentQuery, SegmentRow, Shard, SpillRow,
-    State, StateStats, SupervisionRow, TierPolicy, UrlState, next_due_dated, retry_after_ms,
+    Priority, Quotas, RefreshClass, Result, Revalidator, RobotsDoc, SegmentQuery, SegmentRow,
+    Shard, SpillRow, State, StateStats, SupervisionRow, TierPolicy, UrlState, next_due_dated,
+    retry_after_ms,
 };
 
 /// A [`State`] that lives entirely in memory.
@@ -48,6 +49,10 @@ struct Inner {
     /// that iterating it gives the scan shape a real backend gets for free.
     ledger: BTreeMap<RowKey, Entry>,
     hosts: HashMap<HostId, HostRow>,
+    /// The robots.txt each host served, kept apart from `hosts` for the reason
+    /// [`RobotsDoc`] gives: every lease reads a host row and almost none of
+    /// them want the file.
+    robots: HashMap<HostId, RobotsDoc>,
     /// Doc 07.7's block list, keyed by domain so a lookup on the admit and
     /// lease paths is a hash of eight bytes. Lifted entries stay in it, so this
     /// is the published list and not just the enforced one.
@@ -739,6 +744,29 @@ impl State for MemoryState {
         let mut inner = self.lock();
         for row in rows {
             inner.hosts.insert(row.host, row.clone());
+        }
+        Ok(())
+    }
+
+    async fn robots(&self, hosts: &[HostId]) -> Result<Vec<RobotsDoc>> {
+        let inner = self.lock();
+        // The set is what makes a host named twice produce one row. A caller
+        // asking for the hosts in a leased batch has duplicates in it by
+        // construction, because two hundred urls on one host is the normal
+        // case, and handing back two hundred copies of the same file would
+        // undo the point of reading it at all.
+        let mut asked = HashSet::with_capacity(hosts.len());
+        Ok(hosts
+            .iter()
+            .filter(|host| asked.insert(**host))
+            .filter_map(|host| inner.robots.get(host).cloned())
+            .collect())
+    }
+
+    async fn put_robots(&self, docs: &[RobotsDoc]) -> Result<()> {
+        let mut inner = self.lock();
+        for doc in docs {
+            inner.robots.insert(doc.host, doc.clone());
         }
         Ok(())
     }

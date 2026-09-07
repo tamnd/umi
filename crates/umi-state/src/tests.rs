@@ -1213,3 +1213,58 @@ fn the_politeness_timer_only_moves_forward() {
     host.observe(&ok(), took(40), T0);
     assert_eq!(host.next_allowed_ms, T0 + 60_000);
 }
+
+#[test]
+fn a_robots_document_is_cut_to_what_a_parser_would_read() {
+    // RFC 9309 section 2.5 lets a parser stop at 500 KiB, so bytes past that
+    // cannot change a decision and there is no reason to carry them into the
+    // store. An origin is free to send a gigabyte and one of them will.
+    let doc = RobotsDoc {
+        body: Some("a".repeat(RobotsDoc::MAX_BODY + 4096)),
+        ..Default::default()
+    }
+    .truncated();
+    assert_eq!(doc.body.expect("body").len(), RobotsDoc::MAX_BODY);
+}
+
+#[test]
+fn cutting_a_robots_document_lands_on_a_character_boundary() {
+    // The cap is a byte count and the body is a string, so a file whose
+    // multi byte character straddles the boundary would panic a naive
+    // truncate. Three byte characters do not divide 500 KiB evenly, which is
+    // what makes this one land badly.
+    let body = "\u{4e16}".repeat(RobotsDoc::MAX_BODY);
+    let doc = RobotsDoc {
+        body: Some(body),
+        ..Default::default()
+    }
+    .truncated();
+    let cut = doc.body.expect("body");
+    assert!(cut.len() <= RobotsDoc::MAX_BODY);
+    assert!(cut.len() > RobotsDoc::MAX_BODY - 3);
+}
+
+#[test]
+fn a_robots_document_shorter_than_the_cap_is_left_alone() {
+    let body = "User-agent: *\nDisallow: /private\n";
+    let doc = RobotsDoc {
+        body: Some(body.to_owned()),
+        ..Default::default()
+    }
+    .truncated();
+    assert_eq!(doc.body.as_deref(), Some(body));
+}
+
+#[test]
+fn a_robots_document_is_stale_at_the_moment_it_expires() {
+    // The boundary is exclusive on purpose and matches the in memory cache. A
+    // document that expires at T is not usable at T, because doc 07.4 gives it
+    // a day and the day is over.
+    let doc = RobotsDoc {
+        expires_ms: T0,
+        ..Default::default()
+    };
+    assert!(doc.fresh(T0 - 1));
+    assert!(!doc.fresh(T0));
+    assert!(!doc.fresh(T0 + 1));
+}
