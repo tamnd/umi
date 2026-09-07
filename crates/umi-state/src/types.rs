@@ -434,6 +434,61 @@ pub enum FailureKind {
     Malformed,
 }
 
+impl FailureKind {
+    /// Every kind, in the order [`FailureKind::slot`] counts them in.
+    ///
+    /// The enum is `#[non_exhaustive]`, so a crate above this one cannot match
+    /// on it without a wildcard arm, and a wildcard arm in a tally is a bucket
+    /// that quietly swallows whatever gets added here next. This array and
+    /// `slot` are the way to count kinds from outside without that happening:
+    /// add a kind and the array grows, and every tally built from its length
+    /// grows with it.
+    pub const ALL: [Self; 8] = [
+        Self::Connect,
+        Self::Tls,
+        Self::Timeout,
+        Self::ServerError,
+        Self::NotFound,
+        Self::Blocked,
+        Self::Rejected,
+        Self::Malformed,
+    ];
+
+    /// Where this kind sits in a tally the width of [`FailureKind::ALL`].
+    #[must_use]
+    pub const fn slot(self) -> usize {
+        match self {
+            Self::Connect => 0,
+            Self::Tls => 1,
+            Self::Timeout => 2,
+            Self::ServerError => 3,
+            Self::NotFound => 4,
+            Self::Blocked => 5,
+            Self::Rejected => 6,
+            Self::Malformed => 7,
+        }
+    }
+
+    /// A one word name, for a progress line or a metric label.
+    ///
+    /// One word and not a phrase because the callers put these in lists, and a
+    /// name with a space in it stops being readable the moment there is a count
+    /// beside it.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Connect => "connect",
+            Self::Tls => "tls",
+            Self::Timeout => "timeout",
+            Self::ServerError => "server",
+            Self::NotFound => "notfound",
+            Self::Blocked => "blocked",
+            Self::Rejected => "rejected",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
 /// Why a URL will not be fetched.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[non_exhaustive]

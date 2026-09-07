@@ -2185,6 +2185,15 @@ async fn what_the_origin_said_about_its_rate_reaches_the_scheduler() {
         .await
         .expect("tick");
     assert_eq!(report.failed, 1);
+    // The other side of the tally from the robots case. This failure did reach
+    // an origin and does have a row, and doc 08.3 folds a 429 in with the rest
+    // of the walls, so the kind here is what the scheduler backs off on.
+    assert_eq!(
+        report.failures[umi_state::FailureKind::Blocked.slot()],
+        1,
+        "{report:?}"
+    );
+    assert_eq!(report.failures.iter().sum::<u32>(), 1, "{report:?}");
 
     let host = umi_types::RowKey::for_url("https://example.com/a", None)
         .expect("a crawlable url")

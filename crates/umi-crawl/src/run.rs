@@ -652,6 +652,23 @@ pub struct TickReport {
     pub unchanged: usize,
     /// Answers that were a failure of some kind.
     pub failed: usize,
+    /// Those failures by what went wrong, indexed by
+    /// [`FailureKind::slot`](umi_state::FailureKind::slot).
+    ///
+    /// `failed` on its own says a tick went badly and says nothing at all about
+    /// why, and the three things it can mean want three different fixes: a run
+    /// of connect failures is a resolver or a socket limit, a run of timeouts is
+    /// a window wider than the box can serve, and a run of blocks is doc 05.8
+    /// and the tier ladder. Measured on #251, where a candidate branch failed
+    /// seventy thousand leases an arm and the only trace of any of it was a zero
+    /// in the ledger's status column, which is a number that cannot be acted on.
+    ///
+    /// Rows already carry doc 04.5's finer outcome in `pages`. This covers the
+    /// failures that have no row, which is where that arm's went, and it counts
+    /// the ones that do have a row as well so that the two views agree. It adds
+    /// up to `failed` less the rows that were gone or newly disallowed, because
+    /// those are not failures of a fetch and carry no kind.
+    pub failures: [u32; umi_state::FailureKind::ALL.len()],
     /// URLs robots.txt said no to, which are completed as excluded and never
     /// fetched.
     pub disallowed: usize,
@@ -1505,6 +1522,15 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             // would not load. All three are answers and all three come round
             // again, so a report that left them out would show a tick doing
             // less work than it did.
+            // The kind is taken once, here, rather than at either of the two
+            // places below that add to `failed`, because a failure with a row
+            // and a failure without one are the same event and belong in the
+            // same tally. It is the completion that carries the kind either
+            // way: the row path gets there through `failure_kind`, and the
+            // paths that never reached an origin set it directly.
+            if let umi_state::FetchResult::Failed { kind, .. } = outcome.result {
+                report.failures[kind.slot()] += 1;
+            }
             if row.is_none() && matches!(outcome.result, umi_state::FetchResult::Failed { .. }) {
                 report.failed += 1;
                 self.live.failed.fetch_add(1, Ordering::Relaxed);

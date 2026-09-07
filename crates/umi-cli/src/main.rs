@@ -896,8 +896,12 @@ fn run(command: &Command) -> Result<(), Error> {
 fn finish(result: Result<crawl::Summary, Error>) -> Result<(), Error> {
     let summary = result?;
     println!(
-        "{} rows in {} files, {} pages fetched, {} failed",
-        summary.rows, summary.files, summary.fetched, summary.failed
+        "{} rows in {} files, {} pages fetched, {} failed{}",
+        summary.rows,
+        summary.files,
+        summary.fetched,
+        summary.failed,
+        summary.failure_note()
     );
     match summary.stopped {
         crawl::Stop::Budget => Err(Error::Budget),

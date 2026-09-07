@@ -23,6 +23,29 @@ fn options(target: &str) -> Options {
 }
 
 #[test]
+fn the_failure_list_names_only_what_happened() {
+    use umi_state::FailureKind as Kind;
+
+    let mut summary = Summary::default();
+    assert_eq!(summary.failure_list(), "", "a clean crawl lists nothing");
+    assert_eq!(summary.failure_note(), "", "and prints no empty brackets");
+
+    summary.failures[Kind::Connect.slot()] = 44_842;
+    summary.failures[Kind::Blocked.slot()] = 3;
+    assert_eq!(summary.failure_list(), "connect 44842, blocked 3");
+    assert_eq!(summary.failure_note(), " (connect 44842, blocked 3)");
+
+    // In the order of `ALL` rather than by size, because the line is read
+    // against the same line from another run and a list that reorders itself
+    // when the numbers move is a list nobody can compare.
+    summary.failures[Kind::Timeout.slot()] = 1;
+    assert_eq!(
+        summary.failure_list(),
+        "connect 44842, timeout 1, blocked 3"
+    );
+}
+
+#[test]
 fn a_domain_target_becomes_a_host_suffix_scope() {
     let scope = scope_for(&options("example.com")).expect("scope");
     assert!(scope.allows("https://example.com/"));
