@@ -87,6 +87,19 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
         .expect("tick");
     assert!(!crawler.fetcher().asked_for(&format!("{ORIGIN}/a")));
     assert_eq!(report.failed, 1, "{report:?}");
+    // A failure with no row behind it still has to say what it was. This is the
+    // one path where the ledger has nothing but a zero in its status column, so
+    // if the tally does not carry the kind then nothing does.
+    assert_eq!(
+        report.failures[umi_state::FailureKind::ServerError.slot()],
+        1,
+        "{report:?}"
+    );
+    assert_eq!(
+        report.failures.iter().sum::<u32>(),
+        1,
+        "the one failure was counted twice or under two kinds: {report:?}"
+    );
     assert_eq!(report.disallowed, 0, "{report:?}");
     let stats = state.stats().await.expect("stats");
     assert_eq!(stats.urls_excluded, 0, "the site was retired over a 503");

@@ -1024,6 +1024,28 @@ fn the_four_rungs_are_the_ones_doc_07_6_wrote_down() {
 }
 
 #[test]
+fn every_failure_kind_has_a_slot_of_its_own_and_a_name() {
+    // The tally in a crawl's tick report is an array this wide, indexed by
+    // `slot`, and the whole thing is only sound if the slots are a permutation
+    // of the positions in `ALL`. Two kinds sharing a slot would silently add
+    // one to the other and nobody would find out from the number.
+    for (at, kind) in FailureKind::ALL.into_iter().enumerate() {
+        assert_eq!(kind.slot(), at, "{kind:?} is not where ALL puts it");
+    }
+    let names: std::collections::BTreeSet<_> =
+        FailureKind::ALL.iter().map(|kind| kind.label()).collect();
+    assert_eq!(
+        names.len(),
+        FailureKind::ALL.len(),
+        "two kinds share a name"
+    );
+    assert!(
+        names.iter().all(|name| !name.contains(' ')),
+        "a name with a space in it stops being readable next to a count"
+    );
+}
+
+#[test]
 fn an_answer_that_is_not_about_load_changes_nothing() {
     // A 404 is a correct, cheap answer about a page that is not there. A site
     // with a lot of dead links must not read as a site with spare capacity,

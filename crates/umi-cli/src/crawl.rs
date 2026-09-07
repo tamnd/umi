@@ -457,6 +457,14 @@ pub struct Summary {
     pub bytes_fetched: u64,
     /// Answers that were a failure of some kind.
     pub failed: u64,
+    /// Those failures by what went wrong, indexed by
+    /// [`FailureKind::slot`](umi_state::FailureKind::slot).
+    ///
+    /// The run total of the per tick tally, so it says what a whole crawl kept
+    /// hitting rather than what the last ten seconds hit. It adds up to slightly
+    /// less than `failed`, because a 410 and a URL that robots newly forbids are
+    /// counted there and are not failures of a fetch.
+    pub failures: [u64; umi_state::FailureKind::ALL.len()],
     /// Parquet files produced, whether they were kept or published.
     pub files: usize,
     /// How many of those went to the hub. Zero without `--publish`.
@@ -1603,7 +1611,43 @@ fn add(summary: &mut Summary, report: &TickReport) {
     summary.rows += report.rows as u64;
     summary.fetched += report.fetched as u64;
     summary.failed += report.failed as u64;
+    for (total, tick) in summary.failures.iter_mut().zip(report.failures) {
+        *total += u64::from(tick);
+    }
     summary.bytes_fetched += report.bytes_fetched;
+}
+
+impl Summary {
+    /// The failure tally as a list, for the end of a line somebody reads.
+    ///
+    /// Only the kinds that happened, because eight names with seven zeroes
+    /// beside them is a line nobody reads, and the whole point of the list is
+    /// that the one number which is large should be easy to find. In the order
+    /// of `FailureKind::ALL` rather than by size, because these lines get read
+    /// against the same line from another run and a list that reorders itself
+    /// when the numbers move is a list nobody can compare.
+    ///
+    /// Empty when nothing failed, which is what lets a caller leave the
+    /// brackets off entirely rather than printing an empty pair of them.
+    #[must_use]
+    pub fn failure_list(&self) -> String {
+        umi_state::FailureKind::ALL
+            .iter()
+            .map(|kind| (kind, self.failures[kind.slot()]))
+            .filter(|&(_, count)| count > 0)
+            .map(|(kind, count)| format!("{} {count}", kind.label()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// The same list in the brackets the two callers want it in.
+    #[must_use]
+    pub fn failure_note(&self) -> String {
+        match self.failure_list() {
+            list if list.is_empty() => list,
+            list => format!(" ({list})"),
+        }
+    }
 }
 
 /// Whether a doc 13.2 budget has been reached.
@@ -2395,6 +2439,14 @@ impl Pressure {
 /// tenth of what it saw is spending nine tenths of the largest write in the
 /// tick recognising links it already has, and the answer to that is a cheaper
 /// way of recognising them rather than a faster insert.
+///
+/// The failures come last with their kinds beside them, and the kinds are the
+/// point. A count on its own says a crawl is going badly and gives nobody a
+/// place to start, and the three things it usually means want three unrelated
+/// fixes: connect failures are the resolver or the socket limit, timeouts are a
+/// window wider than the box can serve, and blocks are doc 05.8 and the tier
+/// ladder. Only the kinds that happened are listed, so a healthy crawl prints a
+/// short list and a sick one puts the large number at the front of it.
 fn progress(
     summary: &Summary,
     report: &TickReport,
@@ -2410,7 +2462,7 @@ fn progress(
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
          {:.0}s links for {} of {})  \
-         {} MB fetched  {} MB stored  {} failed  bottleneck: {}",
+         {} MB fetched  {} MB stored  {} failed{}  bottleneck: {}",
         summary.rows,
         report.window_mean(),
         queued,
@@ -2438,6 +2490,7 @@ fn progress(
         summary.bytes_fetched / (1 << 20),
         summary.bytes_stored / (1 << 20),
         summary.failed,
+        summary.failure_note(),
         bottleneck(report),
     )
 }
