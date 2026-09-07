@@ -3352,7 +3352,24 @@ async fn a_host_with_no_robots_file_publishes_the_status_that_said_so() {
     let crawler = crawler(fetch, Arc::clone(&state));
     let sink = Arc::new(Collected::default());
 
-    crawler.tick(&sink).await.expect("tick");
+    let report = crawler.tick(&sink).await.expect("tick");
+    // Two of the three hosts refused a lease because their robots.txt could not
+    // be read, one at a 503 and one at a connect timeout, and the third served
+    // a 404, which is an answer and lets the page through. The two land on
+    // different failure kinds and on the same counter, because what they cost
+    // is the same thing: a url back on the queue untried and a host we still
+    // know nothing about.
+    assert_eq!(report.robots_refused, 2, "{report:?}");
+    assert_eq!(
+        report.failures[umi_state::FailureKind::Connect.slot()],
+        1,
+        "{report:?}"
+    );
+    assert_eq!(
+        report.failures[umi_state::FailureKind::ServerError.slot()],
+        1,
+        "{report:?}"
+    );
 
     let mut snapshots = sink.robots();
     snapshots.sort_by(|l, r| l.host.cmp(&r.host));

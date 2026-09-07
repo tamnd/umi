@@ -100,6 +100,10 @@ async fn a_server_error_on_robots_disallows_the_whole_host() {
         1,
         "the one failure was counted twice or under two kinds: {report:?}"
     );
+    assert_eq!(
+        report.robots_refused, 1,
+        "the lease failed on the file and not on the page: {report:?}"
+    );
     assert_eq!(report.disallowed, 0, "{report:?}");
     let stats = state.stats().await.expect("stats");
     assert_eq!(stats.urls_excluded, 0, "the site was retired over a 503");

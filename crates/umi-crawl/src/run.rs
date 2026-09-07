@@ -672,6 +672,21 @@ pub struct TickReport {
     /// URLs robots.txt said no to, which are completed as excluded and never
     /// fetched.
     pub disallowed: usize,
+    /// Leases that failed because the host's robots.txt could not be read.
+    ///
+    /// The other half of `failures`, and the half that tells two very different
+    /// problems apart. Both a page that will not connect and a robots.txt that
+    /// will not come back land on `FailureKind::Connect`, neither has a row and
+    /// neither has an HTTP status, so from the ledger they are the same zero.
+    /// This is the count of the second kind. Subtract it from the connect and
+    /// server figures in `failures` and what is left is the pages.
+    ///
+    /// It matters because of what each one costs. A page that will not connect
+    /// is one dead url. A robots.txt that will not come back sends every url
+    /// behind it back on the queue untried, so on a broad crawl of hosts we
+    /// have never seen this number climbing is the crawl stalling on a file
+    /// nobody wanted rather than on the pages somebody asked for. See #245.
+    pub robots_refused: usize,
     /// Rows this tick produced, by the tier that fetched them and how they
     /// came out.
     ///
@@ -1457,6 +1472,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 links,
                 links_seen,
                 disallowed,
+                robots_refused,
                 unchanged,
                 give_back,
                 signal,
@@ -1468,6 +1484,9 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
 
             if disallowed {
                 report.disallowed += 1;
+            }
+            if robots_refused {
+                report.robots_refused += 1;
             }
             // Whatever the prefetch finished while this fetch was on the wire.
             // Here rather than on the prefetch's own task because `held` is the
@@ -2776,6 +2795,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             links,
             links_seen,
             disallowed: false,
+            robots_refused: false,
             unchanged,
             give_back: false,
             signal: learned,
@@ -2909,6 +2929,17 @@ struct Fetched {
     links: Vec<(String, u8)>,
     links_seen: usize,
     disallowed: bool,
+    /// Whether this lease failed because the host's robots.txt could not be
+    /// read at all, rather than because the page could not be fetched.
+    ///
+    /// Both of them land on `FailureKind::Connect` and they are not the same
+    /// problem. A page that will not connect is one dead url on a host that is
+    /// otherwise fine. A robots.txt that will not come back costs the host, and
+    /// on a crawl of hosts we have never seen before it costs most of them,
+    /// because every url behind that file goes back on the queue untried. The
+    /// two are told apart nowhere else: neither has a row and neither has an
+    /// HTTP status, so from the ledger they are the same zero.
+    robots_refused: bool,
     /// Whether the row is a copy of one we have already published.
     ///
     /// Doc 05.3 says a 304 writes no row, because a revalidation is an
@@ -3218,7 +3249,9 @@ impl Fetched {
             From::Unreachable => umi_state::FailureKind::Connect,
             From::ServerError => umi_state::FailureKind::ServerError,
         };
-        Self::answered(lease, now_ms, FetchResult::Failed { status: None, kind })
+        let mut out = Self::answered(lease, now_ms, FetchResult::Failed { status: None, kind });
+        out.robots_refused = true;
+        out
     }
 
     /// A lease that spent its slot on robots.txt.
@@ -3300,6 +3333,7 @@ impl Fetched {
             links: Vec::new(),
             links_seen: 0,
             disallowed: false,
+            robots_refused: false,
             unchanged: false,
             give_back: false,
             signal: None,
