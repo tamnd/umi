@@ -82,10 +82,11 @@ percent-encoding = "2"
 # means the worst a bad pattern costs is a bad pattern.
 regex = "1"
 
-# Extraction. html5ever is the parser doc 11.3 names, and markup5ever_rcdom
-# is the tree it builds into.
+# Extraction. html5ever is the parser doc 11.3 names. The tree it builds into
+# is ours, in umi-extract's `sink` module, rather than markup5ever_rcdom, which
+# says in its own documentation that it is unsupported and not for production
+# and which costs an allocation and a refcount per node.
 html5ever = "0.39"
-markup5ever_rcdom = "0.39"
 tendril = "0.5"
 unicode-normalization = "0.1"
 

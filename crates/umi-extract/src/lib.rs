@@ -50,6 +50,17 @@ pub use text::plain_text;
 /// crate emits for an input it already handled is a major release.
 pub const VERSION: &str = concat!("umi-extract/", env!("CARGO_PKG_VERSION"));
 
+/// Parse a page and throw the tree away, returning how many nodes it had.
+///
+/// This is here for `benches/extract.rs`, which times the parse on its own
+/// alongside the whole of extraction so that a slow corpus can be blamed on the
+/// right half. It is not part of the interface: the node count is returned only
+/// so that the work cannot be optimised out, and nothing else should call this.
+#[doc(hidden)]
+pub fn parse_node_count(html: &[u8]) -> usize {
+    dom::Dom::parse(html).node_count()
+}
+
 /// The quality signals from doc 11.6 that this crate can compute today.
 ///
 /// Doc 11.6 lists seven. Six are here. `stopword_coverage` arrives with

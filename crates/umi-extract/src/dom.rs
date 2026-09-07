@@ -1,12 +1,13 @@
 //! The document tree, cleaned down to what the markdown subset can express.
 //!
-//! html5ever builds an `Rc` tree with interior mutability. That is the right
-//! shape for a parser and the wrong shape for everything after it: it cannot
-//! move across threads, it holds every attribute of every node alive, and
-//! walking it means chasing pointers through `RefCell` twice per node. Doc 11.9
-//! gives the whole of extraction 3 to 8 ms per page, and we walk the tree three
-//! times, so the parse is converted once into a flat arena and the html5ever
-//! tree is dropped before scoring starts.
+//! The tree html5ever builds is the right shape for a parser and the wrong
+//! shape for everything after it: it is mutable everywhere, it holds every
+//! attribute of every element alive, and it holds the comments and the
+//! `<script>` bodies doc 11.3 drops. Doc 11.9 gives the whole of extraction 3 to
+//! 8 ms per page, and we walk the tree three times, so the parse is converted
+//! once into this arena and the parse tree is dropped before scoring starts.
+//! [`crate::sink`] is the other half of that story and says why the parse tree
+//! is a flat arena too.
 //!
 //! The conversion is also where doc 11.3's drop list is applied. A `<script>`
 //! subtree never reaches the arena, so nothing downstream has to remember to
@@ -22,10 +23,9 @@
 //! [`Tag::Chrome`], marked, out of the content and still walkable.
 
 use html5ever::tendril::TendrilSink;
-use html5ever::{ParseOpts, parse_document};
-use markup5ever_rcdom::{Handle, NodeData};
+use html5ever::{Attribute, ParseOpts, parse_document};
 
-use crate::sink::Sink;
+use crate::sink::{DOCUMENT, Data, Id, Sink, Tree};
 
 /// The index of the root node, which every arena has and which is never an
 /// element.
@@ -262,9 +262,15 @@ impl Dom {
         // was worth two percent, and it disagreed with html5ever on five of two
         // thousand real pages. Doc 11.1 wants byte identical output forever, so
         // a scanner that quietly differs from the reference parser is not worth
-        // two percent. If this needs to be fast, the answer is to build the
-        // arena from html5ever's tokeniser and skip `RcDom`, not to guess ahead
-        // of it.
+        // two percent.
+        //
+        // The tree the parser builds is [`crate::sink`]'s flat arena rather than
+        // an `Rc` graph, so the walk below reads a `Vec` instead of chasing a
+        // pointer and a `RefCell` per node, and the discarded tree frees in one
+        // deallocation. It is still two trees per page. Collapsing them into one
+        // is not available: foster parenting and the adoption agency algorithm
+        // both move a node that already exists to somewhere earlier in the
+        // document, and the arena's whole contract is that they never do.
         let parsed = parse_document(Sink::default(), ParseOpts::default())
             .from_utf8()
             .one(html);
@@ -279,7 +285,7 @@ impl Dom {
             microdata: false,
             rdfa: false,
         };
-        dom.absorb(&parsed.document);
+        dom.absorb(&parsed);
         dom
     }
 
@@ -291,14 +297,15 @@ impl Dom {
     /// so that popping visits them in document order, which is also why a node's
     /// index is greater than every index before it in the document and why every
     /// pass downstream can treat `0..node_count()` as document order.
-    fn absorb(&mut self, document: &Handle) {
-        let mut stack: Vec<(Handle, usize, u32, bool)> = vec![(document.clone(), ROOT, 0, false)];
-        while let Some((handle, parent, depth, chrome)) = stack.pop() {
+    fn absorb(&mut self, tree: &Tree) {
+        let mut stack: Vec<(Id, usize, u32, bool)> = vec![(DOCUMENT, ROOT, 0, false)];
+        while let Some((id, parent, depth, chrome)) = stack.pop() {
             let mut chrome = chrome;
-            let (kind, keep_children) = match &handle.data {
-                NodeData::Document => (None, true),
-                NodeData::Text { contents } => {
-                    let text = contents.borrow().to_string();
+            let node = tree.node(id);
+            let (kind, keep_children) = match &node.data {
+                Data::Document => (None, true),
+                Data::Text(contents) => {
+                    let text = contents.to_string();
                     // Text inside chrome counts as dropped, because that is what
                     // it was before chrome was kept and this signal should not
                     // move for a change nobody can see in the output.
@@ -307,9 +314,9 @@ impl Dom {
                     }
                     (Some(Kind::Text(text)), false)
                 }
-                NodeData::Element { name, attrs, .. } => {
-                    let local = name.local.as_ref();
-                    self.note_vocabulary(&attrs.borrow());
+                Data::Element(element) => {
+                    let local = element.name.local.as_ref();
+                    self.note_vocabulary(&element.attrs);
                     match classify(local) {
                         None => {
                             // `<script type="application/ld+json">` is the one
@@ -319,20 +326,20 @@ impl Dom {
                             // downstream has to learn that some scripts are
                             // different from other scripts.
                             if local == "script" {
-                                self.note_ld_json(&handle, &attrs.borrow());
+                                self.note_ld_json(tree, id, &element.attrs);
                             }
                             // Already inside chrome, so this subtree's text is
                             // counted by whichever of the two rules gets there
                             // first and never by both.
                             if !chrome {
-                                self.dropped += dropped_bytes(&handle);
+                                self.dropped += dropped_bytes(tree, id);
                             }
                             continue;
                         }
                         Some(tag) => {
                             chrome = chrome || tag == Tag::Chrome;
-                            let attrs = attrs
-                                .borrow()
+                            let attrs = element
+                                .attrs
                                 .iter()
                                 .filter(|attr| KEPT_ATTRS.contains(&attr.name.local.as_ref()))
                                 .map(|attr| {
@@ -346,7 +353,7 @@ impl Dom {
                 // Comments, doctypes and processing instructions are dropped
                 // whole. A doctype has no children and a comment's children are
                 // not a thing, so nothing is lost by not descending.
-                _ => continue,
+                Data::Ignored => continue,
             };
 
             let (me, next_depth) = match kind {
@@ -377,8 +384,8 @@ impl Dom {
             };
 
             if keep_children {
-                for child in handle.children.borrow().iter().rev() {
-                    stack.push((child.clone(), me, next_depth, chrome));
+                for &child in node.children.iter().rev() {
+                    stack.push((child, me, next_depth, chrome));
                 }
             }
         }
@@ -391,7 +398,7 @@ impl Dom {
     /// than on the ones that name a field, because `itemprop` and `property`
     /// both turn up on pages carrying neither vocabulary and would flag most of
     /// the web.
-    fn note_vocabulary(&mut self, attrs: &[html5ever::Attribute]) {
+    fn note_vocabulary(&mut self, attrs: &[Attribute]) {
         // Both flags set means there is nothing left to look for, and this runs
         // on every element of every page.
         if self.microdata && self.rdfa {
@@ -412,7 +419,7 @@ impl Dom {
     /// that is missing, or that says `text/javascript`, is a script and not
     /// structured data, and treating a bare `<script>` as JSON-LD would hand the
     /// parser every inline script on the page.
-    fn note_ld_json(&mut self, handle: &Handle, attrs: &[html5ever::Attribute]) {
+    fn note_ld_json(&mut self, tree: &Tree, id: Id, attrs: &[Attribute]) {
         if self.ld_json.len() >= MAX_LD_JSON {
             return;
         }
@@ -429,9 +436,9 @@ impl Dom {
         // A script element holds exactly one text child when it holds anything,
         // because the tokeniser runs it in a raw text state.
         let mut body = String::new();
-        for child in handle.children.borrow().iter() {
-            if let NodeData::Text { contents } = &child.data {
-                body.push_str(&contents.borrow());
+        for &child in &tree.node(id).children {
+            if let Data::Text(contents) = &tree.node(child).data {
+                body.push_str(contents);
             }
             if body.len() > MAX_LD_JSON_BYTES {
                 return;
@@ -594,23 +601,22 @@ fn classify(name: &str) -> Option<Tag> {
 
 /// The text bytes under a subtree we are about to drop.
 ///
-/// Only used for the dropped byte signal, so it walks the html5ever tree
-/// directly rather than paying to convert a subtree we do not want.
-fn dropped_bytes(handle: &Handle) -> u32 {
+/// Only used for the dropped byte signal, so it walks the parsed tree directly
+/// rather than paying to convert a subtree we do not want.
+fn dropped_bytes(tree: &Tree, id: Id) -> u32 {
     let mut total = 0u32;
-    let mut stack = vec![handle.clone()];
+    let mut stack = vec![id];
     let mut budget = 100_000u32;
-    while let Some(node) = stack.pop() {
+    while let Some(id) = stack.pop() {
         if budget == 0 {
             break;
         }
         budget -= 1;
-        if let NodeData::Text { contents } = &node.data {
-            total = total.saturating_add(contents.borrow().len() as u32);
+        let node = tree.node(id);
+        if let Data::Text(contents) = &node.data {
+            total = total.saturating_add(contents.len() as u32);
         }
-        for child in node.children.borrow().iter() {
-            stack.push(child.clone());
-        }
+        stack.extend(node.children.iter().copied());
     }
     total
 }
