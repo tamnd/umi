@@ -932,6 +932,120 @@ async fn robots_is_asked_for_when_the_lease_arrives_and_not_when_it_is_dispatche
 }
 
 #[tokio::test]
+async fn a_robots_file_the_crawl_fetched_is_written_down_for_the_next_run() {
+    // The half of #164 that survives the process. The ledger has recorded the
+    // digest and the expiry since the first schema, which is enough to know an
+    // answer went stale and not enough to use one, so the rules only ever lived
+    // in this process and a restart threw them away.
+    let state = seeded(&["https://w0.example/a"]).await;
+    let fetch = Canned::new()
+        .robots("https://w0.example", "User-agent: *\nDisallow: /admin\n")
+        .html("https://w0.example/a", &page("A", &[]));
+    let crawler = crawler(fetch, Arc::clone(&state));
+
+    crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+
+    let host = umi_types::HostId::derive(b"w0.example");
+    let docs = state.robots(&[host]).await.expect("robots");
+    assert_eq!(docs.len(), 1, "{docs:?}");
+    // The bytes and not our reading of them, so that a parser change is picked
+    // up on the next load rather than needing a migration.
+    assert_eq!(
+        docs[0].body.as_deref(),
+        Some("User-agent: *\nDisallow: /admin\n"),
+        "{docs:?}"
+    );
+    assert_eq!(docs[0].status, 200, "{docs:?}");
+    assert!(docs[0].fresh(T0), "{docs:?}");
+}
+
+#[tokio::test]
+async fn a_stored_robots_file_is_loaded_rather_than_asked_for_again() {
+    // The restart itself. A fresh crawler over a store that already holds the
+    // file must not spend a request on it, and the rules it loads have to be
+    // the rules that decide, which is why the two answers here disagree. The
+    // store says the page is off limits and the fetcher would say it is fine,
+    // so a run that asked the origin fetches the page and a run that read the
+    // store refuses it. Counting requests alone would not tell those apart: a
+    // loader that filled the cache and then let the fetch decide would pass a
+    // count and be useless.
+    let state = seeded(&["https://w0.example/a"]).await;
+    state
+        .put_robots(&[umi_state::RobotsDoc {
+            host: umi_types::HostId::derive(b"w0.example"),
+            digest: umi_types::Digest::derive(b"User-agent: *\nDisallow: /\n"),
+            fetched_ms: T0,
+            expires_ms: T0 + crate::robots::TTL_MS,
+            status: 200,
+            body: Some("User-agent: *\nDisallow: /\n".to_owned()),
+        }])
+        .await
+        .expect("put_robots");
+    let fetch = Canned::new()
+        .robots("https://w0.example", "User-agent: *\nAllow: /\n")
+        .html("https://w0.example/a", &page("A", &[]));
+    let crawler = crawler(fetch, state);
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+
+    assert_eq!(report.robots_loaded, 1, "{report:?}");
+    // Nothing warmed, because the host never needed asking.
+    assert_eq!(report.robots_warmed, 0, "{report:?}");
+    assert!(
+        !crawler.fetcher().asked_for("https://w0.example/robots.txt"),
+        "{:?}",
+        crawler.fetcher().asked()
+    );
+    // And the stored rules are the ones that decided.
+    assert_eq!(report.disallowed, 1, "{report:?}");
+    assert_eq!(report.fetched, 0, "{report:?}");
+}
+
+#[tokio::test]
+async fn a_stored_robots_file_past_its_day_is_asked_for_again() {
+    // The other side of the same rule. Doc 07.4 gives a file a day, and a row
+    // older than that is not rules we may act on. It is worth keeping, because
+    // the digest on it is what a conditional refetch is built from, but that is
+    // a round trip we have not built yet and this must not quietly become one.
+    let state = seeded(&["https://w0.example/a"]).await;
+    state
+        .put_robots(&[umi_state::RobotsDoc {
+            host: umi_types::HostId::derive(b"w0.example"),
+            digest: umi_types::Digest::derive(b"User-agent: *\nDisallow: /\n"),
+            fetched_ms: T0 - crate::robots::TTL_MS * 2,
+            expires_ms: T0 - crate::robots::TTL_MS,
+            status: 200,
+            body: Some("User-agent: *\nDisallow: /\n".to_owned()),
+        }])
+        .await
+        .expect("put_robots");
+    let fetch = Canned::new()
+        .robots("https://w0.example", "User-agent: *\nAllow: /\n")
+        .html("https://w0.example/a", &page("A", &[]));
+    let crawler = crawler(fetch, state);
+
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+
+    assert_eq!(report.robots_loaded, 0, "{report:?}");
+    assert_eq!(report.robots_warmed, 1, "{report:?}");
+    assert!(
+        crawler.fetcher().asked_for("https://w0.example/robots.txt"),
+        "{:?}",
+        crawler.fetcher().asked()
+    );
+    assert_eq!(report.fetched, 1, "{report:?}");
+}
+
+#[tokio::test]
 async fn a_delay_the_prefetch_read_still_reaches_the_host_record() {
     // The one thing the prefetch could quietly break. Doc 07.4 puts a published
     // `Crawl-delay` in the host record, and the record used to learn it from
