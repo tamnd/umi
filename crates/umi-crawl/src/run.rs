@@ -57,8 +57,8 @@ use umi_fetch::Outcome;
 use umi_frontier::{Ask, Config as FrontierConfig, Frontier, Rate};
 use umi_robots::Provenance;
 use umi_state::{
-    Budget, Discovery, FetchOutcome, FetchResult, LeaseId, NackReason, Pace, RobotsRef, State,
-    StateError,
+    Budget, Discovery, FetchOutcome, FetchResult, LeaseId, NackReason, Pace, RobotsDoc, RobotsRef,
+    State, StateError,
 };
 use umi_types::{FetcherId, HostId, OutcomeCode, Revalidator, Tier, TierSignal, Verification};
 
@@ -220,6 +220,16 @@ struct Held {
     /// Doc 07.4's robots snapshots, for the sink. Not merged, because each one
     /// is a distinct fetch of a distinct host.
     robots: Vec<RobotsRow>,
+    /// The same files again for the state layer, so a restart does not ask for
+    /// them a second time.
+    ///
+    /// Two vectors of the same fetch rather than one, because they go to two
+    /// different places for two different reasons and neither one can be
+    /// derived from the other. [`RobotsRow`] is doc 07.4's published shape,
+    /// with the parse flattened into columns a reader can query and the host as
+    /// text. [`RobotsDoc`] is the bytes and the digest, which is what a reload
+    /// needs and what a conditional refetch is built from.
+    robots_docs: Vec<RobotsDoc>,
 }
 
 impl Held {
@@ -417,11 +427,25 @@ struct Warming<'a> {
 /// leaves what it learned here and the loop folds it in on its next pass, the
 /// same way a finished fetch leaves a signal.
 #[derive(Default)]
-struct Warmed(Mutex<Vec<Learned>>);
+struct Warmed {
+    learned: Mutex<Vec<Learned>>,
+    /// Hosts the prefetch did not have to ask about because the store already
+    /// held a fresh file for them.
+    ///
+    /// A counter and not a [`Learned`], because a loaded file teaches nothing.
+    /// Nothing was fetched, so there is no tier signal, no host record to write
+    /// and nothing to publish. All that happened is a request that did not go
+    /// out, and the only place that belongs is the report.
+    loaded: AtomicU64,
+}
 
 impl Warmed {
     fn push(&self, learned: Learned) {
         self.lock().push(learned);
+    }
+
+    fn load(&self, hosts: usize) {
+        self.loaded.fetch_add(hosts as u64, Ordering::Relaxed);
     }
 
     /// Everything left here, leaving the vector empty for the next pass.
@@ -429,8 +453,13 @@ impl Warmed {
         std::mem::take(&mut *self.lock())
     }
 
+    /// The loads since the last pass, leaving the counter at zero.
+    fn take_loaded(&self) -> usize {
+        self.loaded.swap(0, Ordering::Relaxed) as usize
+    }
+
     fn lock(&self) -> MutexGuard<'_, Vec<Learned>> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.learned.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -718,6 +747,15 @@ pub struct TickReport {
     /// slots on robots.txt is a tick where the files arrived too late to help,
     /// which means the queue was not deep enough to give them any runway.
     pub robots_warmed: usize,
+    /// Robots.txt files read back out of the store instead of being fetched.
+    ///
+    /// This is the number that says whether a restart is costing the hosts in
+    /// its working set a second request for a file they already served us. A
+    /// crawl that has been running for a while sits near zero, because the
+    /// cache in front of the store answers first and only a host that fell out
+    /// of it reaches this. The tick after a restart is where it should be large,
+    /// and if it is not then the files are not being written or not being found.
+    pub robots_loaded: usize,
     /// Times a window slot stepped over a lease whose robots.txt had not
     /// landed and took the one behind it instead.
     ///
@@ -1494,9 +1532,11 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             // because a fact the loop is sitting on is a host record the tick
             // has not written yet. Taking an empty vector is what this does on
             // almost every pass.
+            report.robots_loaded += warmed.take_loaded();
             for mut learned in warmed.take() {
                 report.robots_warmed += 1;
                 held.robots.extend(learned.snapshot.take());
+                held.robots_docs.extend(learned.doc.take());
                 learn(&mut held.signals, learned);
             }
             if let Some(mut learned) = signal {
@@ -1504,6 +1544,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 // that spent its slot on robots.txt and learned nothing about
                 // the ladder still fetched a file doc 07.4 publishes.
                 held.robots.extend(learned.snapshot.take());
+                held.robots_docs.extend(learned.doc.take());
                 // A block with no row behind it is a challenge page: doc 05.8
                 // says a 200 carrying a wall is not a fetch, so `one` throws
                 // the row away and this is what is left of it. A block that
@@ -1636,9 +1677,11 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         // entry is in the cache either way, and holding a tick open for a
         // robots.txt that nothing is waiting for is the delay this whole change
         // is about. See the note in `run_one` for what covers the loss.
+        report.robots_loaded += warmed.take_loaded();
         for mut learned in warmed.take() {
             report.robots_warmed += 1;
             held.robots.extend(learned.snapshot.take());
+            held.robots_docs.extend(learned.doc.take());
             learn(&mut held.signals, learned);
         }
         // Both, in order. The one in flight has the earlier window in it and
@@ -1738,6 +1781,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
     /// hosts, which is the same order as the window it runs beside.
     fn warm(&self, leases: &[umi_state::Lease], floors: &Arc<HostFloors>, warmed: &Arc<Warmed>) {
         let mut seen = HashSet::with_capacity(leases.len());
+        let mut hosts = Vec::new();
         for lease in leases {
             if !seen.insert(lease.key.host) {
                 continue;
@@ -1745,11 +1789,36 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             let Some(origin) = origin_of(&lease.url) else {
                 continue;
             };
+            hosts.push((lease.key.host, origin, lease.tier, lease.delay_ms));
+        }
+        if hosts.is_empty() {
+            return;
+        }
+
+        // The batch read of the store, done once for all of them and awaited by
+        // each. A cell rather than a task in front of the spawns, because the
+        // spawns have to keep happening here and in this order: `warm` is
+        // called before the leases reach the queue precisely so that a
+        // prefetch task is queued ahead of the window task that will want the
+        // file, and putting anything between the two hands the host's first
+        // slot to the lease instead of the prefetch. Whichever prefetch is
+        // polled first does the read and the others wait on it, which is the
+        // same shape [`RobotsCache::entry`] uses per host.
+        let hosts = Arc::new(hosts);
+        let loaded = Arc::new(tokio::sync::OnceCell::new());
+        for (host, origin, tier, delay_ms) in hosts.iter().cloned() {
             let shared = Arc::clone(&self.shared);
             let floors = Arc::clone(floors);
             let warmed = Arc::clone(warmed);
-            let (host, tier, delay_ms) = (lease.key.host, lease.tier, lease.delay_ms);
+            let hosts = Arc::clone(&hosts);
+            let loaded = Arc::clone(&loaded);
             tokio::spawn(async move {
+                let held = loaded
+                    .get_or_init(|| shared.load_robots(&hosts, &warmed))
+                    .await;
+                if held.contains(&host) {
+                    return;
+                }
                 if let Some(learned) = shared
                     .warm_one(host, &origin, tier, delay_ms, &floors)
                     .await
@@ -2023,6 +2092,19 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             // a lot of hosts.
             sink.take_robots(&held.robots).await?;
             done.robots = held.robots.len();
+        }
+        if !held.robots_docs.is_empty() {
+            // One call for the batch rather than one per host. The prefetch
+            // finishes a few hundred files a minute on a broad crawl and each
+            // of these is a transaction on the backend, so per host this would
+            // be a few hundred fsync-less commits a minute competing with the
+            // completions for the same lock. Batched it is one.
+            //
+            // Not counted in `store_ms`'s split, for the reason the snapshot
+            // above is not: this is a write that happens on the ticks that
+            // warmed hosts and on no others, and folding it into the page cost
+            // would make the page write look like it slowed down.
+            self.state().put_robots(&held.robots_docs).await?;
         }
         if !held.rows.is_empty() {
             let at = Instant::now();
@@ -2339,6 +2421,67 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         }
     }
 
+    /// Fill the cache from the store for as many of these hosts as it can, and
+    /// say which ones came back.
+    ///
+    /// The hosts named here are the ones the caller is about to spend a request
+    /// on, so every one this finds is a round trip that does not happen. After
+    /// a restart that is most of them, which is the case doc 07.4's day long
+    /// TTL was always meant to cover and which until now it did not: the ledger
+    /// knew we had asked and the answer itself only ever lived in this process.
+    ///
+    /// The cache is asked first and only the misses go to the store. A crawl
+    /// that has been running for a while holds nearly everything it is about to
+    /// lease, and reading the store for those would put a lock and a few
+    /// thousand b-tree descents on every tick to learn what a hash lookup
+    /// already knew.
+    ///
+    /// Stale rows are dropped rather than loaded. They are not useless, and the
+    /// conditional refetch that turns one into a 304 with no body is the next
+    /// thing worth building, but a row past doc 07.4's day is not rules we may
+    /// act on and loading one would mean acting on it.
+    ///
+    /// A store that cannot answer is not an error here. The caller falls
+    /// through to asking the origin, which is what it did before this existed,
+    /// so the worst a broken read costs is the request it was trying to save.
+    ///
+    /// Called once per batch, from whichever prefetch task reaches the cell
+    /// first, and every other task in the batch waits on that one. It is a
+    /// batch call because that is the shape [`State::robots`] is built in: the
+    /// hosts of one lease batch are known together, and a backend given all of
+    /// them takes its lock once instead of a few thousand times.
+    async fn load_robots(
+        &self,
+        hosts: &[(HostId, String, Tier, u32)],
+        warmed: &Warmed,
+    ) -> HashSet<HostId> {
+        let now_ms = self.clock.now_ms();
+        let mut misses = Vec::new();
+        for (host, ..) in hosts {
+            if !self.robots.holds(*host, now_ms).await {
+                misses.push(*host);
+            }
+        }
+        if misses.is_empty() {
+            return HashSet::new();
+        }
+
+        let Ok(docs) = self.state().robots(&misses).await else {
+            return HashSet::new();
+        };
+        let mut held = HashSet::with_capacity(docs.len());
+        for doc in docs {
+            if !doc.fresh(now_ms) {
+                continue;
+            }
+            let host = doc.host;
+            self.robots.insert(host, RobotsEntry::from_doc(&doc)).await;
+            held.insert(host);
+        }
+        warmed.load(held.len());
+        held
+    }
+
     /// One host's robots.txt, fetched ahead of the lease that needs it.
     ///
     /// [`None`] when there was nothing to do, which covers three cases and
@@ -2373,6 +2516,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         fetched.then(|| Learned {
             robots: Some(RobotsFacts::of(&entry)),
             snapshot: Some(RobotsRow::build(authority_of(origin), &entry)),
+            doc: Some(entry.doc(host)),
             ..Learned::nothing(host, tier, false)
         })
     }
@@ -2474,6 +2618,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             // lease read the file out of the cache and publishing a second row
             // for it would put the same fetch in the corpus twice.
             snapshot: robots_fetched.then(|| RobotsRow::build(authority_of(&origin), &entry)),
+            doc: robots_fetched.then(|| entry.doc(lease.key.host)),
         });
         if !decision.is_allowed() {
             return Fetched::refused(&lease, now(), entry.robots.provenance())
@@ -3012,6 +3157,9 @@ struct Learned {
     /// [`RobotsFacts`] because the facts are folded per host by `learn` and a
     /// published row is not something to merge.
     snapshot: Option<RobotsRow>,
+    /// The same file for the state layer, set on the same one task and for the
+    /// same reason. See [`Held::robots_docs`] for why it is not the snapshot.
+    doc: Option<RobotsDoc>,
 }
 
 /// What one robots.txt fetch said about the host that owns it, beyond the
@@ -3033,6 +3181,9 @@ struct Taught {
     /// The half that gets published, present only when this task is the one
     /// that asked the origin.
     snapshot: Option<RobotsRow>,
+    /// The half that gets stored, on the same condition and for the same
+    /// reason: a file we did not ask for is not ours to write down.
+    doc: Option<RobotsDoc>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -3114,6 +3265,7 @@ impl Learned {
             lie: false,
             robots: None,
             snapshot: None,
+            doc: None,
         }
     }
 
@@ -3367,6 +3519,7 @@ impl Fetched {
                 .get_or_insert_with(|| Learned::nothing(lease.key.host, lease.tier, lease.probe));
             signal.robots = Some(robots.facts);
             signal.snapshot = robots.snapshot;
+            signal.doc = robots.doc;
         }
         self
     }

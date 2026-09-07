@@ -41,6 +41,7 @@ use arrow::datatypes::{DataType, Field};
 use tokio::sync::{Mutex, OnceCell};
 use umi_file::StreamKind;
 use umi_robots::{Decision, Provenance, Robots};
+use umi_state::RobotsDoc;
 use umi_types::{Digest, HostId, Tier};
 
 use crate::fetch::Fetch;
@@ -100,6 +101,54 @@ impl Entry {
     #[must_use]
     pub const fn fresh(&self, now_ms: u64) -> bool {
         now_ms < self.expires_ms
+    }
+
+    /// The entry a stored document parses to.
+    ///
+    /// The rules are parsed here rather than stored, which is the whole reason
+    /// [`RobotsDoc`] keeps the body and not our reading of it. A change to the
+    /// parser is picked up the first time a restored row is loaded, with no
+    /// migration and no stale rules left behind in a table.
+    ///
+    /// [`Robots::for_status`] and not a plain parse, because a row recording a
+    /// 404 or a 5xx has no body and the two mean opposite things. Parsing an
+    /// absent body gives the empty ruleset, which allows everything, and that
+    /// is the right answer for the 404 and exactly the wrong one for the 5xx
+    /// that RFC 9309 2.3.1.4 says disallows the host for a day. `for_status`
+    /// is the one place that knows which is which, and going through it means
+    /// a restored entry gives the same answer the original fetch did.
+    #[must_use]
+    pub fn from_doc(doc: &RobotsDoc) -> Self {
+        Self {
+            robots: Arc::new(Robots::for_status(
+                doc.status,
+                doc.body.as_deref().unwrap_or_default().as_bytes(),
+            )),
+            digest: doc.digest,
+            fetched_ms: doc.fetched_ms,
+            expires_ms: doc.expires_ms,
+            status: doc.status,
+            body: doc.body.as_deref().map(Arc::from),
+        }
+    }
+
+    /// The document to store for `host`, so that a restart can rebuild this
+    /// entry instead of asking the origin again.
+    ///
+    /// Cut to [`RobotsDoc::MAX_BODY`] on the way out. The body here came off a
+    /// fetch and an origin is free to send a gigabyte, and the store should not
+    /// be the layer that finds that out.
+    #[must_use]
+    pub fn doc(&self, host: HostId) -> RobotsDoc {
+        RobotsDoc {
+            host,
+            digest: self.digest,
+            fetched_ms: self.fetched_ms,
+            expires_ms: self.expires_ms,
+            status: self.status,
+            body: self.body.as_deref().map(ToOwned::to_owned),
+        }
+        .truncated()
     }
 }
 

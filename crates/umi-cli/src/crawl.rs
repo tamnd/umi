@@ -2407,6 +2407,14 @@ impl Pressure {
 /// is still high has a queue too shallow for either of them to help, which is a
 /// frontier problem and not a fetch one.
 ///
+/// `loaded` is the third and is the cheapest of them, because it is files that
+/// came out of the store rather than off the wire. A steady crawl sits near
+/// zero here, since the cache in front of the store answers first. The tick
+/// after a restart is where it should be a large fraction of the hosts leased,
+/// and a restart where it is not is a restart asking every host in its working
+/// set for a file it already had, which is the worst possible moment to look
+/// like a burst of unexplained traffic.
+///
 /// `refused` is what that costs when it goes all the way wrong. It counts the
 /// leases that failed because the host's robots.txt could not be read at all,
 /// which is a url going back on the queue untried and a host we still know
@@ -2467,7 +2475,7 @@ fn progress(
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  \
          {} ms per slot ({} waiting to start, {} uncollected)  \
-         {} ms per page ({} robots, {} polite, {} warmed, {} stepped, {} refused)  \
+         {} ms per page ({} robots, {} polite, {} warmed, {} loaded, {} stepped, {} refused)  \
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
          {:.0}s links for {} of {})  \
@@ -2483,6 +2491,7 @@ fn progress(
         report.robots_mean_ms(),
         report.waited_mean_ms(),
         report.robots_warmed,
+        report.robots_loaded,
         report.robots_stepped,
         report.robots_refused,
         (report.store_waited_ms + report.ask_waited_ms) as f64 / 1000.0,
