@@ -12,10 +12,10 @@
 //! document. The whole thing is `Instant` and a sort.
 //!
 //! The parse is timed on its own as well as inside the total, because the two
-//! answers lead to different work. If html5ever is most of the number then no
-//! amount of tuning the passes over the tree will move it and the fix is upstream
-//! or is a cap on what we agree to parse. If the passes are most of it, they are
-//! ours to fix.
+//! answers lead to different work. If getting the page into an arena is most of
+//! the number then no amount of tuning the passes over the tree will move it,
+//! and the fix is the tokeniser or a cap on what we agree to parse. If the
+//! passes are most of it, they are ours to fix.
 //!
 //! server1, server2 and server3 all run other work, so the first thing this
 //! prints is whether the machine gave us a cpu or made us queue for one. A run
@@ -34,9 +34,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use html5ever::tendril::TendrilSink;
-use markup5ever_rcdom::RcDom;
-use umi_extract::{DescriptionSource, TitleSource, extract};
+use umi_extract::{DescriptionSource, TitleSource, extract, parse_node_count};
 use url::Url;
 
 /// Doc 05.4 caps a stored body at 512 KiB, so the fetcher never hands the
@@ -127,18 +125,17 @@ fn main() {
         timings.push((best, html.len(), name.clone()));
     }
 
-    // The same parse the extractor does, timed on its own. The tree is dropped
-    // inside the measurement because building it and freeing it are both costs
-    // the extractor pays.
+    // The same parse the extractor does, timed on its own. That is html5ever
+    // plus the arena it builds into plus the walk that applies doc 11.3's drop
+    // list, because those three are one cost and none of them can be skipped.
+    // The tree is dropped inside the measurement because building it and freeing
+    // it are both costs the extractor pays.
     let mut parse_ns = 0u128;
     for (_, html) in &documents {
         let mut best = u128::MAX;
         for _ in 0..repeat {
             let start = Instant::now();
-            let tree = html5ever::parse_document(RcDom::default(), Default::default())
-                .from_utf8()
-                .one(html.as_slice());
-            drop(std::hint::black_box(tree));
+            std::hint::black_box(parse_node_count(html.as_slice()));
             best = best.min(start.elapsed().as_nanos());
         }
         parse_ns += best;
@@ -377,7 +374,7 @@ fn report(
     );
     let parse_ms = parse_ns as f64 / count as f64 / 1e6;
     println!(
-        "               html5ever parse {parse_ms:.2} ms of it, {:.0} percent",
+        "               parse and arena {parse_ms:.2} ms of it, {:.0} percent",
         parse_ms / mean_ms * 100.0
     );
     println!(
