@@ -398,6 +398,27 @@ INSERT OR REPLACE INTO hosts (
     ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
 )";
 
+/// One host's stored robots.txt.
+///
+/// A statement per host rather than an `IN` list, because the list is built
+/// from a leased batch and rusqlite has no array binding, so an `IN` would mean
+/// assembling SQL text per call and losing the prepared statement cache. A
+/// prepared lookup by primary key is a b-tree descent, and doing a few thousand
+/// of them inside one transaction is what the rest of this crate does too.
+pub const SELECT_ROBOTS: &str = "
+SELECT host, digest, fetched_ms, expires_ms, status, body
+  FROM robots_documents
+ WHERE host = ?1";
+
+/// Write one host's robots.txt whole.
+///
+/// Replace and never merge. A robots.txt is one document, and half of an old
+/// one stitched to half of a new one is not a file any host ever served.
+pub const PUT_ROBOTS: &str = "
+INSERT OR REPLACE INTO robots_documents (
+    host, digest, fetched_ms, expires_ms, status, body
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
+
 /// Put an ETag in the pool and get back the reference a ledger row stores.
 ///
 /// The `DO UPDATE` looks pointless and is not. `DO NOTHING` makes the statement

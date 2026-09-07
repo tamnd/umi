@@ -75,8 +75,8 @@ pub use pace::Pace;
 pub use types::{
     AdmitReport, BlockReport, BlockRow, Candidate, Checkpoint, Discovery, EvictReport,
     ExcludeReason, FailureKind, FetchOutcome, FetchResult, HostRow, Lease, LeaseId, LeaseRequest,
-    LedgerRow, NackReason, Priority, RemoteCopy, Revalidator, RobotsRef, SegmentQuery, SegmentRow,
-    Shard, SpillRow, StateStats, Stream, SupervisionRow, TierPolicy, UrlState,
+    LedgerRow, NackReason, Priority, RemoteCopy, Revalidator, RobotsDoc, RobotsRef, SegmentQuery,
+    SegmentRow, Shard, SpillRow, StateStats, Stream, SupervisionRow, TierPolicy, UrlState,
 };
 
 /// The batch size the whole design is tuned around, from doc 08.5.
@@ -185,8 +185,8 @@ pub type Result<T> = std::result::Result<T, StateError>;
 
 /// The state layer.
 ///
-/// Twenty one methods, all batched, all taking time as an argument. Implement it
-/// and then run [`conformance::check`] against it: the suite is the definition
+/// Twenty seven methods, all batched, all taking time as an argument. Implement
+/// it and then run [`conformance::check`] against it: the suite is the definition
 /// of what these doc comments mean, and a backend that has not been through it
 /// has not implemented this trait, it has implemented something that compiles.
 #[async_trait::async_trait]
@@ -323,6 +323,48 @@ pub trait State: Send + Sync + 'static {
     ///
     /// Whatever the store reports.
     async fn put_host(&self, rows: &[HostRow]) -> Result<()>;
+
+    /// The stored robots.txt for these hosts, for whichever of them we have.
+    ///
+    /// A host with nothing stored is absent from the result rather than present
+    /// with an empty body, because those mean opposite things: no row is a host
+    /// we have never had a usable answer from, and a row with no body is a host
+    /// that served an empty file, which allows everything.
+    ///
+    /// Rows past their expiry come back too. They are not a cache hit and a
+    /// caller must not use one as if it were, but they carry the digest a
+    /// conditional refetch is built from, and that turns a refetch into a round
+    /// trip with no body on it. Which of the two a stale row is worth is the
+    /// caller's decision, so the store does not make it by filtering here.
+    ///
+    /// Order is unspecified, and a host named twice in `hosts` produces one row.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::BatchTooLarge`] if the backend has a smaller limit than
+    /// the batch, and whatever the store reports otherwise.
+    async fn robots(&self, hosts: &[HostId]) -> Result<Vec<RobotsDoc>>;
+
+    /// Store what these hosts served, replacing whatever was there.
+    ///
+    /// Last write wins per host, and within one batch the last occurrence of a
+    /// host wins, as with [`put_host`](State::put_host). Replacing and never
+    /// merging, because a robots.txt is one document and half of an old one
+    /// stitched to half of a new one is not a file any host ever served.
+    ///
+    /// A body longer than [`RobotsDoc::MAX_BODY`] is the caller's to cut, with
+    /// [`truncated`](RobotsDoc::truncated). A backend may store it whole and
+    /// none of them should have to decide.
+    ///
+    /// **Durability: buffered.** Losing one of these costs one refetch of one
+    /// file, which is exactly the cost this table exists to avoid and nowhere
+    /// near enough to pay for a sync on the path that writes it.
+    ///
+    /// # Errors
+    ///
+    /// [`StateError::BatchTooLarge`] if the backend has a smaller limit than
+    /// the batch, and whatever the store reports otherwise.
+    async fn put_robots(&self, docs: &[RobotsDoc]) -> Result<()>;
 
     /// Stop crawling a domain, or record that a block has been lifted.
     ///
@@ -718,6 +760,14 @@ impl<T: State + ?Sized> State for std::sync::Arc<T> {
 
     async fn put_host(&self, rows: &[HostRow]) -> Result<()> {
         (**self).put_host(rows).await
+    }
+
+    async fn robots(&self, hosts: &[HostId]) -> Result<Vec<RobotsDoc>> {
+        (**self).robots(hosts).await
+    }
+
+    async fn put_robots(&self, docs: &[RobotsDoc]) -> Result<()> {
+        (**self).put_robots(docs).await
     }
 
     async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {

@@ -21,8 +21,8 @@
 use rusqlite::Row;
 use rusqlite::types::Type;
 use umi_state::{
-    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsRef, SegmentRow, Shard, SpillRow,
-    Stream, SupervisionRow, TierPolicy, UrlState,
+    BlockRow, HostRow, LedgerRow, Priority, RemoteCopy, RobotsDoc, RobotsRef, SegmentRow, Shard,
+    SpillRow, Stream, SupervisionRow, TierPolicy, UrlState,
 };
 use umi_types::{Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKey, UrlKeyFull};
 
@@ -162,6 +162,23 @@ pub fn ledger(row: &Row<'_>) -> rusqlite::Result<LedgerRow> {
         tier_used: tier(row, "tier_used")?,
         fail_streak: small(row, "fail_streak")?,
         observed_secs: small(row, "observed_secs")?,
+    })
+}
+
+/// Read one stored robots.txt.
+///
+/// No truncation here even though the trait caps the body. What is on disk is
+/// what some earlier build stored, and a reader that silently shortened it
+/// would make the digest stop matching the bytes beside it, which is the one
+/// thing about this row that has to stay true.
+pub fn robots_doc(row: &Row<'_>) -> rusqlite::Result<RobotsDoc> {
+    Ok(RobotsDoc {
+        host: host(row, "host")?,
+        digest: Digest::from_bytes(bytes(row, "digest")?),
+        fetched_ms: from_ms(row.get("fetched_ms")?),
+        expires_ms: from_ms(row.get("expires_ms")?),
+        status: small(row, "status")?,
+        body: row.get("body")?,
     })
 }
 

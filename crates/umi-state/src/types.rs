@@ -951,6 +951,99 @@ pub struct RobotsRef {
     pub authoritative: bool,
 }
 
+/// A host's robots.txt as it was served, kept so a restart does not ask again.
+///
+/// [`RobotsRef`] says we asked and when the answer expires, which is enough to
+/// know an answer is stale and not enough to use one. This is the answer. A
+/// coordinator that comes back up reads these instead of asking every host in
+/// its working set inside the first few seconds, and a deploy is the moment we
+/// would least like to look like a burst of unexplained traffic.
+///
+/// Not columns on [`HostRow`], for a reason that is about the other table. Doc
+/// 08.3 sizes `hosts` so that all fifty million rows sit in page cache, because
+/// every lease reads one of them, and a couple of kilobytes of robots.txt
+/// inline would roughly double it in order to serve the one read in a hundred
+/// that wants the file. This is read once per host per day and never on the
+/// hot path.
+///
+/// The body rather than the parsed rules, for two reasons. A change to the
+/// parser is picked up on the next load instead of needing a migration, and
+/// doc 07.7's rule about a `Disallow` that appears later has to compare the
+/// file the host served rather than our reading of it.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct RobotsDoc {
+    /// The host that served it.
+    pub host: HostId,
+    /// blake3 of the body, or of the empty string when there was no body.
+    ///
+    /// The same digest [`RobotsRef`] carries, repeated so that a reader asking
+    /// whether the file changed does not have to open both tables.
+    pub digest: Digest,
+    /// When we fetched it.
+    pub fetched_ms: u64,
+    /// When it stops being usable.
+    ///
+    /// A row past this is not dead. It is what a conditional refetch is built
+    /// from, and a 304 against it renews the row for another day at the cost of
+    /// a round trip and no body, which is the case this whole thing exists to
+    /// make cheap.
+    pub expires_ms: u64,
+    /// The status the fetch came back with, or zero when nothing came back.
+    ///
+    /// The one field that separates the three ways a host ends up with no
+    /// rules: it said so, it has no file, or it was down. They are three
+    /// different decisions under RFC 9309 and they are indistinguishable from
+    /// an empty body.
+    pub status: u16,
+    /// The bytes, already capped at [`MAX_BODY`](RobotsDoc::MAX_BODY).
+    ///
+    /// `None` when no body arrived or the status was not a 2xx. A 404 body is
+    /// somebody's HTML error page rather than a robots.txt, and keeping those
+    /// would fill the table with pages that say "not found" in forty languages.
+    pub body: Option<String>,
+}
+
+impl RobotsDoc {
+    /// RFC 9309 section 2.5's parsed size cap, 500 KiB.
+    ///
+    /// A parser has to read at least this much and may ignore the rest, so
+    /// bytes past it cannot change a decision and storing them buys nothing.
+    /// The number is repeated here rather than imported from the parser
+    /// because the state layer does not depend on it, deliberately: a store
+    /// that knew how to read robots.txt would be a store that has to be
+    /// redeployed whenever the reading changes.
+    pub const MAX_BODY: usize = 500 * 1024;
+
+    /// The same document with its body cut to [`MAX_BODY`](Self::MAX_BODY).
+    ///
+    /// The cut lands on a character boundary, so what comes back is still a
+    /// string. Callers build documents out of whatever an origin sent, and an
+    /// origin is free to send a gigabyte.
+    #[must_use]
+    pub fn truncated(mut self) -> Self {
+        if let Some(body) = self.body.as_mut()
+            && body.len() > Self::MAX_BODY
+        {
+            let mut cut = Self::MAX_BODY;
+            while !body.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            body.truncate(cut);
+        }
+        self
+    }
+
+    /// Whether this is still usable at `now_ms`.
+    ///
+    /// The same comparison the in memory cache makes, here so that the two
+    /// cannot drift and so that a caller reading rows back does not have to
+    /// remember which way round the boundary goes.
+    #[must_use]
+    pub const fn fresh(&self, now_ms: u64) -> bool {
+        now_ms < self.expires_ms
+    }
+}
+
 /// The per host tier ladder state from doc 05.8.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TierPolicy {

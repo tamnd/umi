@@ -37,8 +37,8 @@ use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
 
 use crate::{
     BlockRow, Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow,
-    LeaseRequest, LedgerRow, NackReason, Pace, Priority, RemoteCopy, Revalidator, SegmentQuery,
-    SegmentRow, Shard, State, Stream, SupervisionRow, TierPolicy, retry_after_ms,
+    LeaseRequest, LedgerRow, NackReason, Pace, Priority, RemoteCopy, Revalidator, RobotsDoc,
+    SegmentQuery, SegmentRow, Shard, State, Stream, SupervisionRow, TierPolicy, retry_after_ms,
 };
 
 /// A fixed instant to run every case from, so nothing in here depends on when
@@ -198,6 +198,11 @@ where
     run!(a_host_record_round_trips);
     run!(an_unknown_host_reads_back_as_none);
     run!(put_host_replaces_rather_than_merges);
+    run!(a_robots_document_round_trips);
+    run!(a_host_with_no_robots_document_is_left_out_rather_than_returned_empty);
+    run!(asking_for_one_host_twice_returns_one_robots_document);
+    run!(a_robots_document_past_its_expiry_still_comes_back);
+    run!(put_robots_replaces_rather_than_merges);
     run!(a_blocked_host_is_never_leased);
     run!(a_block_takes_the_domain_out_of_the_frontier);
     run!(a_blocked_domain_is_not_admitted_again);
@@ -1319,6 +1324,142 @@ async fn put_host_replaces_rather_than_merges(state: &dyn State) -> Outcome {
     ensure_eq!(
         read,
         second,
+        "the second write merged with the first instead of replacing it"
+    );
+    Ok(())
+}
+
+/// One host's robots.txt, with `n` picking the host the same way
+/// [`host_url`] does.
+fn robots_doc(n: usize, body: Option<&str>) -> RobotsDoc {
+    RobotsDoc {
+        host: key(&host_url(n)).host,
+        digest: Digest::derive(body.unwrap_or_default().as_bytes()),
+        fetched_ms: T0,
+        expires_ms: T0 + DAY,
+        status: if body.is_some() { 200 } else { 404 },
+        body: body.map(str::to_owned),
+    }
+}
+
+async fn a_robots_document_round_trips(state: &dyn State) -> Outcome {
+    let doc = robots_doc(1, Some("User-agent: *\nDisallow: /private\n"));
+    state
+        .put_robots(std::slice::from_ref(&doc))
+        .await
+        .map_err(|e| format!("put_robots failed: {e}"))?;
+
+    let read = state
+        .robots(&[doc.host])
+        .await
+        .map_err(|e| format!("robots failed: {e}"))?;
+    ensure_eq!(read.len(), 1, "expected one document back");
+    ensure_eq!(
+        &read[0],
+        &doc,
+        "the document did not survive the round trip"
+    );
+    Ok(())
+}
+
+async fn a_host_with_no_robots_document_is_left_out_rather_than_returned_empty(
+    state: &dyn State,
+) -> Outcome {
+    // The two cases this tells apart are the point of the method. A host with
+    // no row has never given us a usable answer and has to be asked. A host
+    // whose row has no body served an empty file, which allows everything and
+    // must not be asked again for a day. An implementation that filled in a
+    // missing host with an empty body would turn the first into the second and
+    // the crawl would stop asking hosts it has never heard of.
+    let served_nothing = robots_doc(1, None);
+    state
+        .put_robots(std::slice::from_ref(&served_nothing))
+        .await
+        .map_err(|e| format!("put_robots failed: {e}"))?;
+
+    let never_asked = key(&host_url(2)).host;
+    let read = state
+        .robots(&[served_nothing.host, never_asked])
+        .await
+        .map_err(|e| format!("robots failed: {e}"))?;
+    ensure_eq!(read.len(), 1, "expected only the host that had a row");
+    ensure_eq!(
+        read[0].host,
+        served_nothing.host,
+        "the wrong host came back"
+    );
+    ensure!(
+        read[0].body.is_none(),
+        "a host that served no body came back with one"
+    );
+    Ok(())
+}
+
+async fn asking_for_one_host_twice_returns_one_robots_document(state: &dyn State) -> Outcome {
+    let doc = robots_doc(1, Some("User-agent: *\nAllow: /\n"));
+    state
+        .put_robots(std::slice::from_ref(&doc))
+        .await
+        .map_err(|e| format!("put_robots failed: {e}"))?;
+
+    let read = state
+        .robots(&[doc.host, doc.host, doc.host])
+        .await
+        .map_err(|e| format!("robots failed: {e}"))?;
+    ensure_eq!(
+        read.len(),
+        1,
+        "a host named three times did not produce exactly one row"
+    );
+    Ok(())
+}
+
+async fn a_robots_document_past_its_expiry_still_comes_back(state: &dyn State) -> Outcome {
+    // Stale is the caller's decision and not the store's. The row past its
+    // expiry is what a conditional refetch is built from, and a store that
+    // hid it would turn every renewal back into a full fetch, which is the
+    // case this table exists to make cheap.
+    let doc = RobotsDoc {
+        expires_ms: T0 - 1,
+        ..robots_doc(1, Some("User-agent: *\nDisallow: /\n"))
+    };
+    state
+        .put_robots(std::slice::from_ref(&doc))
+        .await
+        .map_err(|e| format!("put_robots failed: {e}"))?;
+
+    let read = state
+        .robots(&[doc.host])
+        .await
+        .map_err(|e| format!("robots failed: {e}"))?;
+    ensure_eq!(read.len(), 1, "an expired document was filtered out");
+    ensure!(
+        !read[0].fresh(T0),
+        "the document read back as fresh at a time after its expiry"
+    );
+    Ok(())
+}
+
+async fn put_robots_replaces_rather_than_merges(state: &dyn State) -> Outcome {
+    let first = robots_doc(1, Some("User-agent: *\nDisallow: /old\n"));
+    let second = RobotsDoc {
+        fetched_ms: T0 + DAY,
+        expires_ms: T0 + 2 * DAY,
+        ..robots_doc(1, None)
+    };
+    state
+        .put_robots(&[first, second.clone()])
+        .await
+        .map_err(|e| format!("put_robots failed: {e}"))?;
+
+    let read = state
+        .robots(&[second.host])
+        .await
+        .map_err(|e| format!("robots failed: {e}"))?;
+    ensure_eq!(read.len(), 1, "expected one document back");
+    ensure_eq!(
+        &read[0],
+        &second,
         "the second write merged with the first instead of replacing it"
     );
     Ok(())
