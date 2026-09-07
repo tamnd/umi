@@ -22,8 +22,8 @@
 //! away most of the links doc 11.4 is asking for. So they arrive as
 //! [`Tag::Chrome`], marked, out of the content and still walkable.
 
-use html5ever::tendril::TendrilSink;
-use html5ever::{Attribute, ParseOpts, parse_document};
+use html5ever::tendril::{StrTendril, TendrilSink};
+use html5ever::{Attribute, LocalName, ParseOpts, parse_document};
 
 use crate::sink::{DOCUMENT, Data, Id, Sink, Tree};
 
@@ -40,36 +40,54 @@ pub const ROOT: usize = 0;
 /// only thing lost is nesting nobody was rendering anyway.
 pub const MAX_DEPTH: u32 = 256;
 
-/// The attributes kept on the arena.
+/// What one attribute is for.
 ///
-/// Doc 11.3 drops every attribute except `href`, `src`, `alt`, `title`, `lang`,
-/// `datetime` and the `class` used for code language detection, and that is the
-/// rule for the markdown output. It is not the rule for the arena: scoring needs
-/// `class` and `id` to match the boilerplate markers, the link pass needs `rel`,
-/// and the metadata pass needs the `<meta>` attributes. None of those reach the
-/// output. Everything else is dropped here so that a page with 400 inline styles
-/// does not pay to carry them.
-const KEPT_ATTRS: [&str; 16] = [
-    "alt",
-    "charset",
-    "class",
-    "content",
-    "datetime",
-    "href",
-    "http-equiv",
-    "id",
-    "itemprop",
-    "lang",
-    "name",
-    "property",
-    "rel",
-    "src",
-    "title",
-    // `type` on a `<link>`, which is the only thing that tells an RSS feed from
-    // a translation: doc 11.4's feed kind needs `rel="alternate"` and a feed
-    // media type together, because either one on its own means something else.
-    "type",
-];
+/// The arena keeps sixteen attribute names and the vocabulary check in doc 11.6
+/// looks for four more, and the two sets do not overlap, so one match over the
+/// name answers both questions at once. This used to be two passes over every
+/// attribute of every element, one of them a linear scan of a sixteen entry
+/// array, and after text nodes the attributes are the most numerous thing on a
+/// page.
+enum Role {
+    /// Nothing downstream reads it.
+    Ignored,
+    /// One of the sixteen the arena carries.
+    Kept,
+    /// Opens a microdata item.
+    Microdata,
+    /// Opens an RDFa vocabulary.
+    Rdfa,
+}
+
+/// Decide what an attribute is for from its name.
+///
+/// The kept set: doc 11.3 drops every attribute except `href`, `src`, `alt`,
+/// `title`, `lang`, `datetime` and the `class` used for code language
+/// detection, and that is the rule for the markdown output. It is not the rule
+/// for the arena: scoring needs `class` and `id` to match the boilerplate
+/// markers, the link pass needs `rel`, and the metadata pass needs the `<meta>`
+/// attributes. None of those reach the output. Everything else is dropped here
+/// so that a page with 400 inline styles does not pay to carry them.
+///
+/// `type` is in the set because of `<link>`, where it is the only thing that
+/// tells an RSS feed from a translation: doc 11.4's feed kind needs
+/// `rel="alternate"` and a feed media type together, because either one on its
+/// own means something else.
+///
+/// The vocabulary half is on the attributes that open a vocabulary rather than
+/// the ones that name a field, because `itemprop` and `property` both turn up
+/// on pages carrying neither vocabulary and would flag most of the web.
+fn role(name: &str) -> Role {
+    match name {
+        "alt" | "charset" | "class" | "content" | "datetime" | "href" | "http-equiv" | "id"
+        | "itemprop" | "lang" | "name" | "property" | "rel" | "src" | "title" | "type" => {
+            Role::Kept
+        }
+        "itemscope" | "itemtype" => Role::Microdata,
+        "typeof" | "vocab" => Role::Rdfa,
+        _ => Role::Ignored,
+    }
+}
 
 /// A tag we have a rule for.
 ///
@@ -184,7 +202,12 @@ pub enum Kind {
     Element(Element),
     /// A run of text, exactly as it appeared. Whitespace is collapsed by the
     /// serialiser and not here, because `<pre>` needs the original.
-    Text(String),
+    ///
+    /// The parser's own string type rather than a `String`. Taking it as it
+    /// comes is a refcount bump and taking it as a `String` is an allocation
+    /// and a copy per text node, and a page has as many text nodes as it has
+    /// elements.
+    Text(StrTendril),
 }
 
 /// An element and the attributes worth keeping.
@@ -193,7 +216,12 @@ pub struct Element {
     /// The tag.
     pub tag: Tag,
     /// The kept attributes, in document order, names lowercased.
-    pub attrs: Vec<(String, String)>,
+    ///
+    /// The parser's own types for the same reason [`Kind::Text`] uses them: an
+    /// attribute name is an interned atom and a value is a refcounted string,
+    /// and copying either into a fresh `String` buys nothing that the passes
+    /// downstream can use.
+    pub attrs: Vec<(LocalName, StrTendril)>,
 }
 
 impl Element {
@@ -202,8 +230,8 @@ impl Element {
     pub fn attr(&self, name: &str) -> Option<&str> {
         self.attrs
             .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
+            .find(|(key, _)| &**key == name)
+            .map(|(_, value)| &**value)
     }
 }
 
@@ -305,20 +333,24 @@ impl Dom {
             let (kind, keep_children) = match &node.data {
                 Data::Document => (None, true),
                 Data::Text(contents) => {
-                    let text = contents.to_string();
                     // Text inside chrome counts as dropped, because that is what
                     // it was before chrome was kept and this signal should not
                     // move for a change nobody can see in the output.
                     if chrome {
-                        self.dropped = self.dropped.saturating_add(text.len() as u32);
+                        self.dropped = self.dropped.saturating_add(contents.len() as u32);
                     }
-                    (Some(Kind::Text(text)), false)
+                    (Some(Kind::Text(contents.clone())), false)
                 }
                 Data::Element(element) => {
                     let local = element.name.local.as_ref();
-                    self.note_vocabulary(&element.attrs);
                     match classify(local) {
                         None => {
+                            // A dropped element still gets its attributes read,
+                            // because a vocabulary can be opened on a `<form>`
+                            // or a `<select>` as easily as on a `<div>` and the
+                            // flag is a fact about the page rather than about
+                            // the content.
+                            self.note_vocabulary(&element.attrs);
                             // `<script type="application/ld+json">` is the one
                             // dropped subtree with something in it we want. Doc
                             // 11.6 reads five fields out of it, and the script
@@ -338,14 +370,22 @@ impl Dom {
                         }
                         Some(tag) => {
                             chrome = chrome || tag == Tag::Chrome;
-                            let attrs = element
-                                .attrs
-                                .iter()
-                                .filter(|attr| KEPT_ATTRS.contains(&attr.name.local.as_ref()))
-                                .map(|attr| {
-                                    (attr.name.local.as_ref().to_owned(), attr.value.to_string())
-                                })
-                                .collect();
+                            // One pass over the attributes doing both jobs. The
+                            // kept set and the vocabulary set do not overlap, so
+                            // the role of an attribute is one answer and not
+                            // two, and this is the loop that runs once per
+                            // attribute on the page.
+                            let mut attrs = Vec::new();
+                            for attr in &element.attrs {
+                                match role(attr.name.local.as_ref()) {
+                                    Role::Kept => {
+                                        attrs.push((attr.name.local.clone(), attr.value.clone()));
+                                    }
+                                    Role::Microdata => self.microdata = true,
+                                    Role::Rdfa => self.rdfa = true,
+                                    Role::Ignored => {}
+                                }
+                            }
                             (Some(Kind::Element(Element { tag, attrs })), true)
                         }
                     }
@@ -391,24 +431,23 @@ impl Dom {
         }
     }
 
-    /// Flag a microdata or RDFa vocabulary on an element.
+    /// Flag a microdata or RDFa vocabulary on an element the arena is dropping.
     ///
     /// Doc 11.6 detects both and parses neither, which is a scope cut recorded
-    /// in doc 17. Detection is on the attributes that open a vocabulary rather
-    /// than on the ones that name a field, because `itemprop` and `property`
-    /// both turn up on pages carrying neither vocabulary and would flag most of
-    /// the web.
+    /// in doc 17. A kept element does this inline in [`Self::absorb`], as part
+    /// of the pass that collects its attributes, so this is only for the
+    /// elements that never reach the arena.
     fn note_vocabulary(&mut self, attrs: &[Attribute]) {
         // Both flags set means there is nothing left to look for, and this runs
-        // on every element of every page.
+        // on every dropped element of every page.
         if self.microdata && self.rdfa {
             return;
         }
         for attr in attrs {
-            match attr.name.local.as_ref() {
-                "itemscope" | "itemtype" => self.microdata = true,
-                "typeof" | "vocab" => self.rdfa = true,
-                _ => {}
+            match role(attr.name.local.as_ref()) {
+                Role::Microdata => self.microdata = true,
+                Role::Rdfa => self.rdfa = true,
+                Role::Kept | Role::Ignored => {}
             }
         }
     }
