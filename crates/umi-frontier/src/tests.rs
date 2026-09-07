@@ -452,6 +452,14 @@ impl State for Counted {
         self.inner.put_host(rows).await
     }
 
+    async fn robots(&self, hosts: &[HostId]) -> Result<Vec<umi_state::RobotsDoc>> {
+        self.inner.robots(hosts).await
+    }
+
+    async fn put_robots(&self, docs: &[umi_state::RobotsDoc]) -> Result<()> {
+        self.inner.put_robots(docs).await
+    }
+
     async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {
         self.inner.block(rows).await
     }
