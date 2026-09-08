@@ -900,6 +900,33 @@ pub struct TickReport {
     /// sitting in the window. The slot is spent either way: nothing else may
     /// use it until the loop gets there.
     pub uncollected_ms: u64,
+    /// Milliseconds the harvest loop spent inside its own body.
+    ///
+    /// [`uncollected_ms`](Self::uncollected_ms) says the loop is the constraint
+    /// and says nothing about why, and the two answers want opposite fixes.
+    /// This is the loop doing its own work: folding an answer into the report,
+    /// asking for the lease that replaces it, and handing a full batch to the
+    /// store. Wall clock and not cpu, so the awaits inside the body are in it.
+    ///
+    /// Read against [`harvest_idle_ms`](Self::harvest_idle_ms), which is the
+    /// rest of the tick. The two together are about the whole of it, because a
+    /// tick is the loop and nothing else.
+    pub harvest_ms: u64,
+    /// Milliseconds the harvest loop spent waiting to be handed an answer.
+    ///
+    /// The other half, and on a crawl with finished work piled up in the window
+    /// it should be near zero: an answer is already sitting there, so the await
+    /// has nothing to wait for. It is not near zero when the task cannot get a
+    /// core. The fetches run on every worker thread and the harvest runs on
+    /// one, so a box whose cores are all busy parsing leaves this task ready
+    /// and not running, and the wait shows up here because the await only
+    /// returns when something polls it.
+    ///
+    /// So a tick with a large `uncollected_ms` says which of the two it is. If
+    /// the time is here then the loop was starved of cpu, and if it is in
+    /// `harvest_ms` then the loop's own work is too slow. Nothing else on this
+    /// report separates them.
+    pub harvest_idle_ms: u64,
 }
 
 /// Where a lease's wall clock went.
@@ -1020,6 +1047,17 @@ impl TickReport {
     #[must_use]
     pub fn uncollected_mean_ms(&self) -> u64 {
         self.mean(self.uncollected_ms)
+    }
+
+    /// What one answer cost the harvest loop in its own body.
+    ///
+    /// The window over the slot cost is the rate, and this is the part of the
+    /// slot cost the loop could do something about. An answer that costs the
+    /// loop a millisecond cannot leave four thousand slots waiting twenty two
+    /// seconds, and one that costs eleven can.
+    #[must_use]
+    pub fn harvest_mean_ms(&self) -> u64 {
+        self.mean(self.harvest_ms)
     }
 
     fn mean(&self, total: u64) -> u64 {
@@ -1458,7 +1496,21 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             // spend a round trip saying so.
             return Ok(report);
         }
+        // Split the tick's wall clock between the loop's own work and the loop
+        // waiting to be handed something. See `harvest_idle_ms` for why the two
+        // apart are worth more than the sum, which is just the tick.
+        //
+        // Durations and not milliseconds, added up and rounded once at the end.
+        // A body that takes a hundred microseconds truncates to zero every time
+        // it runs, and a loop reporting no time in its own body is the reading
+        // that says it was starved of cpu, which is the opposite of what a fast
+        // body means.
+        let mut busy = Duration::ZERO;
+        let mut idle = Duration::ZERO;
+        let mut idle_from = Instant::now();
         while let Some(done) = pending.next().await {
+            idle += idle_from.elapsed();
+            let body_from = Instant::now();
             // A fetch task can only end without a `Fetched` by panicking, and
             // swallowing that would leave the lease out on loan and the tick's
             // counts quietly short. Carry it out of here the way it came out
@@ -1569,6 +1621,8 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             // next tick offers it again.
             if give_back {
                 deferred.push(outcome.lease);
+                busy += body_from.elapsed();
+                idle_from = Instant::now();
                 continue;
             }
             // Counted off the completion rather than off the row, because a
@@ -1669,7 +1723,11 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                     storing = Some(self.put(sink, batch, now_ms));
                 }
             }
+            busy += body_from.elapsed();
+            idle_from = Instant::now();
         }
+        report.harvest_ms = busy.as_millis() as u64;
+        report.harvest_idle_ms = idle.as_millis() as u64;
         // The last of the prefetch, before the last store, so a file that
         // arrived while the window was draining still reaches the host record
         // in this tick. A prefetch still running when the tick ends is dropped

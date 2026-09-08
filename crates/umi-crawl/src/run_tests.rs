@@ -3669,3 +3669,65 @@ async fn a_slot_costs_at_least_what_the_fetch_in_it_cost() {
         report.slot_mean_ms()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_harvest_split_accounts_for_the_whole_of_the_loop() {
+    // `uncollected` says the loop could not keep up and says nothing about
+    // why. The split says which: time in the body is the loop's own work,
+    // time idle is the loop ready and not running. They are only worth
+    // anything if together they are the loop, so this pins that.
+    let (urls, canned) = a_page_each(16);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let fetch = Slow {
+        inner: canned,
+        per_request: Duration::from_millis(20),
+    };
+    let crawler = Crawler::new(
+        fetch,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let started = std::time::Instant::now();
+    let report = crawler
+        .tick(&Arc::new(Collected::default()))
+        .await
+        .expect("tick");
+    let tick_ms = started.elapsed().as_millis() as u64;
+
+    assert_eq!(report.fetched, 16, "{report:?}");
+    // Sixteen fetches behind a window of four at 20 ms each leaves the loop
+    // waiting for nearly all of the tick, so the idle half has to be most of
+    // it and the body has to be the smaller of the two.
+    //
+    // There is no lower bound on the body here on purpose. Sixteen answers of
+    // folding arithmetic and a lease ask is a few hundred microseconds all
+    // told, which is a legitimate zero once it is rounded to milliseconds. The
+    // figure this is here to protect is the shape, not the floor: a real tick
+    // harvests tens of thousands of answers and the body is 11 ms of each.
+    assert!(report.harvest_idle_ms > 0, "{report:?}");
+    assert!(
+        report.harvest_ms < report.harvest_idle_ms,
+        "the loop spent {} ms in its own body against {} ms waiting, on a run \
+         where the fetches are slow and the window is narrow",
+        report.harvest_ms,
+        report.harvest_idle_ms
+    );
+    // The two are the tick and nothing else is, give or take what the tick
+    // spends before the loop starts and after it ends.
+    let split = report.harvest_ms + report.harvest_idle_ms;
+    assert!(
+        split <= tick_ms,
+        "the loop claims {split} ms of a {tick_ms} ms tick"
+    );
+    assert!(
+        split * 2 > tick_ms,
+        "the loop claims only {split} ms of a {tick_ms} ms tick, so most of \
+         it is going somewhere neither half is counting"
+    );
+}
