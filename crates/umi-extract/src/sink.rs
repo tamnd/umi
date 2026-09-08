@@ -143,6 +143,16 @@ impl Tree {
     pub fn node(&self, id: Id) -> &Node {
         &self.nodes[id as usize]
     }
+
+    /// How many nodes the parse produced, counting the document node.
+    ///
+    /// The arena `dom.rs` builds next holds a subset of these, so this is an
+    /// exact upper bound on it and the one number worth sizing that arena from.
+    /// Never zero, because the document node is always there, which is why this
+    /// is not called `len`.
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
 }
 
 /// The name of an element, owned.
@@ -171,12 +181,45 @@ pub struct Sink {
 
 impl Default for Sink {
     fn default() -> Self {
+        Self::for_html(0)
+    }
+}
+
+/// Bytes of html per node, over the ten thousand page wide golden corpus.
+///
+/// The whole corpus is 1,491,624,180 bytes and parses to 15,510,894 nodes, so
+/// 96.17 bytes a node across the lot. Per page the median is 86, the lower
+/// quartile 50 and the fifth percentile 33, which is the spread a single ratio
+/// has to live with.
+///
+/// Sizing from the mean rather than from a low percentile is deliberate. What
+/// this is buying is fewer doublings, and a doubling curve is forgiving: a page
+/// that needs twice the guess pays one reallocation, one that needs four times
+/// pays two. Guessing at the fifth percentile would spare those pages a single
+/// further doubling each and would triple the reservation on every ordinary
+/// page to do it. The mean puts the median page at one reallocation and the
+/// lower quartile at one, down from the eleven or so a page takes growing from
+/// nothing.
+const BYTES_PER_NODE: usize = 96;
+
+impl Sink {
+    /// A sink sized for a document of `len` bytes.
+    ///
+    /// The arena is one contiguous `Vec` that doubles, so a page with a hundred
+    /// thousand nodes copies its way there through seventeen reallocations and
+    /// moves about eight megabytes doing it. `RcDom` never did that, because it
+    /// allocated each node separately and copied nothing, and that is the one
+    /// place the flat arena is worse. The input length is known before the parse
+    /// starts and predicts the node count well enough to take most of it back.
+    pub fn for_html(len: usize) -> Self {
+        let mut nodes = Vec::with_capacity(len / BYTES_PER_NODE + 1);
+        nodes.push(Node {
+            data: Data::Document,
+            children: Vec::new(),
+            parent: None,
+        });
         Self {
-            nodes: RefCell::new(vec![Node {
-                data: Data::Document,
-                children: Vec::new(),
-                parent: None,
-            }]),
+            nodes: RefCell::new(nodes),
         }
     }
 }

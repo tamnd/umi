@@ -299,15 +299,24 @@ impl Dom {
         // is not available: foster parenting and the adoption agency algorithm
         // both move a node that already exists to somewhere earlier in the
         // document, and the arena's whole contract is that they never do.
-        let parsed = parse_document(Sink::default(), ParseOpts::default())
+        // Both arenas are sized before they are filled. A `Vec` that grows from
+        // nothing to a hundred thousand nodes reallocates seventeen times and
+        // memmoves about eight megabytes on the way, which is work `RcDom` never
+        // did because it allocated each node on its own. The parse arena is
+        // sized from the input length, which predicts the node count closely
+        // enough, and this one is sized from the parse, which is an exact upper
+        // bound because every node here comes from a node there.
+        let parsed = parse_document(Sink::for_html(html.len()), ParseOpts::default())
             .from_utf8()
             .one(html);
+        let mut nodes = Vec::with_capacity(parsed.node_count());
+        nodes.push(Node {
+            kind: Kind::Root,
+            children: Vec::new(),
+            chrome: false,
+        });
         let mut dom = Self {
-            nodes: vec![Node {
-                kind: Kind::Root,
-                children: Vec::new(),
-                chrome: false,
-            }],
+            nodes,
             dropped: 0,
             ld_json: Vec::new(),
             microdata: false,
