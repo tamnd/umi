@@ -2399,7 +2399,12 @@ impl Pressure {
 /// an idle half that is most of the tick means the task was ready and not
 /// running and the box had no core to give it. A busy half that is most of the
 /// tick means the opposite, that the per answer work is genuinely too slow, and
-/// `ms an answer` is that work priced per answer. The two have opposite fixes
+/// `ms an answer` is that work priced per answer. `replacing` is the part of the
+/// busy half spent asking for the lease that replaces the answer just collected,
+/// which the loop does once per answer and which is the only substantial call on
+/// a path that is otherwise arithmetic, so a busy half that is mostly this one
+/// wants replacements asked for in batches rather than one at a time. The two
+/// halves have opposite fixes
 /// and nothing else on the line tells them apart.
 ///
 /// The two figures in brackets after `ms per page` are the parts of the fetch
@@ -2486,7 +2491,7 @@ fn progress(
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  \
          {} ms per slot ({} waiting to start, {} uncollected)  \
-         harvest {:.0}s busy {:.0}s idle, {} ms an answer  \
+         harvest {:.0}s busy ({:.0}s replacing) {:.0}s idle, {} ms an answer  \
          {} ms per page ({} robots, {} polite, {} warmed, {} loaded, {} stepped, {} refused)  \
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
@@ -2500,6 +2505,7 @@ fn progress(
         report.queued_mean_ms(),
         report.uncollected_mean_ms(),
         report.harvest_ms as f64 / 1000.0,
+        report.replace_ms as f64 / 1000.0,
         report.harvest_idle_ms as f64 / 1000.0,
         report.harvest_mean_ms(),
         report.lease_mean_ms(),
