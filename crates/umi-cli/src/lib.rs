@@ -22,6 +22,7 @@ pub mod evict;
 pub mod exporter;
 pub mod get;
 pub mod inspect;
+pub mod prime;
 pub mod rdns;
 pub mod retract;
 pub mod robots;

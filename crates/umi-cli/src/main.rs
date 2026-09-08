@@ -14,8 +14,8 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use umi_cli::{
-    Error, block, cards, config, crawl, doctor, evict, get, inspect, retract, robots, supervise,
-    verify, warm,
+    Error, block, cards, config, crawl, doctor, evict, get, inspect, prime, retract, robots,
+    supervise, verify, warm,
 };
 use umi_crawl::{Clock, SystemClock};
 use umi_types::{CANON_VERSION, Exit};
@@ -203,6 +203,35 @@ enum Command {
         #[arg(long, default_value_t = warm::DOMAINS)]
         limit: usize,
         /// Say how many domains would come back and bring none of them.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Fill a crawl's robots cache from the published corpus.
+    ///
+    /// The other half of `umi robots`. That command asks hosts for their
+    /// robots.txt and publishes the answers, and this reads them back into a
+    /// crawl directory so the run that follows finds a row instead of opening
+    /// a connection. Measured on server2, robots.txt is 53 percent of the wall
+    /// clock of a page.
+    ///
+    /// A row is imported with the expiry its own fetch date gives it, so a
+    /// corpus older than the ttl imports nothing and says so.
+    Prime {
+        /// The crawl directory.
+        dir: String,
+        /// The published corpus to read.
+        #[arg(long, default_value = prime::CORPUS, value_name = "ORG/NAME")]
+        from: String,
+        /// Read only this many files, newest first. All of them by default.
+        #[arg(long)]
+        files: Option<usize>,
+        /// Skip a host whose robots.txt is longer than this many bytes.
+        #[arg(long, default_value_t = prime::MAX_BODY)]
+        max_body: usize,
+        /// How long after its own fetch a published row stays usable.
+        #[arg(long, default_value_t = prime::TTL_HOURS)]
+        ttl_hours: u64,
+        /// Say what would be imported and import none of it.
         #[arg(long)]
         dry_run: bool,
     },
@@ -834,6 +863,35 @@ fn run(command: &Command) -> Result<(), Error> {
             // where the rows went. Without a token there is nothing to read.
             None => Err(Error::Missing("umi warm needs publish.token".to_owned())),
         },
+        Command::Prime {
+            dir,
+            from,
+            files,
+            max_body,
+            ttl_hours,
+            dry_run,
+        } => {
+            // A token when the config has one and none when it does not. The
+            // corpus is public, so unlike a warm this works without one, and
+            // the token only buys a higher rate limit on the hub.
+            let publishing = crawl::Publishing::resolve(&load(command)?, true).unwrap_or(None);
+            let primed = prime::prime(
+                &prime::Options {
+                    dir: std::path::PathBuf::from(dir),
+                    corpus: from.clone(),
+                    files: *files,
+                    max_body: *max_body,
+                    ttl_hours: *ttl_hours,
+                    dry_run: *dry_run,
+                },
+                publishing.as_ref(),
+            )?;
+            println!(
+                "{} rows from {} files, {} stale, {} oversized, {} already fresher",
+                primed.imported, primed.files, primed.stale, primed.oversized, primed.fresher
+            );
+            Ok(())
+        }
         Command::Block {
             domain,
             reason,
