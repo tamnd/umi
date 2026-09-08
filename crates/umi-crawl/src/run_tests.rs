@@ -3718,6 +3718,16 @@ async fn the_harvest_split_accounts_for_the_whole_of_the_loop() {
         report.harvest_ms,
         report.harvest_idle_ms
     );
+    // The replacement ask happens inside the body, so it can never be more
+    // than the body. This is the assertion that would catch the two being
+    // measured from different clocks or the ask being timed outside the
+    // brackets it is supposed to sit in.
+    assert!(
+        report.replace_ms <= report.harvest_ms,
+        "the loop spent {} ms replacing leases inside a {} ms body",
+        report.replace_ms,
+        report.harvest_ms
+    );
     // The two are the tick and nothing else is, give or take what the tick
     // spends before the loop starts and after it ends.
     let split = report.harvest_ms + report.harvest_idle_ms;

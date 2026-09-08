@@ -927,6 +927,21 @@ pub struct TickReport {
     /// `harvest_ms` then the loop's own work is too slow. Nothing else on this
     /// report separates them.
     pub harvest_idle_ms: u64,
+    /// Milliseconds of [`harvest_ms`](Self::harvest_ms) spent asking for the
+    /// lease that replaces the answer just collected.
+    ///
+    /// The loop does this once per answer, so it is the only substantial call
+    /// on a path that is otherwise arithmetic, and it is the first thing to
+    /// suspect when the body is slow. Most of it is not the frontier: the ask
+    /// runs a batch at a time and [`ask_waited_ms`](Self::ask_waited_ms) is
+    /// the part of it the loop actually waited for. The rest is the picking,
+    /// which is per answer and which nothing else on this report prices.
+    ///
+    /// Read as a share of `harvest_ms`. A large share says the replacement is
+    /// the body and the answer is asking for replacements in batches. A small
+    /// share says the cost is spread over the folding instead, and there is no
+    /// single call to fix.
+    pub replace_ms: u64,
 }
 
 /// Where a lease's wall clock went.
@@ -1058,6 +1073,12 @@ impl TickReport {
     #[must_use]
     pub fn harvest_mean_ms(&self) -> u64 {
         self.mean(self.harvest_ms)
+    }
+
+    /// [`replace_ms`](Self::replace_ms) per completed lease.
+    #[must_use]
+    pub fn replace_mean_ms(&self) -> u64 {
+        self.mean(self.replace_ms)
     }
 
     fn mean(&self, total: u64) -> u64 {
@@ -1507,6 +1528,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         // body means.
         let mut busy = Duration::ZERO;
         let mut idle = Duration::ZERO;
+        let mut replacing = Duration::ZERO;
         let mut idle_from = Instant::now();
         while let Some(done) = pending.next().await {
             idle += idle_from.elapsed();
@@ -1537,7 +1559,8 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                     done.outcome.finished_ms.saturating_add(u64::from(after)),
                 );
             }
-            if let Some((lease, at)) = self
+            let replace_from = Instant::now();
+            let next = self
                 .next_lease(
                     &mut supply,
                     &allowance,
@@ -1546,8 +1569,9 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                     &warming,
                     &mut report,
                 )
-                .await?
-            {
+                .await?;
+            replacing += replace_from.elapsed();
+            if let Some((lease, at)) = next {
                 pending.push(self.start(lease, at, &floors));
             }
             // After the replacement rather than before, so the number a watcher
@@ -1728,6 +1752,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         }
         report.harvest_ms = busy.as_millis() as u64;
         report.harvest_idle_ms = idle.as_millis() as u64;
+        report.replace_ms = replacing.as_millis() as u64;
         // The last of the prefetch, before the last store, so a file that
         // arrived while the window was draining still reaches the host record
         // in this tick. A prefetch still running when the tick ends is dropped
