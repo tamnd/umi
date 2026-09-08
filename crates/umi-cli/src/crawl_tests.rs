@@ -13,6 +13,9 @@ use super::{
     Stop, Summary, WATCH_MAX_WAIT, adopt, day, default_out, delay_ms, profile_toml, scope_for,
     seed, seed_url, settings, sitemap_sources, sources, span, spent, tier,
 };
+use umi_crawl::TickReport;
+
+use super::bottleneck;
 use crate::config::{Config, Flags, Paths};
 
 fn options(target: &str) -> Options {
@@ -758,4 +761,71 @@ fn config_with(env: &[(&str, &str)]) -> Config {
         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
         .collect();
     Config::load(&paths, &env, &Flags::default()).expect("no files to fail on")
+}
+
+/// A report of `leases` completed leases, each spending the given
+/// milliseconds queued, fetching and then finished but uncollected.
+///
+/// The report holds totals and the means divide by the completed lease count,
+/// so the per lease figures the tests are written in have to be multiplied up
+/// here. Getting that backwards makes every mean zero, which reads as a
+/// perfectly healthy tick.
+fn slot_report(leases: usize, queued_ms: u64, lease_ms: u64, uncollected_ms: u64) -> TickReport {
+    let each = leases as u64;
+    TickReport {
+        leased: leases,
+        queued_ms: queued_ms * each,
+        lease_ms: lease_ms * each,
+        uncollected_ms: uncollected_ms * each,
+        ..TickReport::default()
+    }
+}
+
+#[test]
+fn a_slot_that_is_mostly_not_a_fetch_does_not_blame_the_origins() {
+    // The numbers are a real five minute arm on server2: 27588 ms a slot
+    // against 4850 ms a page, of which 22647 ms was a finished fetch waiting
+    // for the harvest loop to come round. It also failed 12187 of 33958
+    // leases, which is comfortably over the origin test's quarter, and that
+    // is the whole point. It reported `origin-slow` and the fetch path was
+    // not what was wrong with it.
+    let mut report = slot_report(33958, 91, 4850, 22647);
+    report.failed = 12187;
+    assert_eq!(bottleneck(&report), "collect-loop");
+}
+
+#[test]
+fn a_slot_waiting_for_a_worker_is_told_apart_from_one_waiting_to_be_collected() {
+    // Same shape, opposite end. Both are the slot being held by something
+    // that is not a fetch and both get worse if concurrency goes up, but one
+    // is our loop and the other is the runtime, so they are not one word.
+    assert_eq!(
+        bottleneck(&slot_report(33958, 22647, 4850, 91)),
+        "runtime-starved"
+    );
+}
+
+#[test]
+fn origins_are_still_blamed_when_the_slot_really_is_the_fetch() {
+    // A slot that is almost all fetch, failing more than a quarter of its
+    // leases. Nothing about this change should stop that reading, because
+    // here the fetch path is exactly where to look.
+    let mut report = slot_report(100, 10, 4850, 20);
+    report.failed = 40;
+    assert_eq!(bottleneck(&report), "origin-slow");
+}
+
+#[test]
+fn a_healthy_tick_says_nothing() {
+    let mut report = slot_report(100, 10, 4850, 20);
+    report.failed = 1;
+    assert_eq!(bottleneck(&report), "none");
+}
+
+#[test]
+fn a_tick_that_leased_nothing_is_politeness_before_anything_else() {
+    // Leased nothing means the means are all zero, so every later test would
+    // read whatever zero happens to satisfy. This one comes first and has to
+    // keep coming first.
+    assert_eq!(bottleneck(&TickReport::default()), "politeness");
 }
