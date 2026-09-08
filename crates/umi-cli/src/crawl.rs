@@ -2644,9 +2644,38 @@ fn pressed(metrics: &Metrics, signals: &Signals, moved: &[umi_crawl::Transition]
 ///
 /// One word and not a number, because the question everybody asks first is
 /// whether raising concurrency would help, and `politeness` answers it.
+///
+/// The order of the tests matters more than any of them. The documentation on
+/// [`tick_line`] already says that a crawl whose slot figure is several times
+/// its page figure is not being held up by origins however much this field says
+/// so, and this used to say so anyway, because the only thing it looked at was
+/// the failure count. A run at 27.6 seconds a slot against 4.9 seconds a page,
+/// with 22.6 of those seconds being fetches sitting finished and uncollected,
+/// reported `origin-slow` and sent the reader off to look at the fetch path.
+/// The slot tests come first now, because when a slot is mostly not a fetch
+/// then what the fetches did is the wrong question.
+///
+/// The two of them are the two ends of a slot's life outside the fetch, and
+/// they have opposite fixes. `collect-loop` is time spent finished and waiting
+/// to be harvested, which is one task doing the collecting no matter how many
+/// cores are free, so raising concurrency makes it worse. `runtime-starved` is
+/// time spent leased and waiting for a worker to pick the task up, which is the
+/// runtime already being full, so raising concurrency also makes it worse. They
+/// are separated because the first is our loop and the second is the box.
 fn bottleneck(report: &TickReport) -> &'static str {
+    let slot = report.slot_mean_ms();
+    let fetching = report.lease_mean_ms();
     if report.leased == 0 {
         "politeness"
+    } else if slot > fetching.saturating_mul(3) {
+        // Whichever end of the slot is holding it, reported as itself. Ties go
+        // to the collect loop, which includes the case where both are zero and
+        // the fetch figure is zero too, and where there is nothing else to say.
+        if report.uncollected_mean_ms() >= report.queued_mean_ms() {
+            "collect-loop"
+        } else {
+            "runtime-starved"
+        }
     } else if report.failed * 4 > report.leased {
         "origin-slow"
     } else {
