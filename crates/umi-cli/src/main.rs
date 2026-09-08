@@ -222,7 +222,8 @@ enum Command {
         /// The published corpus to read.
         #[arg(long, default_value = prime::CORPUS, value_name = "ORG/NAME")]
         from: String,
-        /// Read only this many files, newest first. All of them by default.
+        /// Read only this many files, highest ranked hosts first. All of them
+        /// by default.
         #[arg(long)]
         files: Option<usize>,
         /// Skip a host whose robots.txt is longer than this many bytes.

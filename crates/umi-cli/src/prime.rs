@@ -112,8 +112,8 @@ pub struct Options {
     pub dir: PathBuf,
     /// The published corpus to read.
     pub corpus: String,
-    /// How many published files to read, newest last. `None` reads all of
-    /// them.
+    /// How many published files to read, counted from the highest ranked
+    /// hosts. `None` reads all of them.
     pub files: Option<usize>,
     /// Bodies longer than this are skipped.
     pub max_body: usize,
@@ -202,13 +202,15 @@ async fn read(
         return Err(Error::NothingToDo("the corpus has no published files"));
     }
     files.sort();
-    // Newest last, so a run with a file limit takes the newest ones. The names
-    // are ULIDs under a dated directory, so sorted is oldest first and the
-    // limit has to come off the end.
-    if let Some(limit) = options.files
-        && files.len() > limit
-    {
-        files.drain(..files.len() - limit);
+    // Oldest first, and a file limit takes the oldest rather than the newest,
+    // which looks backwards and is not. The names are ULIDs under a dated
+    // directory, so sorted is the order the prefetch wrote them, and the
+    // prefetch walks `open-index/ccrawl-domains` in harmonic centrality order.
+    // The first file is the most linked hosts on the web and the last is the
+    // tail, so a run that can only afford a slice of the corpus wants the
+    // slice a crawl is most likely to meet.
+    if let Some(limit) = options.files {
+        files.truncate(limit);
     }
     log.line(&format!(
         "reading {} published files from {}",
