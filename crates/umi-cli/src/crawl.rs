@@ -2391,6 +2391,17 @@ impl Pressure {
 /// however much the bottleneck field says so, and no amount of work on the
 /// fetch path will move it.
 ///
+/// `harvest` is the answer to the question `uncollected` raises and cannot
+/// settle, which is why the loop could not keep up. It splits the tick's wall
+/// clock between the loop doing its own work and the loop waiting to be handed
+/// an answer. On a crawl with finished fetches piled up in the window the idle
+/// half should be near nothing, because there is always something waiting, so
+/// an idle half that is most of the tick means the task was ready and not
+/// running and the box had no core to give it. A busy half that is most of the
+/// tick means the opposite, that the per answer work is genuinely too slow, and
+/// `ms an answer` is that work priced per answer. The two have opposite fixes
+/// and nothing else on the line tells them apart.
+///
 /// The two figures in brackets after `ms per page` are the parts of the fetch
 /// that are not the page: the robots.txt the first lease on a host has to fetch
 /// before it may ask for anything, and doc 07.6's politeness delay, which a
@@ -2475,6 +2486,7 @@ fn progress(
     format!(
         "{} done  {:.0} in flight  {} queued  {:.1} p/s  \
          {} ms per slot ({} waiting to start, {} uncollected)  \
+         harvest {:.0}s busy {:.0}s idle, {} ms an answer  \
          {} ms per page ({} robots, {} polite, {} warmed, {} loaded, {} stepped, {} refused)  \
          state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
@@ -2487,6 +2499,9 @@ fn progress(
         report.slot_mean_ms(),
         report.queued_mean_ms(),
         report.uncollected_mean_ms(),
+        report.harvest_ms as f64 / 1000.0,
+        report.harvest_idle_ms as f64 / 1000.0,
+        report.harvest_mean_ms(),
         report.lease_mean_ms(),
         report.robots_mean_ms(),
         report.waited_mean_ms(),
