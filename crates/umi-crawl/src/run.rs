@@ -2360,9 +2360,9 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// the gate's condition is a short circuit chain and putting the timing
     /// inside it would either time the cheap tests as well or need the chain
     /// pulled apart.
-    async fn ready(&self, host: HostId, picking: &mut Picking) -> bool {
+    fn ready(&self, host: HostId, picking: &mut Picking) -> bool {
         let from = Instant::now();
-        let ready = self.robots.ready(host, self.clock.now_ms()).await;
+        let ready = self.robots.ready(host, self.clock.now_ms());
         picking.ready += from.elapsed();
         ready
     }
@@ -2383,10 +2383,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             // Only while there is something else to take. A queue down to its
             // last lease has nothing to step aside for, and rotating it would
             // be the same lease coming back sixteen times.
-            if stepped < STEP_ASIDE
-                && !queue.is_empty()
-                && !self.ready(lease.key.host, picking).await
-            {
+            if stepped < STEP_ASIDE && !queue.is_empty() && !self.ready(lease.key.host, picking) {
                 stepped += 1;
                 report.robots_stepped += 1;
                 queue.push_back(lease);
@@ -2612,7 +2609,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         let now_ms = self.clock.now_ms();
         let mut misses = Vec::new();
         for (host, ..) in hosts {
-            if !self.robots.holds(*host, now_ms).await {
+            if !self.robots.holds(*host, now_ms) {
                 misses.push(*host);
             }
         }
@@ -2629,7 +2626,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
                 continue;
             }
             let host = doc.host;
-            self.robots.insert(host, RobotsEntry::from_doc(&doc)).await;
+            self.robots.insert(host, RobotsEntry::from_doc(&doc));
             held.insert(host);
         }
         warmed.load(held.len());
@@ -2653,7 +2650,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
         floors: &HostFloors,
     ) -> Option<Learned> {
         let now_ms = self.clock.now_ms();
-        if self.robots.holds(host, now_ms).await {
+        if self.robots.holds(host, now_ms) {
             return None;
         }
         // The same ceiling a lease uses. A prefetch is not holding a window

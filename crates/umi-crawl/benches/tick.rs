@@ -675,20 +675,17 @@ async fn prime_robots<F: Fetch + 'static>(crawler: &Crawler<F, Arc<FixedClock>>,
     let digest = umi_types::Digest::from_bytes(*blake3::hash(BODY).as_bytes());
     for host in 0..hosts {
         let key = RowKey::for_url(&seed_url(host), None).expect("canonicalise");
-        crawler
-            .robots()
-            .insert(
-                key.host,
-                Entry {
-                    robots: Arc::clone(&robots),
-                    digest,
-                    fetched_ms: T0,
-                    expires_ms: T0 + TTL_MS,
-                    status: 200,
-                    body: Some(Arc::from(std::str::from_utf8(BODY).expect("utf8"))),
-                },
-            )
-            .await;
+        crawler.robots().insert(
+            key.host,
+            Entry {
+                robots: Arc::clone(&robots),
+                digest,
+                fetched_ms: T0,
+                expires_ms: T0 + TTL_MS,
+                status: 200,
+                body: Some(Arc::from(std::str::from_utf8(BODY).expect("utf8"))),
+            },
+        );
     }
 }
 
