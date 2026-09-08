@@ -3718,6 +3718,17 @@ async fn the_harvest_split_accounts_for_the_whole_of_the_loop() {
         report.harvest_ms,
         report.harvest_idle_ms
     );
+    // The gate is inside the replacement and the cache check is inside the
+    // gate, so the three nest and the report has to say so. This is the
+    // assertion that would catch one of them being timed outside the brackets
+    // it is supposed to sit in.
+    assert!(
+        report.ready_ms <= report.gate_ms && report.gate_ms <= report.replace_ms,
+        "{} ms in the cache, {} ms in the gate, {} ms replacing",
+        report.ready_ms,
+        report.gate_ms,
+        report.replace_ms
+    );
     // The replacement ask happens inside the body, so it can never be more
     // than the body. This is the assertion that would catch the two being
     // measured from different clocks or the ask being timed outside the

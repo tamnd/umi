@@ -281,6 +281,21 @@ struct Stored {
     admit_ms: u64,
 }
 
+/// What a tick spent picking the leases it sent.
+///
+/// Durations rather than the milliseconds the report holds, because both of
+/// these are counted per lease looked at rather than per lease sent, and a
+/// figure rounded down to a whole millisecond on every pass of a loop that
+/// runs ten times a page adds up to a confident nothing. They are rounded
+/// once, when the tick ends.
+#[derive(Debug, Default)]
+struct Picking {
+    /// Time inside [`Shared::gate`], which is the walk over the queue.
+    gate: Duration,
+    /// The part of that spent asking the robots cache about a host.
+    ready: Duration,
+}
+
 /// A tick's supply of leases.
 ///
 /// The queue is what has been taken from the scheduler and not yet put on the
@@ -305,6 +320,12 @@ struct Supply {
     patience: usize,
     /// The ask already on its way back, if there is one.
     asking: Option<Asking>,
+    /// What picking from this queue has cost so far.
+    ///
+    /// Here rather than a parameter of its own because the walk it prices is
+    /// a walk over `queue`, and because `next_lease` was already at the
+    /// argument count a reader can hold in their head.
+    picking: Picking,
     /// The moment past which this tick takes no more work.
     ///
     /// A tick leases a whole batch and then drains it, so the only place a
@@ -942,6 +963,28 @@ pub struct TickReport {
     /// share says the cost is spread over the folding instead, and there is no
     /// single call to fix.
     pub replace_ms: u64,
+    /// Milliseconds of [`replace_ms`](Self::replace_ms) spent in the gate.
+    ///
+    /// The gate is the walk over the queue looking for a lease that may go
+    /// out now. A lease whose host has no robots.txt yet steps aside and the
+    /// gate tries the one behind it, up to sixteen times, and
+    /// [`robots_stepped`](Self::robots_stepped) counts how often that
+    /// happened. The rest of `replace_ms` is the frontier ask, which
+    /// [`ask_waited_ms`](Self::ask_waited_ms) already prices, so these two
+    /// together account for the replacement.
+    pub gate_ms: u64,
+    /// Milliseconds of [`gate_ms`](Self::gate_ms) spent asking the robots
+    /// cache whether a host is ready.
+    ///
+    /// One await per lease the gate looks at, on a cache the fetch tasks on
+    /// every worker thread are also using. A crawl stepping aside nine times
+    /// a page makes this call ten times a page from a single task, so it is
+    /// the one place in the gate where a lock could show up as a cost.
+    ///
+    /// A large share of `gate_ms` here says the walk is waiting on the cache.
+    /// A small share says the walk itself is the cost, which is a different
+    /// fix: fewer steps rather than a cheaper step.
+    pub ready_ms: u64,
 }
 
 /// Where a lease's wall clock went.
@@ -1079,6 +1122,12 @@ impl TickReport {
     #[must_use]
     pub fn replace_mean_ms(&self) -> u64 {
         self.mean(self.replace_ms)
+    }
+
+    /// [`gate_ms`](Self::gate_ms) per completed lease.
+    #[must_use]
+    pub fn gate_mean_ms(&self) -> u64 {
+        self.mean(self.gate_ms)
     }
 
     fn mean(&self, total: u64) -> u64 {
@@ -1462,6 +1511,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             left: batch,
             patience: 0,
             asking: None,
+            picking: Picking::default(),
             until,
         };
 
@@ -1753,6 +1803,8 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         report.harvest_ms = busy.as_millis() as u64;
         report.harvest_idle_ms = idle.as_millis() as u64;
         report.replace_ms = replacing.as_millis() as u64;
+        report.gate_ms = supply.picking.gate.as_millis() as u64;
+        report.ready_ms = supply.picking.ready.as_millis() as u64;
         // The last of the prefetch, before the last store, so a file that
         // arrived while the window was draining still reaches the host record
         // in this tick. A prefetch still running when the tick ends is dropped
@@ -1984,7 +2036,12 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             return Ok(None);
         }
         loop {
-            if let Some(next) = self.gate(&mut supply.queue, deferred, report).await {
+            let gate_from = Instant::now();
+            let gated = self
+                .gate(&mut supply.queue, deferred, report, &mut supply.picking)
+                .await;
+            supply.picking.gate += gate_from.elapsed();
+            if let Some(next) = gated {
                 // Below one ask's worth, which in the steady state means there
                 // is always exactly one ask in flight. A queue holding a full
                 // ask is a window's worth of fetching in hand, which is the
@@ -2297,11 +2354,25 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
     /// the origin answered, which on a broad crawl is most of what the window
     /// was doing. It goes to the back instead and the slot takes a lease that
     /// can fetch now. See [`STEP_ASIDE`].
+    /// [`RobotsCache::ready`] with a clock around it.
+    ///
+    /// Its own method rather than a pair of `Instant` calls inline, because
+    /// the gate's condition is a short circuit chain and putting the timing
+    /// inside it would either time the cheap tests as well or need the chain
+    /// pulled apart.
+    async fn ready(&self, host: HostId, picking: &mut Picking) -> bool {
+        let from = Instant::now();
+        let ready = self.robots.ready(host, self.clock.now_ms()).await;
+        picking.ready += from.elapsed();
+        ready
+    }
+
     async fn gate(
         &self,
         queue: &mut VecDeque<umi_state::Lease>,
         deferred: &mut Vec<LeaseId>,
         report: &mut TickReport,
+        picking: &mut Picking,
     ) -> Option<(umi_state::Lease, u64)> {
         let mut stepped = 0;
         while let Some(lease) = queue.pop_front() {
@@ -2314,7 +2385,7 @@ impl<F: Fetch, C: Clock> Shared<F, C> {
             // be the same lease coming back sixteen times.
             if stepped < STEP_ASIDE
                 && !queue.is_empty()
-                && !self.robots.ready(lease.key.host, self.clock.now_ms()).await
+                && !self.ready(lease.key.host, picking).await
             {
                 stepped += 1;
                 report.robots_stepped += 1;
