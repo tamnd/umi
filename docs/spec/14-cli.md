@@ -23,6 +23,7 @@ umi watch <dir>               continue and keep it fresh, doc 09
 
 umi fetch                     run as a community fetcher, doc 04
 umi robots                    prefetch robots.txt in bulk, doc 07.4
+umi prime <dir>               fill a crawl's robots cache from the corpus, doc 07.4
 umi doctor                    check this machine can do the thing it is about to do
 
 umi seed cc                   seed from Common Crawl via ccrawl-cli, doc 13.6
@@ -312,6 +313,27 @@ The check runs after `--limit` rather than before it, so `--limit` still means h
 The second ask is there because a measurement said it was worth having. Five thousand hosts that one box had recorded as silent were put to a second box and 733 of them answered, and the same list put back to the box that had failed on them answered 621 times, so the box accounts for about two points of the difference and the rest is the request itself: a reset connection, a handshake that timed out, a server that was busy for a minute. Roughly an eighth of the silence in the corpus is a request that would work if it were made again.
 
 The guard on the name resolving is what makes it affordable rather than a doubling of the run. Most silence is not a failed request, it is a name that does not exist, and asking those again would spend a full connect timeout on each one for an answer that cannot change. The lookup that decides is free, because the first ask has just made it and lost, so the resolver answers out of its own negative cache. Nothing waits between the two asks either: the failure that dominates is a timeout, which has already put seconds between them, and sleeping would hold a slot in the window open for a host that is probably dead instead of spending it on the next one. The progress line reports how many second asks were made and how many answered, so the trade is measured on every run rather than assumed once.
+
+### `umi prime`
+
+```
+umi prime ./example.com
+umi prime ./example.com --from open-index/umi-robots
+umi prime ./example.com --files 20 --max-body 8192 --ttl-hours 24
+umi prime ./example.com --dry-run
+```
+
+The other direction from `umi robots`. That command asks hosts and publishes what they served, and this reads the published rows back into a crawl directory's state, so the run that follows finds an answer in a table instead of opening a connection. Without it a fresh crawl directory starts with an empty robots cache and pays the full cost of doc 07.4's file on every host it meets, however many times the fleet has already fetched that same file.
+
+The cost is worth stating with a number. Measured on server2 on 2026-09-08, six minutes at 1024 in flight against the gate 3.1 seed produced 60,699 rows at 152.9 pages a second, at 3329 ms of wall clock per page of which 1765 ms was the robots.txt in front of the page. That is 53 percent of the fetch budget. The same run met 69,984 distinct hosts and loaded exactly zero robots documents, because there were none to load.
+
+There is a body cap and it is where most of the value is. A robots.txt has a median size of 381 bytes and a mean of 8210, and the gap between those two is the whole story: of the 46,137 hosts in that run that served a body at all, 1513 of them, 3.3 percent, held 305 of the 379 megabytes. Eighty one percent of the bytes belong to three percent of the hosts. So importing every host under eight kilobytes keeps 92 percent of them for a tenth of the disk, which is the difference between a corpus that lands near 250 gigabytes of body text and one that lands near 25. A host over the cap is left out and gets asked during the crawl exactly as it is asked today, so the cap costs coverage and never correctness.
+
+A row is imported with the expiry its own fetch date gives it, which is `fetched_at_ms` plus `--ttl-hours`, and not with an expiry counted from the import. Doc 07.4 gives a robots.txt a day and a corpus published last week is a week old however it is loaded. Rows already past their expiry are counted and skipped rather than quietly renewed, so a prime against a stale corpus reports that it imported nothing instead of teaching the crawl to act on old rules. An operator who has decided a longer life is acceptable passes a longer `--ttl-hours` and can see in the report how much of the import that decision is carrying.
+
+A published row never replaces a later local one. Each batch reads what the directory already holds before it writes, and a corpus row loses to a row a crawl fetched afterwards. Without that a prime run in the middle of a crawl's life would quietly put last week's answers over today's, and `put_robots` replaces rather than merges so there would be nothing left to notice it by.
+
+`--files` reads only the first few published files, which is how a run bounds what it downloads. The first and not the newest, which looks backwards and is not: the prefetch writes the corpus in the order it walks `open-index/ccrawl-domains`, which is harmonic centrality order, so the earliest file holds the most linked hosts on the web and the latest holds the tail. A run that can only afford a slice wants the slice a crawl is most likely to meet. The body column is the file, so unlike `--known` this cannot project its way out of moving the bytes, and an operator filling a box with 57 gigabytes free should say how much of the corpus they want. `--dry-run` reads the corpus, reports what would be imported and writes none of it, which is how to size the import before paying for it. A corpus with no files in it is exit 3 and not a failure.
 
 ### `umi block`
 
