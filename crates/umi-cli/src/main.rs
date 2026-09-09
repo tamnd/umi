@@ -232,6 +232,12 @@ enum Command {
         /// How long after its own fetch a published row stays usable.
         #[arg(long, default_value_t = prime::TTL_HOURS)]
         ttl_hours: u64,
+        /// Import only the hosts named in this file, one URL or hostname a
+        /// line. A seed file is the usual answer. Without it every host in the
+        /// corpus is imported, which for anything but a very long run costs
+        /// more in state time than it saves in robots time.
+        #[arg(long, value_name = "FILE")]
+        for_seed: Option<String>,
         /// Say what would be imported and import none of it.
         #[arg(long)]
         dry_run: bool,
@@ -870,12 +876,17 @@ fn run(command: &Command) -> Result<(), Error> {
             files,
             max_body,
             ttl_hours,
+            for_seed,
             dry_run,
         } => {
             // A token when the config has one and none when it does not. The
             // corpus is public, so unlike a warm this works without one, and
             // the token only buys a higher rate limit on the hub.
             let publishing = crawl::Publishing::resolve(&load(command)?, true).unwrap_or(None);
+            let wanted = for_seed
+                .as_ref()
+                .map(|path| prime::hosts_in(std::path::Path::new(path)))
+                .transpose()?;
             let primed = prime::prime(
                 &prime::Options {
                     dir: std::path::PathBuf::from(dir),
@@ -883,13 +894,19 @@ fn run(command: &Command) -> Result<(), Error> {
                     files: *files,
                     max_body: *max_body,
                     ttl_hours: *ttl_hours,
+                    wanted,
                     dry_run: *dry_run,
                 },
                 publishing.as_ref(),
             )?;
             println!(
-                "{} rows from {} files, {} stale, {} oversized, {} already fresher",
-                primed.imported, primed.files, primed.stale, primed.oversized, primed.fresher
+                "{} rows from {} files, {} out of scope, {} stale, {} oversized, {} already fresher",
+                primed.imported,
+                primed.files,
+                primed.unwanted,
+                primed.stale,
+                primed.oversized,
+                primed.fresher
             );
             Ok(())
         }
