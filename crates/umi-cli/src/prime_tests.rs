@@ -7,11 +7,14 @@
 //! local one. The reading of Parquet itself is tested in `umi-publish` against
 //! a real file, so it is not tested again here.
 
+use std::collections::HashSet;
+use std::io::Write as _;
+
 use umi_state::{RobotsDoc, State};
 use umi_state_sqlite::SqliteState;
 use umi_types::HostId;
 
-use crate::prime::{Options, Primed, Row, candidate, write};
+use crate::prime::{Options, Primed, Row, candidate, hosts_in, write};
 
 /// The moment every row in this file is dated from.
 const T0: u64 = 1_760_000_000_000;
@@ -35,7 +38,7 @@ fn a_row_fetched_inside_the_ttl_imports() {
         status: 200,
         body: Some("User-agent: *\nDisallow: /private\n"),
     };
-    let doc = candidate(&row, DAY_MS, T0 + 1000, 8192, &mut done).expect("a document");
+    let doc = candidate(&row, None, DAY_MS, T0 + 1000, 8192, &mut done).expect("a document");
     assert_eq!(doc.host, HostId::derive(b"example.com"));
     assert_eq!(doc.status, 200);
     assert_eq!(doc.fetched_ms, T0);
@@ -54,7 +57,7 @@ fn a_row_older_than_the_ttl_is_counted_and_left() {
         status: 200,
         body: Some("User-agent: *\n"),
     };
-    assert!(candidate(&row, DAY_MS, T0 + DAY_MS + 1, 8192, &mut done).is_none());
+    assert!(candidate(&row, None, DAY_MS, T0 + DAY_MS + 1, 8192, &mut done).is_none());
     assert_eq!(done.stale, 1);
     assert_eq!(done.oversized, 0);
 }
@@ -69,7 +72,7 @@ fn a_body_over_the_cap_is_counted_and_left() {
         status: 200,
         body: Some(&big),
     };
-    assert!(candidate(&row, DAY_MS, T0, 8192, &mut done).is_none());
+    assert!(candidate(&row, None, DAY_MS, T0, 8192, &mut done).is_none());
     assert_eq!(done.oversized, 1);
     assert_eq!(done.stale, 0);
 }
@@ -86,7 +89,7 @@ fn a_host_that_answered_nothing_still_imports() {
         status: 0,
         body: None,
     };
-    let doc = candidate(&row, DAY_MS, T0, 8192, &mut done).expect("a document");
+    let doc = candidate(&row, None, DAY_MS, T0, 8192, &mut done).expect("a document");
     assert_eq!(doc.status, 0);
     assert!(doc.body.is_none());
 }
@@ -100,8 +103,79 @@ fn a_null_hostname_is_skipped_without_a_reason() {
         status: 200,
         body: None,
     };
-    assert!(candidate(&row, DAY_MS, T0, 8192, &mut done).is_none());
+    assert!(candidate(&row, None, DAY_MS, T0, 8192, &mut done).is_none());
     assert_eq!(done, Primed::default());
+}
+
+#[test]
+fn a_host_outside_the_scope_is_counted_and_left() {
+    let mut done = Primed::default();
+    let scope: HashSet<HostId> = [HostId::derive(b"wanted.example")].into_iter().collect();
+    let row = Row {
+        host: Some("other.example"),
+        fetched_ms: T0,
+        status: 200,
+        body: Some("User-agent: *\n"),
+    };
+    assert!(candidate(&row, Some(&scope), DAY_MS, T0, 8192, &mut done).is_none());
+    assert_eq!(done.unwanted, 1);
+    // Out of scope is checked before the ttl and the cap, so a row that is
+    // both is only counted once and counted as the reason that matters.
+    assert_eq!(done.stale, 0);
+    assert_eq!(done.oversized, 0);
+}
+
+#[test]
+fn a_host_inside_the_scope_imports() {
+    let mut done = Primed::default();
+    let scope: HashSet<HostId> = [HostId::derive(b"wanted.example")].into_iter().collect();
+    let row = Row {
+        host: Some("wanted.example"),
+        fetched_ms: T0,
+        status: 200,
+        body: Some("User-agent: *\n"),
+    };
+    let doc = candidate(&row, Some(&scope), DAY_MS, T0, 8192, &mut done).expect("a document");
+    assert_eq!(doc.host, HostId::derive(b"wanted.example"));
+    assert_eq!(done, Primed::default());
+}
+
+#[test]
+fn a_host_list_reads_urls_and_bare_names_the_same_way() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("seed.txt");
+    let mut file = std::fs::File::create(&path).expect("create");
+    // A URL, a bare hostname, an uppercase name, a comment, a blank line and
+    // a line that names no host. A seed file has all of these in it.
+    file.write_all(
+        b"https://one.example/some/path?q=1\n\
+          two.example\n\
+          THREE.example\n\
+          # a comment\n\
+          \n\
+          http://one.example/another\n\
+          http://\n",
+    )
+    .expect("write");
+    drop(file);
+
+    let hosts = hosts_in(&path).expect("the list reads");
+    // Three hosts, because the two one.example lines are the same host and
+    // the uppercase one canonicalises down to the same bytes the corpus holds.
+    assert_eq!(hosts.len(), 3);
+    assert!(hosts.contains(&HostId::derive(b"one.example")));
+    assert!(hosts.contains(&HostId::derive(b"two.example")));
+    assert!(hosts.contains(&HostId::derive(b"three.example")));
+}
+
+#[test]
+fn a_host_list_that_names_nothing_is_not_an_empty_scope() {
+    // An empty scope would import the whole corpus by accident, which is the
+    // exact thing the flag exists to stop, so it stops the run instead.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("seed.txt");
+    std::fs::write(&path, "# nothing but a comment\n\n").expect("write");
+    assert!(hosts_in(&path).is_err());
 }
 
 #[tokio::test]

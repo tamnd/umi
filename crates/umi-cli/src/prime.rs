@@ -49,8 +49,26 @@
 //! before it writes, and a published row loses to a local row that was fetched
 //! later. Without that a prime run in the middle of a crawl's life would
 //! quietly replace today's answers with last week's.
+//!
+//! # Why an unscoped import is usually the wrong one
+//!
+//! The A/B that this module's first measurement asked for came back against
+//! it. Importing all 16,822,489 rows of the first hundred published files did
+//! cut robots from 1765 ms a page to 998, and `loaded` went from zero to 7979,
+//! and connect failures fell from 11,949 to 5,169 in the same six minutes. It
+//! also cut the rate from 152.9 pages a second to 121.5, because the resulting
+//! 7.7 GB state file put state time up from 6 seconds to 93 and tripped disk
+//! backpressure, which halved the fetch window.
+//!
+//! The arithmetic behind that is not close. The run met 69,984 distinct hosts
+//! and we gave it 16.8 million, so 240 rows were paid for on every ask and
+//! every write for each one that was ever read. `--for-seed` is the answer: a
+//! run that knows which hosts it is about to meet imports those and nothing
+//! else, which for that arm is about 35 MB instead of 7.7 GB and keeps every
+//! millisecond of the robots saving without any of the state cost.
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use arrow::array::Array as _;
@@ -59,7 +77,7 @@ use umi_crawl::{Clock as _, SystemClock};
 use umi_publish::{Hub, HubFile, footer, read_column};
 use umi_state::{RobotsDoc, State};
 use umi_state_sqlite::SqliteState;
-use umi_types::{Digest, HostId};
+use umi_types::{Digest, HostId, RowKey};
 
 use crate::Error;
 use crate::crawl::{self, Layout, Publishing};
@@ -119,6 +137,12 @@ pub struct Options {
     pub max_body: usize,
     /// How long after its own fetch a published row stays usable, in hours.
     pub ttl_hours: u64,
+    /// The only hosts to import, when the run knows which it will meet.
+    ///
+    /// `None` imports every host the corpus holds, which is right for a long
+    /// run that will eventually meet everything and wrong for anything shorter.
+    /// See this module's header for what the difference measured.
+    pub wanted: Option<HashSet<HostId>>,
     /// Read the corpus, say what would be imported, and write nothing.
     pub dry_run: bool,
 }
@@ -131,9 +155,51 @@ impl Default for Options {
             files: None,
             max_body: MAX_BODY,
             ttl_hours: TTL_HOURS,
+            wanted: None,
             dry_run: false,
         }
     }
+}
+
+/// The hosts named by a file of URLs or bare hostnames, one per line.
+///
+/// A seed file is a list of URLs and an operator's host list is a list of
+/// names, and both are the same question, so both are accepted. Blank lines and
+/// lines starting with `#` are skipped, and a line that has no scheme is read
+/// as a hostname by giving it one, so that every line goes through the same
+/// canonicalisation the frontier uses and derives the same [`HostId`] the crawl
+/// will later look up. A line that will not parse at all is skipped rather than
+/// failing the run, because a seed file with one bad line in it is still a
+/// useful seed file.
+///
+/// # Errors
+///
+/// [`Error::Io`] when the file cannot be read, and [`Error::NothingToDo`] when
+/// nothing in it names a host, which is worth stopping for: it means the scope
+/// is empty and an unscoped import would have been silently enormous.
+pub fn hosts_in(path: &Path) -> Result<HashSet<HostId>, Error> {
+    let text = std::fs::read_to_string(path).map_err(Error::Io)?;
+    let mut wanted = HashSet::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let owned;
+        let url = if line.contains("://") {
+            line
+        } else {
+            owned = format!("http://{line}");
+            &owned
+        };
+        if let Ok(keys) = RowKey::for_url(url, None) {
+            wanted.insert(keys.host);
+        }
+    }
+    if wanted.is_empty() {
+        return Err(Error::NothingToDo("the host list names no hosts"));
+    }
+    Ok(wanted)
 }
 
 /// What a run did.
@@ -149,6 +215,8 @@ pub struct Primed {
     pub stale: u64,
     /// Rows whose body is longer than `--max-body`.
     pub oversized: u64,
+    /// Rows for a host outside the scope the run asked for.
+    pub unwanted: u64,
     /// Rows the directory already had a later answer for.
     pub fresher: u64,
 }
@@ -212,11 +280,19 @@ async fn read(
     if let Some(limit) = options.files {
         files.truncate(limit);
     }
-    log.line(&format!(
-        "reading {} published files from {}",
-        files.len(),
-        options.corpus
-    ))?;
+    match options.wanted.as_ref() {
+        Some(scope) => log.line(&format!(
+            "reading {} published files from {} for {} hosts",
+            files.len(),
+            options.corpus,
+            scope.len()
+        ))?,
+        None => log.line(&format!(
+            "reading {} published files from {} for every host in them",
+            files.len(),
+            options.corpus
+        ))?,
+    }
 
     let ttl_ms = options.ttl_hours.saturating_mul(60 * 60 * 1000);
     let now_ms = SystemClock.now_ms();
@@ -243,6 +319,7 @@ async fn read(
                     primed.imported += done.imported;
                     primed.stale += done.stale;
                     primed.oversized += done.oversized;
+                    primed.unwanted += done.unwanted;
                     primed.fresher += done.fresher;
                 }
                 // One unreadable file does not stop a run, for the reason a
@@ -254,9 +331,10 @@ async fn read(
         }
     }
     log.line(&format!(
-        "{} rows imported from {} read, {} already stale, {} over {} bytes, {} the directory had fresher",
+        "{} rows imported from {} read, {} out of scope, {} already stale, {} over {} bytes, {} the directory had fresher",
         primed.imported,
         primed.seen,
+        primed.unwanted,
         primed.stale,
         primed.oversized,
         options.max_body,
@@ -315,7 +393,14 @@ async fn one_file(
             status: statuses[i],
             body: bodies[i].as_deref(),
         };
-        if let Some(doc) = candidate(&row, ttl_ms, now_ms, options.max_body, &mut done) {
+        if let Some(doc) = candidate(
+            &row,
+            options.wanted.as_ref(),
+            ttl_ms,
+            now_ms,
+            options.max_body,
+            &mut done,
+        ) {
             batch.push(doc);
         }
         if batch.len() == umi_state::BATCH {
@@ -343,17 +428,30 @@ struct Row<'a> {
 
 /// The document one corpus row imports as, or nothing and a reason counted.
 ///
-/// The three ways a row does not import are a null hostname, an age past the
-/// ttl, and a body over the cap. None of them is an error: each one leaves a
-/// host that the crawl asks itself, which is what every host does today.
+/// The four ways a row does not import are a null hostname, a host outside the
+/// scope the run asked for, an age past the ttl, and a body over the cap. None
+/// of them is an error: each one leaves a host that the crawl asks itself,
+/// which is what every host does today.
+///
+/// The scope is checked first and before anything is allocated, because on a
+/// scoped run it is what almost every row fails and the point of the run is not
+/// to pay for those rows.
 fn candidate(
     row: &Row<'_>,
+    wanted: Option<&HashSet<HostId>>,
     ttl_ms: u64,
     now_ms: u64,
     max_body: usize,
     done: &mut Primed,
 ) -> Option<RobotsDoc> {
     let host = row.host?;
+    let id = HostId::derive(host.as_bytes());
+    if let Some(scope) = wanted
+        && !scope.contains(&id)
+    {
+        done.unwanted += 1;
+        return None;
+    }
     let expires_ms = row.fetched_ms.saturating_add(ttl_ms);
     if expires_ms <= now_ms {
         done.stale += 1;
@@ -364,7 +462,7 @@ fn candidate(
         return None;
     }
     Some(RobotsDoc {
-        host: HostId::derive(host.as_bytes()),
+        host: id,
         // Over the bytes the host served, which is what the fetch hashed, so a
         // row imported here and the same row fetched later carry the same
         // digest and a conditional refetch can tell that they match.
