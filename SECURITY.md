@@ -10,7 +10,7 @@ Expect an acknowledgement within 72 hours. There is no bounty programme.
 
 This is treated as a security-class report, not a feature request, and it gets answered first.
 
-The fastest path is the block request at [umi.dev/bot](https://umi.dev/bot), which stops the whole fleet rather than one machine. `umi block <domain> --reason <why>` is what an operator runs, and the block is permanent and published alongside the corpus rather than applied quietly.
+The fastest path is the block request at [umi-bot.dev/bot](https://umi-bot.dev/bot), which stops the whole fleet rather than one machine. `umi block <domain> --reason <why>` is what an operator runs, and the block is permanent and published alongside the corpus rather than applied quietly.
 
 Robots is honoured under RFC 9309 and there is no flag to disable it. If you have a `Disallow` in place and umi fetched the path anyway, that is a bug and we want the URL, the timestamp and the user agent string you saw.
 

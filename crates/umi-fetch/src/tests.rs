@@ -302,7 +302,7 @@ async fn we_say_who_we_are_on_every_request() {
         request.contains(USER_AGENT),
         "the user agent was not {USER_AGENT} in {request:?}"
     );
-    assert_eq!(USER_AGENT, "umi/1.0 (+https://umi.dev/bot)");
+    assert_eq!(USER_AGENT, "umi/1.0 (+https://umi-bot.dev/bot)");
 }
 
 #[tokio::test]
@@ -941,7 +941,7 @@ const NONCE_SEED: [u8; 16] = [7; 16];
 const T0: u64 = 1_756_400_000;
 
 fn signer_at(secs: u64) -> Signer {
-    Signer::fixed(SEED, "https://umi.dev", NONCE_SEED, secs).expect("the agent is a url")
+    Signer::fixed(SEED, "https://umi-bot.dev", NONCE_SEED, secs).expect("the agent is a url")
 }
 
 fn parsed(url: &str) -> url::Url {
@@ -1002,7 +1002,7 @@ fn the_signature_base_is_the_bytes_rfc_9421_describes() {
     let mut fields = http::HeaderMap::new();
     fields.insert(
         "signature-agent",
-        "\"https://umi.dev\"".parse().expect("a value"),
+        "\"https://umi-bot.dev\"".parse().expect("a value"),
     );
 
     let base = signature_base(
@@ -1018,7 +1018,7 @@ fn the_signature_base_is_the_bytes_rfc_9421_describes() {
         "\"@authority\": example.com\n",
         "\"@method\": GET\n",
         "\"@path\": /a/b\n",
-        "\"signature-agent\": \"https://umi.dev\"\n",
+        "\"signature-agent\": \"https://umi-bot.dev\"\n",
         "\"@signature-params\": (\"@authority\" \"@method\" \"@path\" \"signature-agent\")",
         ";created=1756400000;expires=1756400060;keyid=\"kid\";alg=\"ed25519\"",
         ";nonce=\"nonce\";tag=\"web-bot-auth\""
@@ -1067,7 +1067,7 @@ fn a_signed_request_verifies_against_the_published_directory() {
     let verified =
         verify("GET", &url, &headers, &directory, T0 + 1).expect("our own signature verifies");
     assert_eq!(verified.keyid, signer.keyid());
-    assert_eq!(verified.agent, "https://umi.dev");
+    assert_eq!(verified.agent, "https://umi-bot.dev");
     assert_eq!(verified.created, T0);
 }
 
@@ -1193,7 +1193,7 @@ fn the_directory_round_trips_and_names_the_well_known_path() {
     assert_eq!(Directory::parse(&json).expect("it parses"), directory);
     assert_eq!(
         signer.directory_url(),
-        "https://umi.dev/.well-known/http-message-signatures-directory"
+        "https://umi-bot.dev/.well-known/http-message-signatures-directory"
     );
     assert_eq!(
         directory.find(signer.keyid()).expect("the key is there").x,

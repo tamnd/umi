@@ -394,7 +394,7 @@ impl Config {
                 flags.coordinator.clone(),
                 "UMI_COORDINATOR",
                 |f| f.fetch.coordinator.clone(),
-                "https://umi.dev",
+                "https://umi-bot.dev",
             )?,
             rate: layers.number(flags.rate, "UMI_RATE", "number", |f| f.fetch.rate, 2.0)?,
             tabs: layers.number(flags.tabs, "UMI_TABS", "whole number", |f| f.render.tabs, 0)?,

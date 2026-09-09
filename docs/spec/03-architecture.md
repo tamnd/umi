@@ -20,7 +20,7 @@ Two binaries, one crate workspace.
 
 `umid` is the coordinator daemon. It owns the state store, serves the fetch protocol, runs the writer and the publisher, and hosts the local fetcher pool. On the current fleet exactly one `umid` is the frontier owner for a given pay level domain range, and the three of them peer with each other.
 
-`umi` is the command line, which covers both operator commands against a local or remote `umid` and the standalone fetcher mode. A volunteer runs `umi fetch --coordinator https://umi.dev` and nothing else. That has to be true or doc 04 does not work.
+`umi` is the command line, which covers both operator commands against a local or remote `umid` and the standalone fetcher mode. A volunteer runs `umi fetch --coordinator https://umi-bot.dev` and nothing else. That has to be true or doc 04 does not work.
 
 Inside `umid` the pipeline decouples by cost profile, because fetch is I/O bound and extract is CPU bound and they must scale independently.
 

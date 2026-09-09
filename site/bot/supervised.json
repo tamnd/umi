@@ -1,6 +1,6 @@
 {
   "about": "Domains umi is allowed to crawl at tier 4, which is a real browser on a written per domain allowlist. Nothing reaches this tier by learning. A domain is here only because a named person put it here.",
-  "page": "https://umi.dev/bot",
+  "page": "https://umi-bot.dev/bot",
   "published": "https://huggingface.co/datasets/open-index/umi-meta",
   "published_prefix": "supervised/",
   "removal_request": "tamnd87@gmail.com",

@@ -35,7 +35,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-AGENT = "umi-gate-2-5/1.0 (+https://umi.dev/bot)"
+AGENT = "umi-gate-2-5/1.0 (+https://umi-bot.dev/bot)"
 COLLINFO = "https://index.commoncrawl.org/collinfo.json"
 
 # The index is a shared service and this script is not in a hurry. One request

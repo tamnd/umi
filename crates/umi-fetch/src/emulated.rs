@@ -23,7 +23,7 @@
 //!
 //! Doc 07.1 requires the same user agent at every tier including this one, and
 //! is explicit that this makes T2 inconsistent with itself: a browser
-//! fingerprint under `umi/1.0 (+https://umi.dev/bot)` is a mismatch that bot
+//! fingerprint under `umi/1.0 (+https://umi-bot.dev/bot)` is a mismatch that bot
 //! management will score. We take the score. The alternative is presenting as
 //! Chrome, which is the thing that turns a crawler into a scraper in every
 //! sense that matters, including legally.
@@ -282,7 +282,7 @@ mod tests {
         // builder has to be putting ours back after it.
         let fetcher = Emulated::new().expect("boringssl initialises");
         assert_eq!(fetcher.config().per_host, 2);
-        assert_eq!(USER_AGENT, "umi/1.0 (+https://umi.dev/bot)");
+        assert_eq!(USER_AGENT, "umi/1.0 (+https://umi-bot.dev/bot)");
     }
 
     /// Doc 05.5's self check, against the real internet.

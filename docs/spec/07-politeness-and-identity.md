@@ -7,22 +7,22 @@ A crawler at 750 pages per second is a visible participant in the web whether it
 One user agent, fixed, for every tier including T2 and T3.
 
 ```
-umi/1.0 (+https://umi.dev/bot)
+umi/1.0 (+https://umi-bot.dev/bot)
 ```
 
 The URL resolves to a page that states who runs the crawler, what the data is used for, where the published corpus is, the IP ranges we crawl from, how to rate limit us, how to block us, and a contact address that a human reads. That page is a deliverable, not a nicety, and it ships before the first crawl outside our own domains.
 
 T2 is the awkward case. Its whole purpose is to present a browser's TLS and HTTP/2 fingerprint, and a browser fingerprint with a bot user agent is an inconsistency. We keep the honest user agent anyway. The alternative is to present ourselves as Chrome, which is the thing that turns a crawler into a scraper in every sense that matters, including legally. If a site's bot management scores us as suspicious because the layers disagree, that is a signal we should accept rather than paper over.
 
-Forward confirmable reverse DNS is set up for every crawling address, so `62.171.131.190` reverses to `fetch-3.umi.dev` and `fetch-3.umi.dev` resolves back to `62.171.131.190`. This is how Googlebot and Bingbot are verified and it is the check most site operators know how to run. It works because the two halves are held by different parties: anyone can put `umi.dev` in a PTR record for an address they own, and only we can put an address in a name under `umi.dev`. The names are `fetch-N.umi.dev`, under the same domain as the bot page and the key directory, so one domain answers every question about who we are.
+Forward confirmable reverse DNS is set up for every crawling address, so `62.171.131.190` reverses to `fetch-3.umi-bot.dev` and `fetch-3.umi-bot.dev` resolves back to `62.171.131.190`. This is how Googlebot and Bingbot are verified and it is the check most site operators know how to run. It works because the two halves are held by different parties: anyone can put `umi-bot.dev` in a PTR record for an address they own, and only we can put an address in a name under `umi-bot.dev`. The names are `fetch-N.umi-bot.dev`, under the same domain as the bot page and the key directory, so one domain answers every question about who we are.
 
-The addresses are also published as a list, at `https://umi.dev/bot/umi.json`, in the same shape as Google's `googlebot.json` down to the field names. An operator who wants to allow us, rate limit us or just recognise us should not have to write a second reader for our version of the same file, and the tooling that already eats Google's list works on ours unchanged. The one addition is a `name` on each entry carrying the reverse DNS name for that range, which a reader that does not expect it ignores. Ranges today are single addresses, written `/32` and `/128`, because three servers is what there is.
+The addresses are also published as a list, at `https://umi-bot.dev/bot/umi.json`, in the same shape as Google's `googlebot.json` down to the field names. An operator who wants to allow us, rate limit us or just recognise us should not have to write a second reader for our version of the same file, and the tooling that already eats Google's list works on ours unchanged. The one addition is a `name` on each entry carrying the reverse DNS name for that range, which a reader that does not expect it ignores. Ranges today are single addresses, written `/32` and `/128`, because three servers is what there is.
 
 ```json
 {
   "creationTime": "2026-08-29T00:00:00.000000",
   "prefixes": [
-    { "ipv4Prefix": "62.171.131.190/32", "name": "fetch-3.umi.dev" }
+    { "ipv4Prefix": "62.171.131.190/32", "name": "fetch-3.umi-bot.dev" }
   ]
 }
 ```
@@ -37,7 +37,7 @@ Every request from a coordinator operated fetcher is signed under RFC 9421 HTTP 
 
 The mechanics are three headers. `Signature-Agent` points at our public key directory. `Signature-Input` names the covered components. `Signature` carries the Ed25519 signature. We sign at minimum the `@authority` derived component, per Cloudflare's guidance, plus `@method`, `@path`, and a nonce and timestamp for replay resistance.
 
-Keys are Ed25519, published at `https://umi.dev/.well-known/http-message-signatures-directory`, rotated quarterly with an overlap window, and the rotation is announced on the bot page. The directory is a JSON Web Key Set, one entry per key we have ever signed with, and a `keyid` is the RFC 7638 thumbprint of the key it names. A rotated key keeps its entry and gains an `exp`, rather than being deleted, because deleting it would make every request we have ever signed unverifiable after the fact and the point of signing is that somebody can check later.
+Keys are Ed25519, published at `https://umi-bot.dev/.well-known/http-message-signatures-directory`, rotated quarterly with an overlap window, and the rotation is announced on the bot page. The directory is a JSON Web Key Set, one entry per key we have ever signed with, and a `keyid` is the RFC 7638 thumbprint of the key it names. A rotated key keeps its entry and gains an `exp`, rather than being deleted, because deleting it would make every request we have ever signed unverifiable after the fact and the point of signing is that somebody can check later.
 
 The covered components are `@authority`, `@method`, `@path` and the `Signature-Agent` header, and a signature is good for sixty seconds. `Signature-Agent` is covered as well as sent, which is the draft's rule and is not a formality: an unsigned pointer at a key directory would let anyone replay one of our signatures while naming a directory they control.
 

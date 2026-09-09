@@ -222,7 +222,7 @@ The one command in doc 04's design constraint.
 ```
 umi fetch [--coordinator <url>]
 
-  --coordinator <url>     default https://umi.dev
+  --coordinator <url>     default https://umi-bot.dev
   --rate <f>              pages/s you are willing to sustain, default 2.0
   --concurrency <n>       default 8
   --tier <max>            highest tier you will run, default 2
@@ -457,7 +457,7 @@ token = "env:HF_TOKEN"
 key   = "env:UMI_PUBLISH_KEY"
 
 [fetch]
-coordinator = "https://umi.dev"
+coordinator = "https://umi-bot.dev"
 rate        = 2.0
 
 [render]
@@ -487,7 +487,7 @@ $ umi doctor
   disk /var/lib/umi     112 GB free, 24 GB needed for 8 segments      ok
   memory                10.2 GB available, 1.5 GB budgeted            ok
   crawl identity        signing as kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7Ty     ok
-  crawl addresses       62.171.131.190 confirms as fetch-3.umi.dev     ok
+  crawl addresses       62.171.131.190 confirms as fetch-3.umi-bot.dev     ok
   outbound to hf        11.4 MB/s measured over 8s                    ok
   inbound sample        38.1 MB/s measured over 8s                    ok
   hf token              valid, write access to open-index             ok

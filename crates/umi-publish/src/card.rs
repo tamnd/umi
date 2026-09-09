@@ -28,7 +28,7 @@ mod tests;
 const CONTACT: &str = "tamnd87@gmail.com";
 
 /// The bot page, which is the other half of doc 07.3's declaration.
-const BOT_PAGE: &str = "https://umi.dev/bot";
+const BOT_PAGE: &str = "https://umi-bot.dev/bot";
 
 /// The spec, so that a reader can check the card against the document it cites.
 const SPEC: &str = "https://github.com/tamnd/umi/tree/main/docs/spec";

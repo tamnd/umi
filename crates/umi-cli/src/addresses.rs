@@ -26,10 +26,10 @@ use serde::Deserialize;
 pub const PUBLISHED: &str = include_str!("../../../identity/umi.json");
 
 /// Where it is served, and what goes on the bot page.
-pub const URL: &str = "https://umi.dev/bot/umi.json";
+pub const URL: &str = "https://umi-bot.dev/bot/umi.json";
 
 /// The domain every crawling address reverses into.
-pub const DOMAIN: &str = "umi.dev";
+pub const DOMAIN: &str = "umi-bot.dev";
 
 /// One published range and the name it answers to.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,7 +205,7 @@ mod tests {
         let theirs: IpAddr = "62.171.131.191".parse().expect("an address");
         assert_eq!(
             published.find(ours).and_then(|entry| entry.name.as_deref()),
-            Some("fetch-3.umi.dev")
+            Some("fetch-3.umi-bot.dev")
         );
         assert!(published.find(theirs).is_none());
     }

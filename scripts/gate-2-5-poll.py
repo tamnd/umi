@@ -43,7 +43,7 @@ import xml.etree.ElementTree as ET
 # Identifiable and traceable, the same way doc 07.2 asks the crawler's own
 # agent string to be. Somebody reading their access log during these two weeks
 # should be able to find out what this is in one search.
-AGENT = "umi-gate-2-5/1.0 (+https://umi.dev/bot)"
+AGENT = "umi-gate-2-5/1.0 (+https://umi-bot.dev/bot)"
 
 # Atom and Dublin Core, which is most of what a feed that is not plain RSS
 # turns out to be.

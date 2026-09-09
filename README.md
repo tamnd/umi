@@ -22,7 +22,7 @@ umi is the acquisition layer for an open index. Crawling is the part of a search
 
 **Two storage systems, on purpose.** The immutable side is `.umi`, a single file columnar container of markdown, links, snippets, metadata and digests, tuned for one thing: fill in 90 seconds, live less than 10 minutes, convert to Parquet, get deleted. The mutable side is the state layer, which holds the frontier, the seen set and the recrawl schedule under 20 bytes per URL, behind a `State` trait with backends for SQLite (the default), nami (a single high performance file), Postgres, and DuckDB for dashboards and reports.
 
-**Politeness is not configurable downward.** RFC 9309 robots, AIPREF `Content-Usage`, Web Bot Auth request signing so an origin can verify who is calling, per host and per pay level domain rate caps, and a published identity at [umi.dev/bot](https://umi.dev/bot). There is no `--ignore-robots`, no `--user-agent`, no proxy configuration and no CAPTCHA solving. [Doc 14 section 10](docs/spec/14-cli.md) lists what is deliberately absent and why.
+**Politeness is not configurable downward.** RFC 9309 robots, AIPREF `Content-Usage`, Web Bot Auth request signing so an origin can verify who is calling, per host and per pay level domain rate caps, and a published identity at [umi-bot.dev/bot](https://umi-bot.dev/bot). There is no `--ignore-robots`, no `--user-agent`, no proxy configuration and no CAPTCHA solving. [Doc 14 section 10](docs/spec/14-cli.md) lists what is deliberately absent and why.
 
 **Everything published is verifiable.** Manifests are hash chained and Ed25519 signed with three separate keys, and a stranger can verify a published corpus from a clean machine with the released binary. Local data is deleted only when four conditions hold at once, with no override flag.
 
@@ -41,7 +41,7 @@ The command surface is real even though the commands are not:
 
 ```sh
 umi crawl example.com --max-pages 10000 --publish   # focused crawl of one domain
-umi fetch --coordinator https://umi.dev --rate 2    # contribute capacity to the fleet
+umi fetch --coordinator https://umi-bot.dev --rate 2    # contribute capacity to the fleet
 umi get https://example.com/ --markdown --receipt   # one URL through the full ladder
 umi doctor                                          # can this machine do the thing
 umi sql "select host, count(*) from pages group by 1 order by 2 desc limit 20"

@@ -17,14 +17,15 @@ use super::{
 
 #[test]
 fn a_query_is_the_bytes_rfc_1035_describes() {
-    let query = encode(0x1234, "umi.dev", A).expect("the name encodes");
+    let query = encode(0x1234, "umi-bot.dev", A).expect("the name encodes");
     assert_eq!(
         query,
         vec![
             // Header: id, recursion desired, one question, one additional.
             0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
-            // "umi.dev" as length prefixed labels, then the root.
-            0x03, b'u', b'm', b'i', 0x03, b'd', b'e', b'v', 0x00, // A, IN.
+            // "umi-bot.dev" as length prefixed labels, then the root.
+            0x07, b'u', b'm', b'i', b'-', b'b', b'o', b't', 0x03, b'd', b'e', b'v',
+            0x00, // A, IN.
             0x00, 0x01, 0x00, 0x01,
             // The OPT record: root name, type 41, 1232 bytes of receive
             // buffer where a class would be, no flags, no options.
@@ -57,16 +58,18 @@ fn the_reverse_name_is_the_address_backwards() {
 #[test]
 fn a_name_reads_back_through_a_compression_pointer() {
     let mut buf = vec![0u8; 12];
-    // "umi.dev" at offset 12.
-    buf.extend_from_slice(&[0x03, b'u', b'm', b'i', 0x03, b'd', b'e', b'v', 0x00]);
-    // "fetch-1" at offset 21, then a pointer back to offset 12.
+    // "umi-bot.dev" at offset 12, thirteen bytes of it.
+    buf.extend_from_slice(&[
+        0x07, b'u', b'm', b'i', b'-', b'b', b'o', b't', 0x03, b'd', b'e', b'v', 0x00,
+    ]);
+    // "fetch-1" at offset 25, then a pointer back to offset 12.
     buf.extend_from_slice(&[0x07, b'f', b'e', b't', b'c', b'h', b'-', b'1', 0xc0, 0x0c]);
 
-    let (name, after) = read_name(&buf, 21).expect("the name reads");
-    assert_eq!(name, "fetch-1.umi.dev");
+    let (name, after) = read_name(&buf, 25).expect("the name reads");
+    assert_eq!(name, "fetch-1.umi-bot.dev");
     // The offset is where the name ends in this record, not where the
     // pointer led.
-    assert_eq!(after, 31);
+    assert_eq!(after, 35);
 }
 
 #[test]
@@ -113,7 +116,7 @@ fn no_such_name_is_told_apart_from_a_broken_lookup() {
 #[test]
 fn a_record_that_runs_off_the_end_is_refused() {
     let mut response = head(7, 0x8180, 1, 1);
-    write_name(&mut response, "umi.dev").expect("the name encodes");
+    write_name(&mut response, "umi-bot.dev").expect("the name encodes");
     response.extend_from_slice(&A.to_be_bytes());
     response.extend_from_slice(&1u16.to_be_bytes());
     // An answer that claims four bytes of address and supplies none.
@@ -132,17 +135,17 @@ fn a_record_that_runs_off_the_end_is_refused() {
 fn a_published_address_confirms_both_ways() {
     let addr = IpAddr::V4(Ipv4Addr::new(62, 171, 131, 190));
     let resolver = fake(vec![
-        (arpa(addr), PTR, name_data("fetch-3.umi.dev")),
-        ("fetch-3.umi.dev".to_owned(), A, vec![62, 171, 131, 190]),
+        (arpa(addr), PTR, name_data("fetch-3.umi-bot.dev")),
+        ("fetch-3.umi-bot.dev".to_owned(), A, vec![62, 171, 131, 190]),
     ]);
 
     assert_eq!(
         resolver.names(addr).expect("the ptr answers"),
-        vec!["fetch-3.umi.dev".to_owned()]
+        vec!["fetch-3.umi-bot.dev".to_owned()]
     );
     assert_eq!(
-        super::confirm(&resolver, addr, "umi.dev"),
-        Confirmation::Confirmed("fetch-3.umi.dev".to_owned())
+        super::confirm(&resolver, addr, "umi-bot.dev"),
+        Confirmation::Confirmed("fetch-3.umi-bot.dev".to_owned())
     );
 }
 
@@ -153,14 +156,14 @@ fn a_name_that_does_not_come_back_is_not_confirmed() {
     // any name in their own PTR record.
     let addr = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
     let resolver = fake(vec![
-        (arpa(addr), PTR, name_data("fetch-9.umi.dev")),
-        ("fetch-9.umi.dev".to_owned(), A, vec![62, 171, 131, 190]),
+        (arpa(addr), PTR, name_data("fetch-9.umi-bot.dev")),
+        ("fetch-9.umi-bot.dev".to_owned(), A, vec![62, 171, 131, 190]),
     ]);
 
     assert_eq!(
-        super::confirm(&resolver, addr, "umi.dev"),
+        super::confirm(&resolver, addr, "umi-bot.dev"),
         Confirmation::NoReturn(
-            "fetch-9.umi.dev".to_owned(),
+            "fetch-9.umi-bot.dev".to_owned(),
             vec![IpAddr::V4(Ipv4Addr::new(62, 171, 131, 190))]
         )
     );
@@ -179,7 +182,7 @@ fn a_providers_default_name_confirms_but_is_not_ours() {
     ]);
 
     assert_eq!(
-        super::confirm(&resolver, addr, "umi.dev"),
+        super::confirm(&resolver, addr, "umi-bot.dev"),
         Confirmation::Foreign("vmi3391933.contaboserver.net".to_owned())
     );
 }
@@ -189,7 +192,7 @@ fn an_address_with_no_reverse_record_says_so() {
     let addr = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4));
     let resolver = fake(Vec::new());
     assert_eq!(
-        super::confirm(&resolver, addr, "umi.dev"),
+        super::confirm(&resolver, addr, "umi-bot.dev"),
         Confirmation::NoName
     );
 }
@@ -201,24 +204,24 @@ fn a_v6_address_confirms_the_same_way() {
         unreachable!("parsed as v6")
     };
     let resolver = fake(vec![
-        (arpa(addr), PTR, name_data("fetch-3.umi.dev")),
-        ("fetch-3.umi.dev".to_owned(), AAAA, v6.octets().to_vec()),
+        (arpa(addr), PTR, name_data("fetch-3.umi-bot.dev")),
+        ("fetch-3.umi-bot.dev".to_owned(), AAAA, v6.octets().to_vec()),
     ]);
     assert_eq!(
-        super::confirm(&resolver, addr, "umi.dev"),
-        Confirmation::Confirmed("fetch-3.umi.dev".to_owned())
+        super::confirm(&resolver, addr, "umi-bot.dev"),
+        Confirmation::Confirmed("fetch-3.umi-bot.dev".to_owned())
     );
 }
 
 #[test]
 fn under_matches_a_domain_and_its_children_and_nothing_else() {
-    assert!(under("umi.dev", "umi.dev"));
-    assert!(under("fetch-1.umi.dev", "umi.dev"));
-    assert!(under("fetch-1.umi.dev.", "umi.dev"));
-    assert!(under("FETCH-1.UMI.DEV", "umi.dev"));
-    assert!(!under("notumi.dev", "umi.dev"));
-    assert!(!under("umi.dev.example.com", "umi.dev"));
-    assert!(!under("dev", "umi.dev"));
+    assert!(under("umi-bot.dev", "umi-bot.dev"));
+    assert!(under("fetch-1.umi-bot.dev", "umi-bot.dev"));
+    assert!(under("fetch-1.umi-bot.dev.", "umi-bot.dev"));
+    assert!(under("FETCH-1.UMI-BOT.DEV", "umi-bot.dev"));
+    assert!(!under("notumi-bot.dev", "umi-bot.dev"));
+    assert!(!under("umi-bot.dev.example.com", "umi-bot.dev"));
+    assert!(!under("dev", "umi-bot.dev"));
 }
 
 /// A twelve byte header with the counts a test wants.

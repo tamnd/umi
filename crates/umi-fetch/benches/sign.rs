@@ -49,7 +49,7 @@ const BATCH: usize = 20_000;
 
 fn main() {
     let signer =
-        Signer::fixed(SEED, "https://umi.dev", NONCE_SEED, T0).expect("the agent is a url");
+        Signer::fixed(SEED, "https://umi-bot.dev", NONCE_SEED, T0).expect("the agent is a url");
     let directory = Directory::of(&signer.jwk(None, None).key().expect("the key parses"));
     let covered: Vec<String> = COVERED.iter().map(|c| (*c).to_owned()).collect();
 
