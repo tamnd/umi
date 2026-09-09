@@ -110,7 +110,7 @@ pub use rendered::{Counts, RenderConfig, Renderer};
 /// how to block us in one line. A site operator reading their logs should be
 /// able to identify us in one search, and that only works if the string never
 /// varies.
-pub const USER_AGENT: &str = "umi/1.0 (+https://umi.dev/bot)";
+pub const USER_AGENT: &str = "umi/1.0 (+https://umi-bot.dev/bot)";
 
 /// What we tell origins we will take.
 ///

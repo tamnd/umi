@@ -18,7 +18,7 @@
 //! # The three headers
 //!
 //! ```text
-//! Signature-Agent: "https://umi.dev"
+//! Signature-Agent: "https://umi-bot.dev"
 //! Signature-Input: sig1=("@authority" "@method" "@path" "signature-agent")\
 //!                  ;created=1756400000;expires=1756400060\
 //!                  ;keyid="...";alg="ed25519";nonce="...";tag="web-bot-auth"
@@ -87,7 +87,7 @@ pub const DIRECTORY_PATH: &str = "/.well-known/http-message-signatures-directory
 pub const DIRECTORY_MEDIA_TYPE: &str = "application/http-message-signatures-directory+json";
 
 /// The signature agent umi presents, which is doc 07.1's host.
-pub const AGENT: &str = "https://umi.dev";
+pub const AGENT: &str = "https://umi-bot.dev";
 
 /// The components every umi request covers.
 ///

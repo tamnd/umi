@@ -4,7 +4,7 @@ The whole 100 billion page target rests on this document. server1, server2 and s
 
 ## 4.1 Design constraints
 
-**A volunteer must be able to start in one command.** Download a static binary, run `umi fetch --coordinator https://umi.dev`, done. No account, no config file, no Docker, no key ceremony. Registration happens on first contact and the key is generated locally.
+**A volunteer must be able to start in one command.** Download a static binary, run `umi fetch --coordinator https://umi-bot.dev`, done. No account, no config file, no Docker, no key ceremony. Registration happens on first contact and the key is generated locally.
 
 **The protocol must be implementable in an afternoon in any language.** HTTPS with CBOR bodies, five endpoints, no gRPC, no custom framing, no streaming requirement. Someone should be able to write a working fetcher in Python in 200 lines. If they can, the fleet grows.
 

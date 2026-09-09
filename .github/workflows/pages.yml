@@ -1,6 +1,6 @@
 name: Site
 
-# umi.dev is static. It is the bot page, the published address list, the
+# umi-bot.dev is static. It is the bot page, the published address list, the
 # purpose declaration and a short front page, and doc 07.1 says the bot page
 # ships before the first crawl outside our own domains. Hosting it on Pages
 # rather than on a crawling box is deliberate: the page an angry operator

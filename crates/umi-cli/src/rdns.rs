@@ -234,8 +234,8 @@ pub enum Confirmation {
 ///
 /// `domain` is the suffix a confirmed name has to sit under, with no leading
 /// dot. A name matches when it is the domain or ends in a dot and the domain,
-/// so `umi.dev` and `fetch-1.umi.dev` both match `umi.dev` and
-/// `notumi.dev` does not.
+/// so `umi-bot.dev` and `fetch-1.umi-bot.dev` both match `umi-bot.dev` and
+/// `notumi-bot.dev` does not.
 #[must_use]
 pub fn confirm(resolver: &Resolver, addr: IpAddr, domain: &str) -> Confirmation {
     let names = match resolver.names(addr) {

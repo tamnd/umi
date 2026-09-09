@@ -32,7 +32,7 @@ Durations assume one person, not full time. They are estimates and they are the 
 
 **Goal.** The crawler handles the 2026 web rather than the 2010 web, and it knows when to come back.
 
-**Built.** Doc 05's full tier ladder: T0 conditional revalidation, T2 through `wreq` behind the `emulation` feature, T3 through `chromiumoxide` with the subresource policy and the 8 tab cap on server2, T4 gated behind the published per domain allowlist. Per host tier learning and the escalation and de-escalation state machine. Doc 07 in full: Web Bot Auth signing, the key directory, forward confirmable rDNS, the adaptive rate limiter, AIPREF `Content-Usage` parsing, `umi block`, and the bot page at `umi.dev/bot`. Doc 09's change rate estimator, refresh classes, and `umi watch`. Sitemap, feed and `robots.txt` seeding.
+**Built.** Doc 05's full tier ladder: T0 conditional revalidation, T2 through `wreq` behind the `emulation` feature, T3 through `chromiumoxide` with the subresource policy and the 8 tab cap on server2, T4 gated behind the published per domain allowlist. Per host tier learning and the escalation and de-escalation state machine. Doc 07 in full: Web Bot Auth signing, the key directory, forward confirmable rDNS, the adaptive rate limiter, AIPREF `Content-Usage` parsing, `umi block`, and the bot page at `umi-bot.dev/bot`. Doc 09's change rate estimator, refresh classes, and `umi watch`. Sitemap, feed and `robots.txt` seeding.
 
 **Gates.**
 
@@ -83,7 +83,7 @@ Durations assume one person, not full time. They are estimates and they are the 
 
 **Goal.** Anyone can contribute fetch capacity, and the corpus is published continuously at a scale that requires a real conversation with Hugging Face.
 
-**Built.** The public coordinator at `umi.dev`, the bot page, the published key directories, the fetcher key directory, the ban list and the block list. Static binaries for the common platforms. The volunteer documentation, which is doc 04 rewritten for someone who has never read this spec. Doc 12 at full rate with weekly repository allocation. Doc 11's global exact dedup batch job and the LSH near duplicate clustering, publishing `umi-dedup`. The PDF handler, off by default until here for the reasons in doc 11.3.
+**Built.** The public coordinator at `umi-bot.dev`, the bot page, the published key directories, the fetcher key directory, the ban list and the block list. Static binaries for the common platforms. The volunteer documentation, which is doc 04 rewritten for someone who has never read this spec. Doc 12 at full rate with weekly repository allocation. Doc 11's global exact dedup batch job and the LSH near duplicate clustering, publishing `umi-dedup`. The PDF handler, off by default until here for the reasons in doc 11.3.
 
 **Gates.**
 

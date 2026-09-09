@@ -52,4 +52,4 @@ Pull requests should say what would have to be true for the change to be wrong. 
 
 ## Reporting a problem with the crawler's behaviour
 
-If umi is fetching your site in a way you did not expect, that is a bug and it is the highest priority category of bug there is. See [SECURITY.md](SECURITY.md) for how to reach us quickly, and [umi.dev/bot](https://umi.dev/bot) for the published identity, the address ranges, and the block request path.
+If umi is fetching your site in a way you did not expect, that is a bug and it is the highest priority category of bug there is. See [SECURITY.md](SECURITY.md) for how to reach us quickly, and [umi-bot.dev/bot](https://umi-bot.dev/bot) for the published identity, the address ranges, and the block request path.

@@ -82,7 +82,7 @@ On detection, the honest position is that T3 is not stealthy and pretending othe
 
 A real browser with a real profile, driven by or with a human, on an explicit per domain allowlist.
 
-The allowlist entry records the domain, the operator who added it, an ISO timestamp, and a free text reason. It is stored in state, it is published one file per domain in `open-index/umi-meta` under `supervised/`, and it is linked from the bot page at `umi.dev/bot`. Anyone can see which domains are crawled this way and why, without having to ask us.
+The allowlist entry records the domain, the operator who added it, an ISO timestamp, and a free text reason. It is stored in state, it is published one file per domain in `open-index/umi-meta` under `supervised/`, and it is linked from the bot page at `umi-bot.dev/bot`. Anyone can see which domains are crawled this way and why, without having to ask us.
 
 The only way onto the list is `umi supervise <domain> --operator <who> --reason <text>`, from doc 14.5. Nothing escalates to T4. There is no signal that gets a host there after enough failures, no counter that reaches it, and no configuration key that lowers the bar. `TierPolicy::CEILING` is T2 and the highest rung anything climbs to on its own is T3, on a shell page.
 

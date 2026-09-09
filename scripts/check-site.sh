@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # The bot page, checked against the code rather than against memory.
 #
-# Doc 07.1 says the page at umi.dev/bot is a deliverable and not a nicety,
+# Doc 07.1 says the page at umi-bot.dev/bot is a deliverable and not a nicety,
 # and the thing that makes it worthless is drift: an address list that has
 # fallen behind the binary, a robots token that no longer matches what the
 # parser looks for, a user agent string that is one character off. Every one
