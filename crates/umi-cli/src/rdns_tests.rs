@@ -218,7 +218,7 @@ fn under_matches_a_domain_and_its_children_and_nothing_else() {
     assert!(under("umi-bot.dev", "umi-bot.dev"));
     assert!(under("fetch-1.umi-bot.dev", "umi-bot.dev"));
     assert!(under("fetch-1.umi-bot.dev.", "umi-bot.dev"));
-    assert!(under("FETCH-1.UMI.DEV", "umi-bot.dev"));
+    assert!(under("FETCH-1.UMI-BOT.DEV", "umi-bot.dev"));
     assert!(!under("notumi-bot.dev", "umi-bot.dev"));
     assert!(!under("umi-bot.dev.example.com", "umi-bot.dev"));
     assert!(!under("dev", "umi-bot.dev"));
