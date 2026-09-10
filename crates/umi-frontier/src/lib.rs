@@ -41,6 +41,19 @@
 //! The cap now travels with the ask as `max_per_pld` and the store counts it,
 //! which is the same guarantee for one round trip instead of five hundred.
 //!
+//! Every domain a tick offers the store is accounted for afterwards, whether
+//! or not the store found anything under it. That is the third thing in here a
+//! measurement changed and it is the one that mattered most. A domain leaves
+//! the head of the order by being charged for work it took, so a domain that
+//! has nothing to give keeps its place, and the head of a long lived frontier
+//! silently fills with domains that had nothing the last time they were asked.
+//! On server3 against a directory holding 2,145,957 due URLs under 75,584
+//! domains, twenty asks of a thousand each returned 1024, 1024, 658, 861, 411,
+//! 258, 160, 60, 84, 50, 35, 20, 9, 8 and then nothing at all. With
+//! [`Gate::miss`] moving a domain that took nothing behind the ones that have
+//! not been asked yet, the same twenty asks return a thousand each, and three
+//! hundred of them return 307,046 leases without ever falling short.
+//!
 //! A tick costs what it schedules and not what is resident, which is the one
 //! thing in here the benchmark changed. It used to read the resident set and
 //! walk it to keep the schedule in step, which is a fine thing to do at a
@@ -466,14 +479,25 @@ impl<S: State> Frontier<S> {
             // Charged per domain off what each actually took, which is what the
             // gate has always done. The store returns a flat batch, so the
             // counting is here now rather than implied by one call per domain.
+            //
+            // Every domain that was offered is accounted for and not only the
+            // ones that answered. A domain the store found nothing under is
+            // usually a domain whose hosts are inside a politeness window this
+            // tick and will be out of one in a second, and leaving its schedule
+            // where it was leaves it at the head of the order for the next ask
+            // and the one after that. See [`Gate::miss`] for what that does to
+            // a real frontier, which is stop it dead.
             {
                 let mut taken: HashMap<PldId, u32> = HashMap::new();
                 for lease in &leases {
                     *taken.entry(lease.key.pld).or_default() += 1;
                 }
                 let mut gate = self.gate();
-                for (pld, count) in taken {
-                    gate.charge(pld, count, ask.now_ms);
+                for pld in &plds {
+                    match taken.get(pld) {
+                        Some(count) => gate.charge(*pld, *count, ask.now_ms),
+                        None => gate.miss(*pld, ask.now_ms),
+                    }
                 }
             }
             out.extend(leases);
@@ -552,6 +576,20 @@ impl<S: State> Frontier<S> {
     #[must_use]
     pub fn next_ready_ms(&self, pld: PldId) -> Option<u64> {
         self.gate().next_ready_ms(pld)
+    }
+
+    /// How many requests this domain may take at `now_ms`, or `None` if it is
+    /// not being scheduled. For a dashboard and for tests.
+    ///
+    /// The pair with [`next_ready_ms`](Self::next_ready_ms), and the two apart
+    /// are worth having because a domain's place in the order and what it may
+    /// spend are not the same thing. [`Gate::miss`] moves the first and leaves
+    /// the second alone, which is the whole of what it does.
+    #[must_use]
+    pub fn allowance(&self, pld: PldId, now_ms: u64) -> Option<u32> {
+        let gate = self.gate();
+        gate.next_ready_ms(pld)?;
+        Some(gate.allowance(pld, now_ms))
     }
 
     /// How many domains are being scheduled.

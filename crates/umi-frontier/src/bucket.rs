@@ -254,6 +254,40 @@ impl Gate {
         self.set(pld, from.saturating_add(cost));
     }
 
+    /// Record that a domain was offered a turn and had nothing to fill it with.
+    ///
+    /// This is the other half of [`charge`](Self::charge) and the crawl does
+    /// not survive without it. The ordering here is the schedule, a domain
+    /// reaches it at zero and leaves the head of it by being charged, so a
+    /// domain that is offered and takes nothing keeps the place it had. Take
+    /// enough turns and the head of the order is nothing but domains that had
+    /// nothing, every ask offers the store the same barren few hundred, and a
+    /// frontier with two million due URLs under seventy five thousand domains
+    /// hands out none of them. Measured on server3 on 2026-09-10: twenty asks
+    /// of a thousand against a real directory returned 1024, 1024, 658, 861,
+    /// 411, 258, 160, 60, 84, 50, 35, 20, 9, 8 and then zero for the rest,
+    /// with 2,145,957 rows due the whole time.
+    ///
+    /// A turn taken and not a request issued, so the schedule moves to now and
+    /// no further. The domain has spent nothing and is owed nothing, and the
+    /// only thing being said is that it has had its look. That is enough to
+    /// move it behind every domain still sitting at zero, which is the whole
+    /// job: the order becomes a round robin over everything the scheduler
+    /// knows about rather than a queue whose head cannot move.
+    ///
+    /// A domain already scheduled ahead of now is left alone. It is ahead
+    /// because it has been busy, moving it back would return burst it has
+    /// already spent, and it is not at the head of anything.
+    pub fn miss(&mut self, pld: PldId, now_ms: u64) {
+        let Some(at) = self.schedule.get(&pld).copied() else {
+            return;
+        };
+        if at >= now_ms {
+            return;
+        }
+        self.set(pld, now_ms);
+    }
+
     /// When this domain may next be fetched, or `None` if it is not tracked.
     #[must_use]
     pub fn next_ready_ms(&self, pld: PldId) -> Option<u64> {
@@ -374,6 +408,44 @@ mod tests {
         gate.charge(pld(1), 0, 5_000);
         assert_eq!(gate.next_ready_ms(pld(1)), Some(0));
         assert_eq!(gate.allowance(pld(1), 0), 20);
+    }
+
+    #[test]
+    fn a_domain_that_takes_nothing_goes_behind_the_ones_that_have_not_tried() {
+        // The whole point of `miss`. Domain 1 is offered a turn and has nothing
+        // to fill it with, so the next turn goes to 2 and 3 rather than to 1
+        // again. Without this the head of the order never moves and the same
+        // barren domains are offered to the store on every ask forever.
+        let mut gate = Gate::new(Rate::new(20, 20));
+        for n in 1..=3 {
+            gate.note(pld(n));
+        }
+        gate.miss(pld(1), 5_000);
+
+        let ready: Vec<_> = gate.ready(5_000, 10).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(ready, vec![pld(2), pld(3), pld(1)]);
+        // A turn taken and not a request issued, so nothing was spent.
+        assert_eq!(gate.allowance(pld(1), 5_000), 20);
+    }
+
+    #[test]
+    fn a_domain_that_is_already_ahead_of_now_is_not_moved_back_by_a_miss() {
+        // A busy domain is ahead because it has spent burst, and setting its
+        // schedule to now would hand that burst back.
+        let mut gate = Gate::new(Rate::new(20, 20));
+        gate.note(pld(1));
+        gate.charge(pld(1), 20, 5_000);
+        assert_eq!(gate.next_ready_ms(pld(1)), Some(5_050));
+        gate.miss(pld(1), 5_000);
+        assert_eq!(gate.next_ready_ms(pld(1)), Some(5_050));
+    }
+
+    #[test]
+    fn a_miss_on_a_domain_nobody_is_scheduling_is_nothing() {
+        let mut gate = Gate::new(Rate::new(20, 20));
+        gate.miss(pld(1), 5_000);
+        assert_eq!(gate.len(), 0);
+        assert_eq!(gate.next_ready_ms(pld(1)), None);
     }
 
     #[test]
