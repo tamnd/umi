@@ -28,12 +28,12 @@
 //! first failure, because when a new backend first runs it the useful output is
 //! the whole list.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
-use umi_types::{CANON_VERSION, Digest, FetcherId, PldId, RowKey, Tier, Ulid};
+use umi_types::{CANON_VERSION, Digest, FetcherId, HostId, PldId, RowKey, Tier, Ulid};
 
 use crate::{
     BlockRow, Budget, Candidate, Discovery, FailureKind, FetchOutcome, FetchResult, HostRow,
@@ -242,6 +242,9 @@ where
     run!(shards_answers_the_domains_it_was_asked_about_and_no_others);
     run!(resident_is_sorted_and_free_of_duplicates);
     run!(a_domain_the_store_holds_a_url_for_is_local);
+    run!(hosts_of_an_empty_store_is_empty);
+    run!(hosts_names_every_host_a_url_was_admitted_for_once);
+    run!(hosts_stops_at_the_limit_it_was_given);
     run!(stats_account_for_what_was_admitted);
     run!(checkpoint_sequence_is_monotonic);
     run!(a_checkpoint_names_the_canonicalisation_its_keys_are_under);
@@ -2501,6 +2504,78 @@ async fn a_domain_the_store_holds_a_url_for_is_local(state: &dyn State) -> Outco
         ensure!(
             resident.contains(&pld),
             "{url} was admitted and its domain is not local: {resident:?}"
+        );
+    }
+    Ok(())
+}
+
+async fn hosts_of_an_empty_store_is_empty(state: &dyn State) -> Outcome {
+    let found = state
+        .hosts(10)
+        .await
+        .map_err(|e| format!("hosts failed: {e}"))?;
+    ensure!(
+        found.is_empty(),
+        "a store with nothing in it named {} hosts",
+        found.len()
+    );
+    Ok(())
+}
+
+async fn hosts_names_every_host_a_url_was_admitted_for_once(state: &dyn State) -> Outcome {
+    // What `umi prime` asks before a crawl starts, so the answer has to come
+    // from the ledger and not from the host table. Nothing here has been leased
+    // or completed, so no host has a record of its own yet, and a backend that
+    // reads the host table answers nothing.
+    let mut urls: Vec<String> = (0..5).map(host_url).collect();
+    // A sixth host with three URLs on it rather than one. A host is named once
+    // however many of its URLs are in the ledger, which is the whole point: a
+    // caller wants a set of hosts to look robots.txt up by.
+    urls.push(path_url(1));
+    urls.push(path_url(2));
+    urls.push(path_url(3));
+    admit_all(state, &urls).await?;
+
+    let found = state
+        .hosts(100)
+        .await
+        .map_err(|e| format!("hosts failed: {e}"))?;
+    let unique: BTreeSet<HostId> = found.iter().copied().collect();
+    ensure!(
+        unique.len() == found.len(),
+        "hosts repeated itself: {} names for {} hosts",
+        found.len(),
+        unique.len()
+    );
+    for url in &urls {
+        let host = key(url).host;
+        ensure!(
+            unique.contains(&host),
+            "{url} was admitted and its host is not in the list"
+        );
+    }
+    ensure!(
+        found.len() == 6,
+        "five hosts of one URL and one of three URLs is six hosts, got {}",
+        found.len()
+    );
+    Ok(())
+}
+
+async fn hosts_stops_at_the_limit_it_was_given(state: &dyn State) -> Outcome {
+    let urls: Vec<String> = (0..8).map(host_url).collect();
+    admit_all(state, &urls).await?;
+
+    for limit in [0, 1, 3, 8, 20] {
+        let found = state
+            .hosts(limit)
+            .await
+            .map_err(|e| format!("hosts({limit}) failed: {e}"))?;
+        let expected = limit.min(8);
+        ensure!(
+            found.len() == expected,
+            "hosts({limit}) over eight hosts gave {} names, expected {expected}",
+            found.len()
         );
     }
     Ok(())

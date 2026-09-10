@@ -460,6 +460,10 @@ impl State for Counted {
         self.inner.put_robots(docs).await
     }
 
+    async fn hosts(&self, limit: usize) -> Result<Vec<HostId>> {
+        self.inner.hosts(limit).await
+    }
+
     async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {
         self.inner.block(rows).await
     }

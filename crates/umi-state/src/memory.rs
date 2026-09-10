@@ -771,6 +771,23 @@ impl State for MemoryState {
         Ok(())
     }
 
+    async fn hosts(&self, limit: usize) -> Result<Vec<HostId>> {
+        let inner = self.lock();
+        // The ledger is ordered by `(pld, host, url)`, so a host's rows are
+        // contiguous and walking in order means only comparing against the last
+        // one to know whether this is a new host. No set, and no sort.
+        let mut found: Vec<HostId> = Vec::new();
+        for key in inner.ledger.keys() {
+            if found.last() != Some(&key.host) {
+                if found.len() == limit {
+                    break;
+                }
+                found.push(key.host);
+            }
+        }
+        Ok(found)
+    }
+
     async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {
         let mut inner = self.lock();
         let Inner { blocks, ledger, .. } = &mut *inner;

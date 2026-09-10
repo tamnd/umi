@@ -419,6 +419,18 @@ INSERT OR REPLACE INTO robots_documents (
     host, digest, fetched_ms, expires_ms, status, body
 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 
+/// Every distinct host the ledger holds a URL for.
+///
+/// A scan of the whole ledger and no index behind it, which is right rather
+/// than lazy. The primary key is `(pld, host, url_key)`, so the scan is
+/// sequential and each host's rows arrive together, and sqlite answers the
+/// `DISTINCT` from that ordering without building anything. An index on `host`
+/// alone would make this a shorter scan and would cost a write on every
+/// admission, which is a hot path, to speed up a command that runs once before
+/// a crawl starts.
+pub const LEDGER_HOSTS: &str = "
+SELECT DISTINCT host FROM ledger LIMIT ?1";
+
 /// Put an ETag in the pool and get back the reference a ledger row stores.
 ///
 /// The `DO UPDATE` looks pointless and is not. `DO NOTHING` makes the statement

@@ -591,6 +591,10 @@ impl State for SlowLease {
         self.inner.put_robots(docs).await
     }
 
+    async fn hosts(&self, limit: usize) -> umi_state::Result<Vec<umi_types::HostId>> {
+        self.inner.hosts(limit).await
+    }
+
     async fn block(
         &self,
         rows: &[umi_state::BlockRow],

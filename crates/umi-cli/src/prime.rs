@@ -66,6 +66,21 @@
 //! run that knows which hosts it is about to meet imports those and nothing
 //! else, which for that arm is about 35 MB instead of 7.7 GB and keeps every
 //! millisecond of the robots saving without any of the state cost.
+//!
+//! # Why there is a second way to spell the scope
+//!
+//! A seed file is the scope a run starts with and not the scope it ends with.
+//! The gate 3.1 seed names 20,000 hosts and the six minute arm above met 69,984
+//! of them, because a page links off its own host and the frontier admits what
+//! it finds. So a seed scoped prime loaded 2548 documents where it could have
+//! loaded most of 70,000, and robots stayed at 1441 ms of a 2911 ms page.
+//!
+//! `--for-ledger` is the scope a directory has already earned. It reads the
+//! distinct hosts out of the ledger, which is every host the frontier holds a
+//! URL for whether or not the crawl has reached it yet, so a directory that has
+//! run once knows far more about where it is going than its seed file did. The
+//! two flags union, so the usual spelling for a second run is both: the seed for
+//! the hosts it will start from and the ledger for the hosts it found last time.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -111,6 +126,16 @@ pub const TTL_HOURS: u64 = 24;
 /// bodies columns in memory next to a sqlite writer.
 pub const FILES: usize = 4;
 
+/// How many hosts a ledger scope will read before it stops.
+///
+/// A bound against surprise rather than a page size. A hundred million URLs at
+/// the twenty or so a host the gate 3.1 arms measured is a few million hosts,
+/// and a `HostId` is sixteen bytes, so eight million of them is 128 MB of set
+/// and well inside what any box in the fleet has. A ledger big enough to pass
+/// this is a ledger where the scope has stopped being a scope, and the right
+/// answer there is an unscoped import and a bigger disk.
+pub const MAX_SCOPE: usize = 8_000_000;
+
 /// The column holding a hostname.
 const HOST_COLUMN: &str = "host";
 
@@ -143,6 +168,11 @@ pub struct Options {
     /// run that will eventually meet everything and wrong for anything shorter.
     /// See this module's header for what the difference measured.
     pub wanted: Option<HashSet<HostId>>,
+    /// Add every host the directory's own ledger holds a URL for to the scope.
+    ///
+    /// Read once the state is open, so it costs nothing on a run that does not
+    /// ask for it and needs no ledger on a directory that has never crawled.
+    pub from_ledger: bool,
     /// Read the corpus, say what would be imported, and write nothing.
     pub dry_run: bool,
 }
@@ -156,6 +186,7 @@ impl Default for Options {
             max_body: MAX_BODY,
             ttl_hours: TTL_HOURS,
             wanted: None,
+            from_ledger: false,
             dry_run: false,
         }
     }
@@ -227,7 +258,8 @@ pub struct Primed {
 ///
 /// [`Error::Io`] when the directory has no `profile.toml`, which is what tells
 /// a crawl directory apart from any other directory, [`Error::NothingToDo`]
-/// when the corpus has no files in it, and whatever the hub or the state store
+/// when the corpus has no files in it or when a ledger scope is the only scope
+/// asked for and the ledger is empty, and whatever the hub or the state store
 /// reports.
 pub fn prime(options: &Options, publishing: Option<&Publishing>) -> Result<Primed, Error> {
     let layout = Layout::create(&options.dir)?;
@@ -244,7 +276,41 @@ pub fn prime(options: &Options, publishing: Option<&Publishing>) -> Result<Prime
         .build()
         .map_err(Error::Io)?;
 
-    runtime.block_on(read(options, &*state, publishing, &mut log))
+    runtime.block_on(async {
+        let options = widen(options, &*state, &mut log).await?;
+        read(&options, &*state, publishing, &mut log).await
+    })
+}
+
+/// The scope the operator asked for plus the one the ledger knows about.
+///
+/// Owned rather than borrowed because a ledger scope is built here and the
+/// caller's options are shared. A run without `--for-ledger` clones a struct
+/// that is four small fields and a set it already had, which is not worth an
+/// enum to avoid.
+async fn widen(
+    options: &Options,
+    state: &dyn State,
+    log: &mut crawl::Log,
+) -> Result<Options, Error> {
+    let mut options = options.clone();
+    if !options.from_ledger {
+        return Ok(options);
+    }
+    let found = state
+        .hosts(MAX_SCOPE)
+        .await
+        .map_err(|e| Error::State(e.to_string()))?;
+    log.line(&format!("the ledger holds {} hosts", found.len()))?;
+    let scope = options.wanted.get_or_insert_with(HashSet::new);
+    scope.extend(found);
+    // An empty scope is not an unscoped import, it is an import of nothing, so
+    // it is worth stopping for. The usual cause is asking a directory that has
+    // never crawled, where the answer is `--for-seed` until it has.
+    if scope.is_empty() {
+        return Err(Error::NothingToDo("the ledger holds no hosts"));
+    }
+    Ok(options)
 }
 
 /// The whole of a run, once there is a runtime to do it on.

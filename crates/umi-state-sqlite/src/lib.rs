@@ -1451,6 +1451,23 @@ impl State for SqliteState {
         })
     }
 
+    async fn hosts(&self, limit: usize) -> Result<Vec<HostId>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        blocking(|| {
+            let guard = self.lock();
+            let mut select = guard.conn.prepare_cached(sql::LEDGER_HOSTS).state()?;
+            let mut found = Vec::new();
+            let mut rows = select.query(params![limit as i64]).state()?;
+            while let Some(row) = rows.next().state()? {
+                found.push(row::host(row, "host").state()?);
+            }
+            Ok(found)
+        })
+    }
+
     async fn put_host(&self, rows: &[HostRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
