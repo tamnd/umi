@@ -1486,12 +1486,13 @@ async fn the_loop_keeps_fetching_while_the_next_ask_is_on_its_way() {
     // million. Every one of those seconds is the window draining with nothing
     // to refill it.
     //
-    // A hundred and twenty eight urls through a window of sixteen, so eight
-    // asks, each taking thirty milliseconds against a window that takes forty
-    // to work through. Seven of the eight have a full queue to hide behind.
-    // The first cannot: a tick with nothing in hand has to wait for its first
-    // ask, and that is the one this asserts around.
-    let (urls, canned) = a_page_each(128);
+    // An ask is RUNWAY windows, so five hundred and twelve urls through a
+    // window of sixteen is eight asks, each taking thirty milliseconds against
+    // four windows that take a hundred and sixty to work through. Seven of the
+    // eight have a full queue to hide behind. The first cannot: a tick with
+    // nothing in hand has to wait for its first ask, and that is the one this
+    // asserts around.
+    let (urls, canned) = a_page_each(512);
     let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
     let state: Arc<dyn State> = Arc::new(SlowLease {
         inner: MemoryState::new(),
@@ -1516,7 +1517,7 @@ async fn the_loop_keeps_fetching_while_the_next_ask_is_on_its_way() {
         state,
         Arc::new(FixedClock::at(T0)),
         CrawlConfig {
-            batch: 128,
+            batch: 512,
             in_flight: 16,
             ..config()
         },
@@ -1526,11 +1527,11 @@ async fn the_loop_keeps_fetching_while_the_next_ask_is_on_its_way() {
         .tick(&Arc::new(Collected::default()))
         .await
         .expect("tick");
-    assert_eq!(report.fetched, 128, "{report:?}");
+    assert_eq!(report.fetched, 512, "{report:?}");
     assert!(
         report.asks >= 8,
-        "a window of sixteen over a batch of a hundred and twenty eight is eight \
-         asks and this made {}",
+        "an ask of four sixteens over a batch of five hundred and twelve is \
+         eight asks and this made {}",
         report.asks
     );
     assert!(
