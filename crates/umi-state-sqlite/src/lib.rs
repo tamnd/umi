@@ -79,6 +79,7 @@ use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKey
 
 mod row;
 mod schema;
+mod seen;
 mod sql;
 
 #[cfg(test)]
@@ -202,6 +203,11 @@ struct Inner {
     /// step by `supervise`, because the lease path cannot afford a query per
     /// url any more than the block check can.
     supervised_plds: HashSet<PldId>,
+    /// URLs this process has already written into the seen table, so that
+    /// admitting the same link off the thousandth page of a site costs a hash
+    /// lookup rather than a descent into a b-tree that does not fit in cache.
+    /// Bounded and lossy on purpose. See [`seen`].
+    seen: seen::Seen,
     next_lease: u64,
     checkpoint_seq: u64,
 }
@@ -273,6 +279,7 @@ impl SqliteState {
                 blocked,
                 blocked_plds,
                 supervised_plds,
+                seen: seen::Seen::default(),
                 next_lease,
                 checkpoint_seq,
             }),
@@ -725,11 +732,15 @@ impl State for SqliteState {
                 conn,
                 blocked,
                 blocked_plds,
+                seen,
                 ..
             } = &mut *guard;
             set_sync(conn, Sync::Buffered)?;
             let tx = conn.transaction().state()?;
             let mut report = AdmitReport::default();
+            // Keys this batch wrote, held back until the commit lands. See the
+            // `seen` module for why they cannot go in before then.
+            let mut wrote: Vec<UrlKey> = Vec::new();
 
             // A batch is the links off a page, so it arrives in the order a
             // human wrote the anchors, and both tables it lands in are keyed on
@@ -759,6 +770,15 @@ impl State for SqliteState {
                 let mut see = tx.prepare_cached(sql::INSERT_SEEN).state()?;
                 for &index in &order {
                     let candidate = &batch[index];
+                    // The insert is the expensive half of admitting a link and
+                    // most of the time it does nothing, so a url this process
+                    // has already written is answered from memory. A key that
+                    // is not remembered still goes to the table, so the table
+                    // is what decides and this only ever saves work.
+                    if seen.holds(candidate.key.url) {
+                        report.seen += 1;
+                        continue;
+                    }
                     if see
                         .execute(params![&candidate.key.url.as_bytes()[..]])
                         .state()?
@@ -768,6 +788,7 @@ impl State for SqliteState {
                     } else {
                         fresh[index] = true;
                     }
+                    wrote.push(candidate.key.url);
                 }
             }
 
@@ -843,6 +864,12 @@ impl State for SqliteState {
             }
 
             tx.commit().state()?;
+            // After the commit and not before it. Until this returns the rows
+            // are not in the table, and a key remembered for a batch that
+            // rolled back would be a url dropped for good.
+            for key in wrote {
+                seen.keep(key);
+            }
             // One file, no cold tier, so nothing was ever warmed. Doc 08.4 is
             // explicit that this is zero on a backend that does not shard, and
             // reporting anything else would make the operator's cache miss rate
