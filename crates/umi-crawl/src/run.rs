@@ -709,6 +709,15 @@ impl Default for CrawlConfig {
 pub struct TickReport {
     /// Leases taken.
     pub leased: usize,
+    /// How many times the tick's batch rolled over into another one.
+    ///
+    /// Zero on a tick with no deadline, which is the caller asking for one
+    /// batch and getting it. On a tick with a deadline the batch is a
+    /// granularity for doc 15.3's ladder and the tick runs to the deadline, so
+    /// this is how many times the ladder was re-read and found to be where it
+    /// was. A tick that ends early with a deadline still in the future ended
+    /// because the ladder moved, and this says how far it got first.
+    pub batches: usize,
     /// Rows produced, which is one per lease that got as far as an answer.
     pub rows: usize,
     /// Fetches that produced a body.
@@ -1639,6 +1648,32 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                     done.outcome.key.host,
                     done.outcome.finished_ms.saturating_add(u64::from(after)),
                 );
+            }
+            // The batch is a granularity for doc 15.3's ladder, not a reason to
+            // stop fetching. A tick that has spent its batch stops replacing,
+            // the window drains to its slowest lease, and the store's last
+            // flush runs with nothing on the wire. Measured on server3 at a
+            // batch of 65,536 and 250 pages a second: the window went from
+            // 1024 in flight to 15 to 2 and stayed there, and the six minute
+            // run averaged 203 a second against a steady state of 277.
+            //
+            // So when there is a deadline and it has not arrived, the batch
+            // rolls over instead. The ladder is re-read at exactly the moment
+            // it used to be, which is the batch boundary, and the reason the
+            // old code did not re-read it mid tick still holds: a batch leased
+            // under one set of rules and fetched under another is neither. If
+            // it has moved, the tick ends here the way it always did and the
+            // next one is sized by the new answer, window and all.
+            //
+            // No deadline means the caller asked for one batch, so one batch
+            // is what it gets.
+            if supply.left == 0
+                && supply.asking.is_none()
+                && until.is_some_and(|at| Instant::now() < at)
+                && self.allowance() == allowance
+            {
+                supply.left = batch;
+                report.batches += 1;
             }
             let replace_from = Instant::now();
             let next = self

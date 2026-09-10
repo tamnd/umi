@@ -1478,6 +1478,67 @@ async fn a_store_that_falls_behind_gets_a_wider_batch_rather_than_the_loop() {
 }
 
 #[tokio::test]
+async fn a_batch_that_runs_out_rolls_over_rather_than_draining_the_window() {
+    // A tick used to stop replacing the moment its batch was spent, so the
+    // window drained to its slowest lease and the store's last flush ran with
+    // nothing on the wire. On server3 at a batch of 65,536 the window went from
+    // 1024 in flight to 15 to 2 and stayed there, and a six minute run averaged
+    // 203 pages a second against a steady state of 277.
+    //
+    // Sixty four urls through a batch of sixteen is three rollovers. The
+    // deadline is far enough away that it is not what ends the tick, so what
+    // ends it is running out of frontier, and everything gets fetched.
+    let (urls, canned) = a_page_each(64);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let crawler = Crawler::new(
+        canned,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            batch: 16,
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let sink = Arc::new(Collected::default());
+    let until = Instant::now() + Duration::from_secs(60);
+    let report = crawler.tick_until(&sink, Some(until)).await.expect("tick");
+    assert_eq!(report.leased, 64, "{report:?}");
+    assert_eq!(report.rows, 64, "{report:?}");
+    // Three to get through the frontier and a fourth that rolls over into an
+    // empty one and ends the tick, which is why this is a floor. The failure it
+    // catches is zero, and zero is sixteen rows.
+    assert!(report.batches >= 3, "{report:?}");
+}
+
+#[tokio::test]
+async fn a_tick_with_no_deadline_still_takes_one_batch_and_stops() {
+    // The other half of the rollover. A caller with no deadline asked for one
+    // batch, so one batch is what it gets, and the urls it did not take are
+    // still there for the next tick.
+    let (urls, canned) = a_page_each(64);
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let state = seeded(&refs).await;
+    let crawler = Crawler::new(
+        canned,
+        state,
+        Arc::new(FixedClock::at(T0)),
+        CrawlConfig {
+            batch: 16,
+            in_flight: 4,
+            ..config()
+        },
+    );
+
+    let sink = Arc::new(Collected::default());
+    let report = crawler.tick_until(&sink, None).await.expect("tick");
+    assert_eq!(report.leased, 16, "{report:?}");
+    assert_eq!(report.batches, 0, "{report:?}");
+}
+
+#[tokio::test]
 async fn the_loop_keeps_fetching_while_the_next_ask_is_on_its_way() {
     // The ask is a scan of the store and it is what is left on the loop task
     // after #177. On server3 it was thirty seconds of a sixty second tick, and
