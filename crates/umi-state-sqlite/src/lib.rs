@@ -1046,7 +1046,13 @@ impl State for SqliteState {
             // at the stored timer and moves forward by the host's delay for
             // every lease handed out, so a fetcher holding eight urls for one
             // host is told to space them out rather than trusted to.
-            let mut clock: HashMap<HostId, u64> = HashMap::new();
+            // Keyed by host and carrying the pld, because the row that puts a
+            // host in here is the only place the pld is to hand and the write
+            // below needs both. Looking it up again afterwards means a search of
+            // the batch per host, which on a batch that is a thousand urls over
+            // nearly a thousand hosts is a million comparisons for a value we
+            // already had.
+            let mut clock: HashMap<HostId, (u64, PldId)> = HashMap::new();
             let mut leases = Vec::with_capacity(chosen.len());
 
             {
@@ -1054,9 +1060,9 @@ impl State for SqliteState {
                 for row in &chosen {
                     let slot = clock
                         .entry(row.key.host)
-                        .or_insert_with(|| row.next_allowed_ms.max(req.now_ms));
-                    let not_before_ms = *slot;
-                    *slot = not_before_ms.saturating_add(row.delay_ms);
+                        .or_insert_with(|| (row.next_allowed_ms.max(req.now_ms), row.key.pld));
+                    let not_before_ms = slot.0;
+                    slot.0 = not_before_ms.saturating_add(row.delay_ms);
 
                     inner.next_lease += 1;
                     let id = LeaseId::from_raw(inner.next_lease);
@@ -1105,11 +1111,7 @@ impl State for SqliteState {
             // host, because a second lease is not issued.
             {
                 let mut bump = tx.prepare_cached(sql::BUMP_HOST_CLOCK).state()?;
-                for (host, next_allowed_ms) in &clock {
-                    let pld = chosen
-                        .iter()
-                        .find(|row| row.key.host == *host)
-                        .map_or_else(PldId::default, |row| row.key.pld);
+                for (host, (next_allowed_ms, pld)) in &clock {
                     bump.execute(params![
                         &host.as_bytes()[..],
                         &pld.as_bytes()[..],
