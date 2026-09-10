@@ -233,11 +233,52 @@ async fn a_domain_that_takes_nothing_is_not_charged_for_it() {
                 .is_empty()
         );
     }
-    // The schedule was never advanced, so it is still where a domain that has
-    // not been fetched starts.
-    assert_eq!(front.next_ready_ms(pld), Some(0));
+    // Fifty looks and the domain has its whole burst, because none of them
+    // issued a request. Its place in the order moved, which is `Gate::miss`
+    // and a separate thing from what it may spend.
+    assert_eq!(front.allowance(pld, T0 + 5_000), Some(20));
     let leases = front.tick(&Ask::new(T0 + 5_000, 8)).await.expect("tick");
     assert_eq!(leases.len(), 1);
+}
+
+#[tokio::test]
+async fn a_barren_domain_does_not_hold_the_head_of_the_queue() {
+    // The failure this is here to stop. A tick offers the store the domains at
+    // the head of the order, and a domain leaves the head by being charged for
+    // work it took. A domain with nothing to give takes nothing, so it is
+    // charged nothing, so it is still at the head on the next ask and the one
+    // after that. Two of those and a tick that visits two domains never sees a
+    // third, however much work is sitting behind them.
+    let front = frontier(Config {
+        max_domains: 2,
+        ..Config::default()
+    });
+    let urls: Vec<String> = (0..6).map(|d| format!("https://b{d}.example/p")).collect();
+    let links: Vec<&str> = urls.iter().map(String::as_str).collect();
+    front.seed(&links, T0).await.expect("seed");
+
+    // Everything but the domain that sorts last, so the tick has to work its
+    // way past every barren one to reach the only one holding work.
+    let mut order: Vec<(PldId, &String)> = urls.iter().map(|u| (pld_of(u), u)).collect();
+    order.sort_unstable();
+    let shut: Vec<HostRow> = order[..5]
+        .iter()
+        .map(|(pld, url)| HostRow {
+            next_allowed_ms: T0 + 1_000_000,
+            ..HostRow::new(host_of(url), *pld)
+        })
+        .collect();
+    front.state().put_host(&shut).await.expect("put host");
+
+    let mut leased = 0;
+    for step in 0..6 {
+        leased += front
+            .tick(&Ask::new(T0 + step * 10, 8))
+            .await
+            .expect("tick")
+            .len();
+    }
+    assert_eq!(leased, 1, "the one domain holding work never got a turn");
 }
 
 #[tokio::test]

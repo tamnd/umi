@@ -3577,6 +3577,7 @@ dependencies = [
  "async-trait",
  "tokio",
  "umi-state",
+ "umi-state-sqlite",
  "umi-types",
 ]
 

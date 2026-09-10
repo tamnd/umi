@@ -19,6 +19,10 @@ umi-types = { workspace = true }
 [dev-dependencies]
 async-trait = { workspace = true }
 tokio = { workspace = true }
+# For the `ask` example only, which points the scheduler at a real crawl
+# directory. Nothing in the crate itself knows which backend it is sitting on
+# and this does not change that.
+umi-state-sqlite = { workspace = true }
 
 # Not criterion. The question doc 16 gate 1.1 asks is leases per second against
 # a store, and the answer is a count over a wall clock interval rather than a
