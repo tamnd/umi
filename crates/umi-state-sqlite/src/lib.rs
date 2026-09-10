@@ -1192,11 +1192,20 @@ impl State for SqliteState {
             // of them is an observation of anything.
             let mut landed = vec![false; outcomes.len()];
 
+            // Prepared once for the batch rather than once per completion, the
+            // same as `admit` does. The statement cache is a short list that is
+            // searched by comparing the sql text, so asking it for a statement
+            // inside the loop is a string compare against every other statement
+            // checked out on the way past. That is nothing on a batch of ten and
+            // it is three lookups per url on a batch of eight thousand.
+            let mut select = tx.prepare_cached(sql::SELECT_LEDGER).state()?;
+            let mut update = tx.prepare_cached(sql::UPDATE_LEDGER).state()?;
+            let mut clear = tx.prepare_cached(sql::CLEAR_LEASE).state()?;
+            let mut select_pace = tx.prepare_cached(sql::SELECT_PACE).state()?;
+
             for &at in &order {
                 let outcome = &outcomes[at];
-                let before: Option<LedgerRow> = tx
-                    .prepare_cached(sql::SELECT_LEDGER)
-                    .state()?
+                let before: Option<LedgerRow> = select
                     .query_row(
                         params![
                             &outcome.key.pld.as_bytes()[..],
@@ -1221,8 +1230,7 @@ impl State for SqliteState {
                 // lease that already expired still lands, because the page
                 // really was fetched.
                 if outcome.finished_ms <= before.last_fetch_ms {
-                    tx.prepare_cached(sql::CLEAR_LEASE)
-                        .state()?
+                    clear
                         .execute(params![row::to_ms(outcome.lease.raw())])
                         .state()?;
                     continue;
@@ -1336,8 +1344,7 @@ impl State for SqliteState {
                     row.next_due_ms = u64::MAX;
                 }
 
-                tx.prepare_cached(sql::UPDATE_LEDGER)
-                    .state()?
+                update
                     .execute(params![
                         i64::from(row.priority.raw()),
                         i64::from(row.state as u8),
@@ -1381,9 +1388,7 @@ impl State for SqliteState {
                 let seat = match paced.entry(outcome.key.host) {
                     Entry::Occupied(seat) => seat.into_mut(),
                     Entry::Vacant(seat) => {
-                        let stored = tx
-                            .prepare_cached(sql::SELECT_PACE)
-                            .state()?
+                        let stored = select_pace
                             .query_row(params![&outcome.key.host.as_bytes()[..]], |read| {
                                 row::pacing(read, outcome.key.host)
                             })
@@ -1398,6 +1403,10 @@ impl State for SqliteState {
                     .0
                     .observe(&outcome.result, outcome.pace, outcome.finished_ms);
             }
+
+            // Back into the cache before the commit, which takes the transaction
+            // by value and so cannot happen while a statement is still out.
+            drop((select, update, clear, select_pace));
 
             {
                 // In key order for the same reason the ledger is, and cheaper
