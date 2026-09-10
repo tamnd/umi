@@ -238,6 +238,11 @@ enum Command {
         /// more in state time than it saves in robots time.
         #[arg(long, value_name = "FILE")]
         for_seed: Option<String>,
+        /// Import the hosts this directory's own ledger holds a URL for. The
+        /// answer for a directory that has already crawled, because a run meets
+        /// several times the hosts its seed named. Unions with --for-seed.
+        #[arg(long)]
+        for_ledger: bool,
         /// Say what would be imported and import none of it.
         #[arg(long)]
         dry_run: bool,
@@ -877,6 +882,7 @@ fn run(command: &Command) -> Result<(), Error> {
             max_body,
             ttl_hours,
             for_seed,
+            for_ledger,
             dry_run,
         } => {
             // A token when the config has one and none when it does not. The
@@ -895,6 +901,7 @@ fn run(command: &Command) -> Result<(), Error> {
                     max_body: *max_body,
                     ttl_hours: *ttl_hours,
                     wanted,
+                    from_ledger: *for_ledger,
                     dry_run: *dry_run,
                 },
                 publishing.as_ref(),

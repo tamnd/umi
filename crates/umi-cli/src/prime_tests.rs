@@ -14,7 +14,7 @@ use umi_state::{RobotsDoc, State};
 use umi_state_sqlite::SqliteState;
 use umi_types::HostId;
 
-use crate::prime::{Options, Primed, Row, candidate, hosts_in, write};
+use crate::prime::{Options, Primed, Row, candidate, hosts_in, widen, write};
 
 /// The moment every row in this file is dated from.
 const T0: u64 = 1_760_000_000_000;
@@ -274,4 +274,104 @@ async fn a_dry_run_counts_and_writes_nothing() {
     // before paying for it.
     assert_eq!(done.imported, 1);
     assert!(state.robots(&[host]).await.expect("robots").is_empty());
+}
+
+/// A log to hand `widen`, in a directory of its own.
+fn log(dir: &tempfile::TempDir) -> crate::crawl::Log {
+    crate::crawl::Log::open(&dir.path().join("umi.log")).expect("log")
+}
+
+/// Put `urls` in a store's ledger, which is where a ledger scope reads from.
+async fn admit(state: &SqliteState, urls: &[&str]) {
+    let batch: Vec<umi_state::Candidate<'_>> = urls
+        .iter()
+        .map(|url| umi_state::Candidate {
+            key: umi_types::RowKey::for_url(url, None).expect("canon"),
+            url,
+            depth: 1,
+            priority: umi_state::Priority::DEFAULT,
+            discovered_ms: T0,
+            discovery: umi_state::Discovery::Trusted,
+            lastmod_ms: None,
+        })
+        .collect();
+    state.admit(&batch).await.expect("admit");
+}
+
+#[tokio::test]
+async fn a_run_without_the_flag_does_not_read_the_ledger() {
+    let (dir, state) = store();
+    admit(&state, &["https://ledger.example/a"]).await;
+
+    let widened = widen(&Options::default(), &state, &mut log(&dir))
+        .await
+        .expect("widen");
+
+    // No scope, so the import is the unscoped one, and the ledger being full of
+    // hosts does not quietly turn that into a scoped run.
+    assert!(widened.wanted.is_none());
+}
+
+#[tokio::test]
+async fn a_ledger_scope_names_the_hosts_the_ledger_holds() {
+    let (dir, state) = store();
+    admit(
+        &state,
+        &[
+            "https://one.example/a",
+            "https://one.example/b",
+            "https://two.example/a",
+        ],
+    )
+    .await;
+
+    let options = Options {
+        from_ledger: true,
+        ..Options::default()
+    };
+    let widened = widen(&options, &state, &mut log(&dir))
+        .await
+        .expect("widen");
+
+    let scope = widened.wanted.expect("a ledger scope is a scope");
+    assert_eq!(scope.len(), 2);
+    assert!(scope.contains(&HostId::derive(b"one.example")));
+    assert!(scope.contains(&HostId::derive(b"two.example")));
+}
+
+#[tokio::test]
+async fn a_ledger_scope_and_a_seed_scope_union() {
+    let (dir, state) = store();
+    admit(&state, &["https://ledger.example/a"]).await;
+
+    let options = Options {
+        from_ledger: true,
+        wanted: Some(HashSet::from([HostId::derive(b"seed.example")])),
+        ..Options::default()
+    };
+    let widened = widen(&options, &state, &mut log(&dir))
+        .await
+        .expect("widen");
+
+    // Both, because the second run of a directory wants the hosts it starts
+    // from and the hosts it found last time.
+    let scope = widened.wanted.expect("a scope");
+    assert_eq!(scope.len(), 2);
+    assert!(scope.contains(&HostId::derive(b"seed.example")));
+    assert!(scope.contains(&HostId::derive(b"ledger.example")));
+}
+
+#[tokio::test]
+async fn a_ledger_scope_on_an_empty_ledger_is_not_an_empty_scope() {
+    let (dir, state) = store();
+    let options = Options {
+        from_ledger: true,
+        ..Options::default()
+    };
+
+    // An empty scope would import nothing and report success, which reads like
+    // a corpus problem and is not one. Asking a directory that has never
+    // crawled is the usual way to get here.
+    let refused = widen(&options, &state, &mut log(&dir)).await;
+    assert!(matches!(refused, Err(crate::Error::NothingToDo(_))));
 }

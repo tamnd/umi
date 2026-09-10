@@ -366,6 +366,28 @@ pub trait State: Send + Sync + 'static {
     /// the batch, and whatever the store reports otherwise.
     async fn put_robots(&self, docs: &[RobotsDoc]) -> Result<()>;
 
+    /// Every distinct host the ledger holds a URL for, up to `limit` of them.
+    ///
+    /// The question a robots prime asks: which hosts is this directory going to
+    /// meet. The ledger is the honest answer and the host table is not, because
+    /// a host gets a row there when the crawl reaches it and the whole point of
+    /// priming is to have the answer before that.
+    ///
+    /// One call and no paging. The ordering doc 08.2 stores rows in is
+    /// `(pld, host, url)`, so there is no index that hands hosts back in host
+    /// order, and paging by host would sort the ledger once per page. A count
+    /// of hosts is small next to a count of URLs, on the order of a few million
+    /// against a few hundred million, so the whole list fits in memory and
+    /// `limit` is a bound against surprise rather than a page size.
+    ///
+    /// Order is unspecified. A caller wanting a set gets one from this and
+    /// nothing about the order it arrives in matters to that.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the store reports.
+    async fn hosts(&self, limit: usize) -> Result<Vec<HostId>>;
+
     /// Stop crawling a domain, or record that a block has been lifted.
     ///
     /// Doc 07.7's mechanism. A block takes a domain out of the frontier, keeps
@@ -768,6 +790,10 @@ impl<T: State + ?Sized> State for std::sync::Arc<T> {
 
     async fn put_robots(&self, docs: &[RobotsDoc]) -> Result<()> {
         (**self).put_robots(docs).await
+    }
+
+    async fn hosts(&self, limit: usize) -> Result<Vec<HostId>> {
+        (**self).hosts(limit).await
     }
 
     async fn block(&self, rows: &[BlockRow]) -> Result<BlockReport> {
