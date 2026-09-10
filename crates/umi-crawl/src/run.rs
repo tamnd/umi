@@ -142,6 +142,26 @@ const SLACK: usize = 4;
 /// a crawl that cannot start is worse than one that starts slowly.
 const STEP_ASIDE: usize = 16;
 
+/// How many fetch windows of leases the loop tries to keep in hand.
+///
+/// An ask used to be exactly one window, which sounds right and is not. The
+/// queue then holds at most one window of runway, the ask that refills it takes
+/// as long as it takes, and a loop that drains its runway before the answer
+/// lands stops dead with every socket in the window idle. On server3 at 1024 in
+/// flight that was 26 seconds of a two minute tick spent inside `take_ask` with
+/// nothing on the wire, and the fetches were not the slow part.
+///
+/// Four windows because the two costs pull opposite ways and neither is steep.
+/// An ask has a fixed price in it, a durable transaction and six cursors opened
+/// against the ledger, so asking for four times as much does not cost four
+/// times as much: on the same box a thousand leases cost 2.4 seconds and four
+/// thousand cost about 4. Against that, leases sit in the queue holding a
+/// politeness slot on their host while they wait, so a queue deeper than the
+/// crawl can work through is a queue whose tail is stale. Four is one ask in
+/// flight and three windows of work behind it, which is enough runway that the
+/// loop never waits and short enough that the tail is seconds old.
+const RUNWAY: usize = 4;
+
 /// The earliest a host may be asked again, for the leases a tick is still
 /// holding.
 ///
@@ -317,7 +337,18 @@ struct Supply {
     /// wasted scan per half window rather than one per page, and it bounds the
     /// wasted scans on a genuinely empty frontier at two before the window
     /// drains and the tick ends.
+    ///
+    /// Half a window and not half an ask. The ask is several windows wide now,
+    /// see [`RUNWAY`], and half of it would be most of a batch: a single empty
+    /// answer would stop the tick asking again for as long as it had work, and
+    /// on a real crawl an empty answer is a second old at most.
     patience: usize,
+    /// How wide the fetch window is, which is what an ask is measured against.
+    ///
+    /// Here rather than a parameter because [`Shared::next_lease`] and
+    /// [`Shared::send_ask`] both need it and both need [`RUNWAY`] applied to
+    /// it, and two callers doing the same multiplication is how the two drift.
+    window: usize,
     /// The ask already on its way back, if there is one.
     asking: Option<Asking>,
     /// What picking from this queue has cost so far.
@@ -1506,14 +1537,6 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             warmed: &warmed,
         };
         let mut pending = FuturesUnordered::new();
-        let mut supply = Supply {
-            queue: VecDeque::new(),
-            left: batch,
-            patience: 0,
-            asking: None,
-            picking: Picking::default(),
-            until,
-        };
 
         // Fill the window, then top it up as each one lands, which is what
         // keeps every slot busy rather than waiting on the slowest of a chunk.
@@ -1524,6 +1547,15 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             u32::try_from(self.config.in_flight).unwrap_or(u32::MAX),
             allowance.lease_scale,
         ) as usize;
+        let mut supply = Supply {
+            queue: VecDeque::new(),
+            left: batch,
+            patience: 0,
+            asking: None,
+            picking: Picking::default(),
+            until,
+            window,
+        };
         let mut held = Held::new(window);
         // One store outstanding at a time, and never two. Doc 16's gate 1.3
         // rule is that a row is on disk before the completion that says we have
@@ -1547,7 +1579,6 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 .next_lease(
                     &mut supply,
                     &allowance,
-                    window,
                     &mut deferred,
                     &warming,
                     &mut report,
@@ -1614,7 +1645,6 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 .next_lease(
                     &mut supply,
                     &allowance,
-                    window,
                     &mut deferred,
                     &warming,
                     &mut report,
@@ -2022,7 +2052,6 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         &self,
         supply: &mut Supply,
         allowance: &Allowance,
-        chunk: usize,
         deferred: &mut Vec<LeaseId>,
         warming: &Warming<'_>,
         report: &mut TickReport,
@@ -2044,14 +2073,14 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             if let Some(next) = gated {
                 // Below one ask's worth, which in the steady state means there
                 // is always exactly one ask in flight. A queue holding a full
-                // ask is a window's worth of fetching in hand, which is the
+                // ask is [`RUNWAY`] windows of fetching in hand, which is the
                 // runway the next ask has to come back inside, and an ask that
                 // takes longer than that is one this tick has to wait for
                 // however early it was sent. Waiting until the queue is nearly
                 // empty is the old behaviour with extra steps: the runway is
                 // then whatever is left, which is nothing.
-                if supply.queue.len() < chunk {
-                    self.send_ask(supply, allowance, chunk);
+                if supply.queue.len() < supply.window.saturating_mul(RUNWAY) {
+                    self.send_ask(supply, allowance);
                 }
                 return Ok(Some(next));
             }
@@ -2059,7 +2088,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 if supply.patience > 0 || supply.left == 0 {
                     return Ok(None);
                 }
-                self.send_ask(supply, allowance, chunk);
+                self.send_ask(supply, allowance);
                 // `send_ask` declines for exactly the reasons ruled out above,
                 // so this cannot happen. It is one branch against an infinite
                 // loop if that ever stops being true.
@@ -2068,7 +2097,7 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
                 }
             }
             if self.take_ask(supply, warming, report).await? == 0 {
-                supply.patience = (chunk / 2).max(1);
+                supply.patience = (supply.window / 2).max(1);
                 return Ok(None);
             }
         }
@@ -2078,10 +2107,11 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
     ///
     /// Takes its share of the tick's allowance now rather than when the answer
     /// comes back. See [`Asking::reserved`].
-    fn send_ask(&self, supply: &mut Supply, allowance: &Allowance, chunk: usize) {
+    fn send_ask(&self, supply: &mut Supply, allowance: &Allowance) {
         if supply.asking.is_some() || supply.patience > 0 || supply.left == 0 {
             return;
         }
+        let chunk = supply.window.saturating_mul(RUNWAY);
         let want = u32::try_from(chunk).unwrap_or(u32::MAX).min(supply.left);
         supply.left -= want;
         let shared = Arc::clone(&self.shared);
