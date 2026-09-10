@@ -50,6 +50,16 @@
 //! takes effect immediately and costs nothing, so the two promises can share one
 //! connection.
 //!
+//! # Sizing
+//!
+//! The pager is sized from the box rather than from a constant, because doc
+//! 08.5 asks for a mapping the size of available memory and doc 08's ceiling
+//! note puts the end of this backend at the moment the seen set index stops
+//! fitting in page cache. [`SqliteConfig::at`] takes one reading of
+//! `MemAvailable` and gives the cache a quarter of it and the mapping all of
+//! it, within floors and ceilings that keep both sensible. A box with no
+//! reading to give keeps the old constants.
+//!
 //! # Blocking
 //!
 //! SQLite is synchronous. Every method here does its work under
@@ -77,6 +87,7 @@ use umi_state::{
 };
 use umi_types::{CANON_VERSION, Digest, HostId, PldId, RowKey, Tier, Ulid, UrlKey, UrlKeyFull};
 
+mod machine;
 mod row;
 mod schema;
 mod seen;
@@ -155,13 +166,56 @@ impl Default for SqliteConfig {
     }
 }
 
+/// The largest page cache this will ask for, whatever the box has free.
+///
+/// The cache is heap and it is the writer's heap, so it is competing with the
+/// fetch window and everything else in the process. Two gigabytes covers the
+/// interior of both hot b-trees at doc 08's hundred million url ceiling, which
+/// is the point of having it, and going past that buys pages that are already
+/// in the mapping.
+const CACHE_CEILING: u64 = 2 * 1024 * 1024 * 1024;
+
+/// The largest mapping this will ask for.
+///
+/// SQLite maps the smaller of this and the file, so on a young crawl it is not
+/// the number that decides. It is address space rather than memory and the
+/// kernel evicts from it under pressure, so the ceiling is only here to keep
+/// the pragma from being absurd on a box with a terabyte of RAM.
+const MMAP_CEILING: u64 = 32 * 1024 * 1024 * 1024;
+
 impl SqliteConfig {
-    /// A configuration for a store at `path`, with the default sizing.
+    /// A configuration for a store at `path`, sized from what the box has free.
+    ///
+    /// Doc 08.5 asks for `mmap_size` to be the smaller of the file size and
+    /// available memory, and SQLite already takes the smaller of the mapping
+    /// and the file, so what is passed here is the memory half of that. The
+    /// page cache gets a quarter of the same reading, because it is heap and
+    /// it is sharing the process with a thousand sockets in flight.
+    ///
+    /// A machine that gives no reading keeps the conservative constants from
+    /// [`Default`], which is what every box got before this and is right for a
+    /// laptop. Today the reading is Linux only and everywhere else keeps them.
+    ///
+    /// The reading is taken once, when the configuration is built, and not
+    /// again. A pager sized against the memory of half an hour ago is a
+    /// slightly stale answer to a question that does not move quickly, and
+    /// re-reading it would mean a cache that shrinks under exactly the load
+    /// that needs it.
     #[must_use]
     pub fn at(path: impl Into<PathBuf>) -> Self {
+        let base = Self::default();
+        let (cache_bytes, mmap_bytes) = match machine::available_bytes() {
+            Some(available) => (
+                (available / 4).clamp(base.cache_bytes, CACHE_CEILING),
+                available.clamp(base.mmap_bytes, MMAP_CEILING),
+            ),
+            None => (base.cache_bytes, base.mmap_bytes),
+        };
         Self {
             path: Some(path.into()),
-            ..Self::default()
+            cache_bytes,
+            mmap_bytes,
+            ..base
         }
     }
 

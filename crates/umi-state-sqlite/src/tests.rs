@@ -625,6 +625,30 @@ async fn a_checkpoint_is_a_database_of_its_own() {
     drop(dir);
 }
 
+#[test]
+fn sizing_from_the_machine_is_never_smaller_than_the_constant_it_replaced() {
+    // The reading is a floor and a ceiling over the old defaults, so this holds
+    // on a box with a reading and on one without, which is what makes it worth
+    // asserting: a machine that reads back nearly nothing must not end up with
+    // a smaller pager than a machine that cannot be read at all.
+    let base = SqliteConfig::default();
+    let sized = SqliteConfig::at("state.umistate");
+    assert!(sized.cache_bytes >= base.cache_bytes, "{sized:?}");
+    assert!(sized.mmap_bytes >= base.mmap_bytes, "{sized:?}");
+    assert!(sized.cache_bytes <= 2 * 1024 * 1024 * 1024, "{sized:?}");
+    assert!(sized.mmap_bytes <= 32 * 1024 * 1024 * 1024, "{sized:?}");
+}
+
+#[test]
+fn an_in_memory_store_is_not_sized_against_the_machine() {
+    // There is no file to map and no b-tree on disk to descend into, so the
+    // pragmas would be sizing a cache in front of memory. Default holds.
+    let base = SqliteConfig::default();
+    assert!(base.path.is_none());
+    assert_eq!(base.cache_bytes, 64 * 1024 * 1024);
+    assert_eq!(base.mmap_bytes, 1024 * 1024 * 1024);
+}
+
 #[tokio::test]
 async fn checkpoints_can_be_turned_off_without_turning_off_the_barrier() {
     // An operator short of disk wants the durability barrier and the sequence
