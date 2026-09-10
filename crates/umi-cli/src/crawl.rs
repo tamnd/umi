@@ -2464,6 +2464,14 @@ impl Pressure {
 /// frontier grows to doc 16's five hundred million rows, and it is the reason
 /// the durations are printed at all.
 ///
+/// The asks carry what they came back with, because how long an ask took and
+/// how much it was worth are separate questions and only one of them was on
+/// this line. A scheduler handing back a tenth of what it was asked for looks
+/// exactly like a healthy one from every other field here: the asks are quick,
+/// nothing waits on them, and the window is empty because the work never
+/// arrived. That went unnoticed for a while and it was the whole of why a
+/// resumed crawl fell over, so the count is printed next to the cost.
+///
 /// The write is split three ways because the three scale with different things
 /// and the answer to a slow one is whichever it is. Rows are a segment write
 /// and scale with bytes, completions scale with pages, and links scale with
@@ -2500,7 +2508,7 @@ fn progress(
          harvest {:.0}s busy ({:.0}s replacing of which {:.0}s gate, {:.0}s robots ready) \
          {:.0}s idle, {} ms an answer  \
          {} ms per page ({} robots, {} polite, {} warmed, {} loaded, {} stepped, {} refused)  \
-         state {:.0}s ({:.0}s waited on {} asks costing {:.0}s, {} empty, \
+         state {:.0}s ({:.0}s waited on {} asks costing {:.0}s for {} leases, {} empty, \
          {:.0}s waited on writes costing {:.0}s of which {:.0}s rows, {:.0}s completions, \
          {:.0}s links for {} of {})  \
          {} MB fetched  {} MB stored  {} failed{}  bottleneck: {}",
@@ -2528,6 +2536,7 @@ fn progress(
         report.ask_waited_ms as f64 / 1000.0,
         report.asks,
         report.ask_ms as f64 / 1000.0,
+        report.leased,
         report.asks_empty,
         report.store_waited_ms as f64 / 1000.0,
         report.store_ms as f64 / 1000.0,

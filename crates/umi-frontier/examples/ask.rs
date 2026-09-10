@@ -32,11 +32,21 @@ use umi_types::PldId;
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
     let Some(path) = args.next() else {
-        eprintln!("usage: ask <state.sqlite> [asks] [max_urls]");
+        eprintln!("usage: ask <state.sqlite> [asks] [max_urls] [max_domains] [max_per_host]");
         return ExitCode::from(2);
     };
     let asks: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(20);
     let max_urls: u32 = args.next().and_then(|a| a.parse().ok()).unwrap_or(1024);
+    // The last two are the frontier knobs the crawl sets from its own
+    // concurrency rather than leaving at the default, so a reading here can be
+    // made to match a reading from a real run.
+    let mut config = Config::default();
+    if let Some(n) = args.next().and_then(|a| a.parse().ok()) {
+        config.max_domains = n;
+    }
+    if let Some(n) = args.next().and_then(|a| a.parse().ok()) {
+        config.max_per_host = n;
+    }
 
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(runtime) => runtime,
@@ -45,7 +55,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(&path, asks, max_urls)) {
+    match runtime.block_on(run(&path, asks, max_urls, config)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("ask: {e}");
@@ -54,9 +64,13 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(path: &str, asks: u32, max_urls: u32) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(
+    path: &str,
+    asks: u32,
+    max_urls: u32,
+    config: Config,
+) -> Result<(), Box<dyn std::error::Error>> {
     let state = SqliteState::open(path)?;
-    let config = Config::default();
     let frontier = Frontier::new(state, config);
 
     let began = Instant::now();
