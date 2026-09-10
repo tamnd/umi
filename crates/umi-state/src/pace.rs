@@ -22,6 +22,15 @@
 //! before easing up has already made the operator's afternoon worse; the whole
 //! reason to watch latency is that it moves first.
 //!
+//! There is one rung on top of that table which is not in it, and it is not
+//! about politeness. A host that will not open a connection at all is not an
+//! origin under load, and a ceiling of a minute means it is asked again every
+//! minute for as long as it has urls left, which is forever. That is our own
+//! slots being spent on nothing, so after [`UNREACHABLE_AFTER`] silences in a
+//! row the wait doubles past the ceiling up to [`UNREACHABLE_MAX_MS`]. It can
+//! only ever make us slower, one answer of any kind clears it, and it does not
+//! touch the delay the table computed.
+//!
 //! # Where this runs
 //!
 //! On the coordinator, inside [`complete`](crate::State::complete), not on the
@@ -86,6 +95,78 @@ pub const FAST_MS: u32 = 500;
 /// statistics in milestone 3. Until it exists this is the conservative half of
 /// the rule on its own, which errs towards the slower floor.
 pub const FAST_STREAK: u16 = 50;
+
+/// Consecutive unanswered requests before the minute ceiling stops applying.
+///
+/// Doc 07.6's table clamps the delay to a minute, which is the right ceiling
+/// for an origin under load, because that is the thing the table is about. It
+/// is the wrong ceiling for a host that is not there. Nothing else takes such
+/// a host out of the frontier, so it is asked again every minute for as long
+/// as it has urls, which is forever.
+///
+/// That is not a small waste. An hour of gate 3.1 on server3 came back with
+/// 124,449 connect failures out of 929,363 outcomes, and at a minute a host
+/// that is about two thousand hosts being told the same thing sixty five times
+/// each. Every one of those costs a lease, a slot for as long as the connect
+/// takes to give up, and a completion written back.
+///
+/// Six, because six doublings from the starting delay is where the table
+/// arrives at its own ceiling anyway. Below that the table is still moving and
+/// this changes nothing.
+pub const UNREACHABLE_AFTER: u16 = 6;
+
+/// The longest a host that will not answer can be put off for.
+///
+/// Six hours rather than a day. While it is happening, a host that has gone
+/// away for good is indistinguishable from one having a very bad afternoon,
+/// and a site that comes back should not have to wait until tomorrow to be
+/// noticed. One answer of any kind resets the streak and the whole escalation
+/// with it.
+pub const UNREACHABLE_MAX_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// The extra wait a host earns for not answering at all.
+///
+/// Zero unless the failure in hand is one where nobody answered and there have
+/// been enough of them in a row to say this is not a blip. A 429, a 503 or a
+/// challenge page is an origin talking to us, and what to do about those is
+/// doc 07.6's table rather than this: they are answers, and a host that
+/// answers is a host worth asking again in a minute.
+///
+/// Doubling from the ceiling, so the seventh consecutive silence waits two
+/// minutes, the tenth sixteen, and the fifteenth hits the cap. A host that is
+/// simply gone costs about eleven requests an hour instead of sixty five, and
+/// one that was gone for ten minutes is picked up again within about that.
+const fn unreachable_ms(result: &FetchResult, consecutive: u16) -> u64 {
+    let FetchResult::Failed { kind, .. } = result else {
+        return 0;
+    };
+    // Exhaustive with no catch all arm, for the same reason `factor` is: this
+    // is the crate that defines `FailureKind`, and an outcome added later
+    // should be a compile error here rather than a silent no.
+    let silent = match kind {
+        FailureKind::Connect | FailureKind::Tls | FailureKind::Timeout => true,
+        FailureKind::Blocked
+        | FailureKind::ServerError
+        | FailureKind::NotFound
+        | FailureKind::Rejected
+        | FailureKind::Malformed => false,
+    };
+    if !silent {
+        return 0;
+    }
+    let Some(steps) = consecutive.checked_sub(UNREACHABLE_AFTER) else {
+        return 0;
+    };
+    if steps == 0 {
+        return 0;
+    }
+    // Casts rather than `from`, because this is a `const fn` and the trait
+    // conversions are not const yet. Both widen, so neither can lose anything.
+    match (HostRow::MAX_DELAY_MS as u64).checked_shl(steps as u32) {
+        Some(ms) if ms < UNREACHABLE_MAX_MS => ms,
+        _ => UNREACHABLE_MAX_MS,
+    }
+}
 
 /// How the delay moves, as a ratio, from doc 07.6's table.
 ///
@@ -213,7 +294,12 @@ impl HostRow {
         // delay is at 8 gets 8: it asked us to wait at least that long, and
         // waiting longer than an origin asked has never annoyed anybody.
         let own = self.adaptive_delay_ms.max(self.crawl_delay_ms.unwrap_or(0));
-        let wait = u64::from(own.max(pace.retry_after_ms.unwrap_or(0)));
+        let wait = u64::from(own.max(pace.retry_after_ms.unwrap_or(0)))
+            // On top of the delay rather than instead of it, and only for a
+            // host that has stopped answering. The delay is still the number
+            // the table computed and it is still what a host that comes back
+            // is paced by, because one answer clears the streak this reads.
+            .max(unreachable_ms(result, self.consecutive_failures));
         self.next_allowed_ms = self.next_allowed_ms.max(finished_ms.saturating_add(wait));
         true
     }

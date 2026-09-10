@@ -1152,6 +1152,71 @@ fn nothing_ever_goes_below_five_requests_a_second_or_above_a_minute() {
 }
 
 #[test]
+fn a_host_that_stops_answering_is_put_off_for_longer_than_a_minute() {
+    use super::pace::{UNREACHABLE_AFTER, UNREACHABLE_MAX_MS};
+
+    // Six silences in a row is where doc 07.6's own table reaches its ceiling,
+    // so nothing has changed up to that point and the seventh is the first one
+    // that waits longer than a minute.
+    let mut host = paced_host();
+    for _ in 0..UNREACHABLE_AFTER {
+        host.observe(&failed(None, FailureKind::Connect), took(10), T0);
+    }
+    assert_eq!(host.adaptive_delay_ms, HostRow::MAX_DELAY_MS);
+    assert_eq!(host.next_allowed_ms, T0 + 60_000);
+
+    host.observe(&failed(None, FailureKind::Connect), took(10), T0);
+    assert_eq!(host.next_allowed_ms, T0 + 120_000, "the seventh doubles");
+
+    host.observe(&failed(None, FailureKind::Connect), took(10), T0);
+    assert_eq!(host.next_allowed_ms, T0 + 240_000, "and the eighth again");
+
+    // And it stops somewhere, because a host that is gone for good and one
+    // having a very bad afternoon look the same while it is happening.
+    for _ in 0..200 {
+        host.observe(&failed(None, FailureKind::Connect), took(10), T0);
+    }
+    assert_eq!(host.next_allowed_ms, T0 + UNREACHABLE_MAX_MS);
+}
+
+#[test]
+fn one_answer_of_any_kind_ends_the_escalation() {
+    // The streak this reads is the one `observe` already keeps, so a host that
+    // comes back is paced by the table again on its very next response rather
+    // than working its way back down some ladder of its own.
+    let cap = super::pace::UNREACHABLE_MAX_MS;
+    let mut host = paced_host();
+    for _ in 0..40 {
+        host.observe(&failed(None, FailureKind::Connect), took(10), T0);
+    }
+    assert_eq!(host.next_allowed_ms, T0 + cap);
+
+    host.observe(&ok(), took(10), T0 + cap);
+    assert_eq!(host.consecutive_failures, 0);
+    host.observe(&failed(None, FailureKind::Connect), took(10), T0 + DAY);
+    assert_eq!(
+        host.next_allowed_ms,
+        T0 + DAY + 60_000,
+        "one connect failure after a success is a minute, not six hours"
+    );
+}
+
+#[test]
+fn a_host_that_is_answering_badly_is_not_treated_as_one_that_is_gone() {
+    // A 429, a 503 or a challenge page is an origin talking to us. What to do
+    // about those is doc 07.6's table, which already puts them at 4.0 and at a
+    // minute, and a site having an outage is not a site to walk away from for
+    // six hours. Only silence escalates.
+    for kind in [FailureKind::Blocked, FailureKind::ServerError] {
+        let mut host = paced_host();
+        for _ in 0..200 {
+            host.observe(&failed(Some(503), kind), took(10), T0);
+        }
+        assert_eq!(host.next_allowed_ms, T0 + 60_000, "{kind:?}");
+    }
+}
+
+#[test]
 fn retry_after_is_a_minimum_and_never_shortens_our_own_wait() {
     // An origin that asks for a second while we are already waiting eight gets
     // eight. Waiting longer than we were asked to has never annoyed anybody,
