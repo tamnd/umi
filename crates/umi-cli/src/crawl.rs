@@ -1398,8 +1398,23 @@ fn run(
                 let gone = Duration::from_millis(tick_ms.saturating_sub(started_ms));
                 Instant::now() + limit.saturating_sub(gone)
             });
+            // A tick with a deadline runs to the deadline, so on `--for 60m` the
+            // full line below is printed once, at minute sixty. The tick sends
+            // its running report down here every time the batch rolls over,
+            // which turns an hour long arm into a line every few minutes and,
+            // more to the point, into a series rather than a single number. The
+            // costs on this line move as the state file grows and that is the
+            // finding, not the average of it.
+            let (interim, mut rolled) = tokio::sync::mpsc::unbounded_channel();
+            // The running totals the interim lines are read against. `seen` is
+            // the last report that came down the channel, so the difference is
+            // the interval, and `far` is the summary those intervals add up
+            // into. Both are thrown away when the tick ends and the real
+            // `summary` takes over, which lands on exactly the same numbers.
+            let mut seen = TickReport::default();
+            let mut far = summary;
             let report = {
-                let ticking = crawler.tick_until(&recorded, until);
+                let ticking = crawler.tick_reporting(&recorded, until, Some(&interim));
                 tokio::pin!(ticking);
                 let mut beat = tokio::time::interval(WORKING);
                 // The first one fires straight away, and a heartbeat in the
@@ -1408,6 +1423,14 @@ fn run(
                 loop {
                     tokio::select! {
                         done = &mut ticking => break done,
+                        Some(running) = rolled.recv() => {
+                            let interval = running.since(&seen);
+                            seen = running;
+                            add(&mut far, &interval);
+                            let now_ms = clock.now_ms();
+                            let queued = frontier.get(&*state, now_ms).await?;
+                            log.line(&progress(&far, &interval, queued, started_ms, now_ms))?;
+                        }
                         _ = beat.tick() => {
                             log.line(&working(&live, started_ms, clock.now_ms()))?;
                         }
@@ -1435,7 +1458,13 @@ fn run(
             if report.leased > 0 {
                 let now_ms = clock.now_ms();
                 let queued = frontier.get(&*state, now_ms).await?;
-                log.line(&progress(&summary, &report, queued, started_ms, now_ms))?;
+                // The last interval and not the whole tick, so every line in
+                // the run reads the same way. `seen` is zero on a tick that
+                // never rolled over, and the difference from zero is the tick,
+                // so this is the old line unchanged on the runs that used to
+                // print it.
+                let interval = report.since(&seen);
+                log.line(&progress(&summary, &interval, queued, started_ms, now_ms))?;
                 backoff.reset();
             }
 

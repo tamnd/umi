@@ -1055,6 +1055,132 @@ struct Spent {
 }
 
 impl TickReport {
+    /// What happened between an earlier reading of the same tick and this one.
+    ///
+    /// A tick with a deadline runs to the deadline, so a report read while it
+    /// is still going is a running total from the start of the run. Every mean
+    /// on it is therefore an average over everything so far, and the thing a
+    /// long run has to say is that those averages move: a completion cost 0.60
+    /// ms in the first six minutes and 1.48 ms by the sixtieth. A running total
+    /// cannot show that and a difference of two of them can.
+    ///
+    /// Every counter is a difference and every flag is taken from the later
+    /// reading, because a flag says what is true now rather than how much of it
+    /// there was. `batches` included, so the interval says how many rollovers
+    /// were in it.
+    ///
+    /// Saturating, so a reading from a different tick gives zeroes rather than
+    /// a very large number. There is no case where that is a legitimate call,
+    /// but there is also no reading of a wrapped subtraction that is not worse.
+    #[must_use]
+    pub fn since(&self, earlier: &Self) -> Self {
+        // Destructured rather than read field by field, so that a field added
+        // to the report later is a compile error here instead of a number that
+        // quietly stops being a difference.
+        let Self {
+            leased,
+            batches,
+            rows,
+            fetched,
+            bytes_fetched,
+            not_modified,
+            unchanged,
+            failed,
+            failures,
+            disallowed,
+            robots_refused,
+            pages,
+            links_seen,
+            links_admitted,
+            challenged,
+            learned,
+            robots_warmed,
+            robots_loaded,
+            robots_stepped,
+            emulated,
+            rendered,
+            deferred,
+            restrained,
+            elapsed_ms,
+            waited_ms,
+            robots_ms,
+            lease_ms,
+            store_ms,
+            rows_ms,
+            complete_ms,
+            admit_ms,
+            store_waited_ms,
+            ask_ms,
+            ask_waited_ms,
+            asks,
+            asks_empty,
+            queued_ms,
+            uncollected_ms,
+            harvest_ms,
+            harvest_idle_ms,
+            replace_ms,
+            gate_ms,
+            ready_ms,
+        } = *self;
+
+        let mut since_failures = failures;
+        for (kind, was) in since_failures.iter_mut().zip(earlier.failures) {
+            *kind = kind.saturating_sub(was);
+        }
+        let mut since_pages = pages;
+        for (tier, was) in since_pages.iter_mut().zip(earlier.pages) {
+            for (code, was) in tier.iter_mut().zip(was) {
+                *code = code.saturating_sub(was);
+            }
+        }
+
+        Self {
+            leased: leased.saturating_sub(earlier.leased),
+            batches: batches.saturating_sub(earlier.batches),
+            rows: rows.saturating_sub(earlier.rows),
+            fetched: fetched.saturating_sub(earlier.fetched),
+            bytes_fetched: bytes_fetched.saturating_sub(earlier.bytes_fetched),
+            not_modified: not_modified.saturating_sub(earlier.not_modified),
+            unchanged: unchanged.saturating_sub(earlier.unchanged),
+            failed: failed.saturating_sub(earlier.failed),
+            failures: since_failures,
+            disallowed: disallowed.saturating_sub(earlier.disallowed),
+            robots_refused: robots_refused.saturating_sub(earlier.robots_refused),
+            pages: since_pages,
+            links_seen: links_seen.saturating_sub(earlier.links_seen),
+            links_admitted: links_admitted.saturating_sub(earlier.links_admitted),
+            challenged: challenged.saturating_sub(earlier.challenged),
+            learned: learned.saturating_sub(earlier.learned),
+            robots_warmed: robots_warmed.saturating_sub(earlier.robots_warmed),
+            robots_loaded: robots_loaded.saturating_sub(earlier.robots_loaded),
+            robots_stepped: robots_stepped.saturating_sub(earlier.robots_stepped),
+            emulated: emulated.saturating_sub(earlier.emulated),
+            rendered: rendered.saturating_sub(earlier.rendered),
+            deferred: deferred.saturating_sub(earlier.deferred),
+            restrained,
+            elapsed_ms: elapsed_ms.saturating_sub(earlier.elapsed_ms),
+            waited_ms: waited_ms.saturating_sub(earlier.waited_ms),
+            robots_ms: robots_ms.saturating_sub(earlier.robots_ms),
+            lease_ms: lease_ms.saturating_sub(earlier.lease_ms),
+            store_ms: store_ms.saturating_sub(earlier.store_ms),
+            rows_ms: rows_ms.saturating_sub(earlier.rows_ms),
+            complete_ms: complete_ms.saturating_sub(earlier.complete_ms),
+            admit_ms: admit_ms.saturating_sub(earlier.admit_ms),
+            store_waited_ms: store_waited_ms.saturating_sub(earlier.store_waited_ms),
+            ask_ms: ask_ms.saturating_sub(earlier.ask_ms),
+            ask_waited_ms: ask_waited_ms.saturating_sub(earlier.ask_waited_ms),
+            asks: asks.saturating_sub(earlier.asks),
+            asks_empty: asks_empty.saturating_sub(earlier.asks_empty),
+            queued_ms: queued_ms.saturating_sub(earlier.queued_ms),
+            uncollected_ms: uncollected_ms.saturating_sub(earlier.uncollected_ms),
+            harvest_ms: harvest_ms.saturating_sub(earlier.harvest_ms),
+            harvest_idle_ms: harvest_idle_ms.saturating_sub(earlier.harvest_idle_ms),
+            replace_ms: replace_ms.saturating_sub(earlier.replace_ms),
+            gate_ms: gate_ms.saturating_sub(earlier.gate_ms),
+            ready_ms: ready_ms.saturating_sub(earlier.ready_ms),
+        }
+    }
+
     /// Whether the tick found nothing to do, which is how a caller knows to
     /// sleep rather than spin.
     #[must_use]
@@ -1495,6 +1621,36 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
         sink: &Arc<S>,
         until: Option<Instant>,
     ) -> Result<TickReport, CrawlError> {
+        self.tick_reporting(sink, until, None).await
+    }
+
+    /// The same again, saying how it is going while it is still going.
+    ///
+    /// A tick with a deadline runs to the deadline, so on a `--for 60m` run the
+    /// report that carries the whole cost breakdown arrives once, at minute
+    /// sixty, and an operator watching a long arm has nothing but four running
+    /// counters until it is over. Worse, the one number that matters on a long
+    /// run is that the costs move as the file grows, and a single reading at
+    /// the end cannot show that at all.
+    ///
+    /// So the caller may hand in a channel and get the running report every
+    /// time the batch rolls over, which on a broad crawl is every few minutes.
+    /// What comes down it is the total so far and not the interval, because a
+    /// total is what the tick has and the difference of two of them is
+    /// [`since`](TickReport::since).
+    ///
+    /// A send that fails is dropped. The receiver going away means the caller
+    /// has stopped listening, and a crawl is not something to stop over that.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`tick`](Self::tick).
+    pub async fn tick_reporting<S: Sink + 'static>(
+        &self,
+        sink: &Arc<S>,
+        until: Option<Instant>,
+        interim: Option<&tokio::sync::mpsc::UnboundedSender<TickReport>>,
+    ) -> Result<TickReport, CrawlError> {
         // The schedule lives in memory and the urls do not, so a crawler whose
         // gate is empty has no domains to take work from and leases nothing
         // however full the store is. Seeds go in through `umi seed` and through
@@ -1674,6 +1830,16 @@ impl<F: Fetch + 'static, C: Clock + 'static> Crawler<F, C> {
             {
                 supply.left = batch;
                 report.batches += 1;
+                // The rollover is the only moment in a long tick where the loop
+                // is between two batches rather than in the middle of one, so
+                // it is where a reading of the report is a reading of something
+                // finished. Stamped with the elapsed time first, because that
+                // is what the receiver divides by and it is otherwise only
+                // written on the way out.
+                if let Some(interim) = interim {
+                    report.elapsed_ms = u64::from(ms(began));
+                    let _ = interim.send(report);
+                }
             }
             let replace_from = Instant::now();
             let next = self

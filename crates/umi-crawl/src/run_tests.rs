@@ -2080,6 +2080,77 @@ async fn a_sink_that_fails_leaves_the_url_uncompleted() {
     assert_eq!(stats.urls_fetched, 0, "the url was recorded as fetched");
 }
 
+#[test]
+fn an_interval_is_the_difference_between_two_readings_of_the_same_tick() {
+    let early = TickReport {
+        leased: 100,
+        batches: 1,
+        rows: 90,
+        bytes_fetched: 4096,
+        complete_ms: 500,
+        elapsed_ms: 60_000,
+        failures: [1; umi_state::FailureKind::ALL.len()],
+        ..TickReport::default()
+    };
+    let late = TickReport {
+        leased: 250,
+        batches: 3,
+        rows: 220,
+        bytes_fetched: 10_240,
+        complete_ms: 1_700,
+        elapsed_ms: 180_000,
+        failures: [4; umi_state::FailureKind::ALL.len()],
+        // A flag and not a count, so it is whatever it is now.
+        restrained: true,
+        ..TickReport::default()
+    };
+
+    let interval = late.since(&early);
+    assert_eq!(interval.leased, 150);
+    assert_eq!(interval.batches, 2);
+    assert_eq!(interval.rows, 130);
+    assert_eq!(interval.bytes_fetched, 6_144);
+    assert_eq!(interval.elapsed_ms, 120_000);
+    assert_eq!(interval.failures, [3; umi_state::FailureKind::ALL.len()]);
+    assert!(interval.restrained);
+
+    // The point of the whole thing. A completion averaged 5 ms over the first
+    // reading and 6.8 ms over the second, and neither of those is the answer:
+    // over the interval between them it was 8 ms, and the run is getting
+    // slower rather than sitting at any of the three.
+    assert_eq!(interval.complete_ms, 1_200);
+    assert_eq!(interval.complete_ms / interval.leased as u64, 8);
+}
+
+#[test]
+fn an_interval_against_nothing_is_the_whole_tick() {
+    // Which is what a tick that never rolled over reports, so the line a short
+    // run prints is the line it has always printed.
+    let report = TickReport {
+        leased: 12,
+        rows: 11,
+        complete_ms: 34,
+        ..TickReport::default()
+    };
+    assert_eq!(report.since(&TickReport::default()), report);
+}
+
+#[test]
+fn an_interval_read_against_a_later_reading_is_empty_rather_than_enormous() {
+    // Two reports from different ticks is not a call anything makes, and the
+    // reason to pin it down is that the wrong answer here is not a wrong
+    // number, it is four billion.
+    let early = TickReport {
+        leased: 10,
+        ..TickReport::default()
+    };
+    let late = TickReport {
+        leased: 400,
+        ..TickReport::default()
+    };
+    assert_eq!(early.since(&late).leased, 0);
+}
+
 #[tokio::test]
 async fn an_empty_frontier_is_idle_and_not_an_error() {
     let state = seeded(&[]).await;
