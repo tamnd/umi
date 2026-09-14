@@ -40,9 +40,9 @@ jobs:
       # copied into the site rather than generated, so this is what stops a
       # page that names addresses the binary no longer crawls from.
       - run: ./scripts/check-site.sh
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: site
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
