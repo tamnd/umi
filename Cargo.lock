@@ -3535,7 +3535,7 @@ dependencies = [
 name = "umi-fetch"
 version = "0.0.1"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "chromiumoxide",
@@ -3601,7 +3601,7 @@ name = "umi-publish"
 version = "0.0.1"
 dependencies = [
  "arrow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "blake3",
  "bytes",
  "ed25519-dalek",
